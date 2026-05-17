@@ -1,0 +1,21 @@
+# Ignore the virtual environment
+venv/
+ENV/
+.venv/
+
+# Ignore Python cache and bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+*.zip
+*.pth
+*.pt
+*.egg-info/
+
+blender_scene.py
