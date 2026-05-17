@@ -46,6 +46,8 @@ All arguments to `raycast.py`:
 | `--no-refine` | off | Skip pitch refinement entirely; use only manual overrides from `config.py`. |
 | `--feature-matcher-debug` | off | Save annotated side-by-side match images (keypoints, ground region band, van bbox, connecting lines) to `{output_dir}/debug/` for every matched frame pair. |
 
+`export_blender.py` accepts the same `--height`, `--enhance`, and `--feature-matcher-debug` flags. Its equivalent of `--calculate-orientation` (runs the orientation solver before export) replaces the old `--optimize-pitch`.
+
 ---
 
 ## Setup
@@ -139,7 +141,7 @@ raycast_challenge/
     ├── undistort.py         Fisheye lens correction (OpenCV fisheye model)
     ├── pose.py              Camera pose estimation: GPS → ENU, roll detection, R matrix
     ├── detect_van.py        Van detection (GroundingDINO → white-blob fallback)
-    ├── pitch_solver.py      Ground-scatter residual function and least-squares solver
+    ├── orientation_solver.py  Ground-scatter residual function and orientation least-squares solver
     ├── feature_matcher.py   Ground feature matching and pitch refinement orchestration
     ├── geometry.py          Ray–ground-plane intersection + reprojection math
     └── ui.py                Interactive grid viewer + proof-sheet export
@@ -239,7 +241,7 @@ The camera gimbal pitch is not available in the HUD. This step recovers it by mi
 
 **Feature matching** — SuperPoint keypoints are extracted from each frame and matched with LightGlue. Matches are filtered to the lower 55% of the image content area (ground region), any matches falling inside the van bounding box are excluded, and the remainder are validated with RANSAC homography.
 
-**Pitch optimisation** — For each matched feature seen in two or more frames, each camera shoots a ray from its pixel through the ground plane. A perfect pitch would make all rays converge on the same point. The optimizer minimises the 2D scatter (East, North) of these intersections using `scipy.optimize.least_squares` with a Cauchy robust loss (down-weights incorrect correspondences).
+**Orientation optimisation** — For each matched feature seen in two or more frames, each camera shoots a ray from its pixel through the ground plane. A perfect orientation would make all rays converge on the same point. The optimizer (`orientation_solver.py`) minimises the 2D scatter (East, North) of these intersections using `scipy.optimize.least_squares` with a Cauchy robust loss. It simultaneously solves for three unknowns per camera: **pitch** (−89° → +15°), **yaw offset** (±5°, correction on the OCR heading), and **roll offset** (±1°, correction on the bracket-detected roll). Bounds are set in `config.py` under `SOLVER_*`.
 
 **Two-pass incremental solve:**
 - *Pass 1* — frames with ≥ `MIN_MATCHES_STABLE` total matched keypoints across all their pairs are solved jointly in a global optimisation.

@@ -31,7 +31,7 @@ from pipeline.frame      import Frame
 from pipeline.ocr        import extract_telemetry_all
 from pipeline.undistort  import undistort_all
 from pipeline.pose       import estimate_poses
-from pipeline.pitch_solver import optimize_pitches
+from pipeline.orientation_solver import optimize_orientation
 
 import config
 
@@ -159,7 +159,7 @@ def main():
         for (ua, va), (ub, vb) in zip(pts_a, pts_b)
     ]
 
-    pitches, result = optimize_pitches(
+    pitches, yaw_offs, roll_offs, result = optimize_orientation(
         cameras, features,
         initial_pitches=[0.0, 0.0],
         z_ground=0.0,
@@ -172,8 +172,8 @@ def main():
     print(f"  nfev             : {result.nfev}")
     print(f"  status           : {result.message}")
     print(f"{'─'*60}")
-    print(f"  Frame A  {fa.stem[-16:]}  pitch = {pitches[0]:+.2f}°")
-    print(f"  Frame B  {fb.stem[-16:]}  pitch = {pitches[1]:+.2f}°")
+    print(f"  Frame A  {fa.stem[-16:]}  pitch = {pitches[0]:+.2f}°  yaw_off = {yaw_offs[0]:+.2f}°  roll_off = {roll_offs[0]:+.2f}°")
+    print(f"  Frame B  {fb.stem[-16:]}  pitch = {pitches[1]:+.2f}°  yaw_off = {yaw_offs[1]:+.2f}°  roll_off = {roll_offs[1]:+.2f}°")
     print(f"{'─'*60}\n")
 
     # Write overrides for easy copy-paste into config.py

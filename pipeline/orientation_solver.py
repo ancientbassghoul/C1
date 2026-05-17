@@ -1,10 +1,10 @@
 """
-pipeline/pitch_solver.py – Ground-scatter pitch calibration for a multi-camera rig.
+pipeline/orientation_solver.py – Ground-scatter orientation calibration for a multi-camera rig.
 
 Given : camera positions, yaw, roll, intrinsics, and matched 2-D pixel
         coordinates for shared ground features (z = ground_z).
-Find  : the pitch angle of each camera that minimises the scatter of
-        ray-ground intersections across cameras observing the same feature.
+Find  : the pitch, yaw offset, and roll offset of each camera that minimises
+        the scatter of ray-ground intersections across cameras observing the same feature.
 
 Rotation convention (ENU world frame, OpenCV camera frame)
 ──────────────────────────────────────────────────────────
@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import numpy as np
 from scipy.optimize import least_squares
+
+import config
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -104,18 +106,23 @@ _MISS_PENALTY = 1000.0
 
 
 def compute_residuals(
-    pitches:  np.ndarray,      # (N,)  current pitch guess (degrees)
-    cameras:  list[dict],      # N dicts – see optimize_pitches() docstring
+    params:   np.ndarray,      # (3N,) [pitch_0..N, yaw_off_0..N, roll_off_0..N]
+    cameras:  list[dict],      # N dicts – see optimize_orientation() docstring
     features: list[dict],      # M dicts {cam_idx: (u, v), ...}
     z_ground: float = 0.0,
 ) -> np.ndarray:
     """
     Flat residual vector for scipy.optimize.least_squares.
 
+    Parameter vector layout (length 3N):
+      params[:N]    = pitch per camera (degrees)
+      params[N:2N]  = yaw offset per camera (degrees, added to cam['yaw'])
+      params[2N:3N] = roll offset per camera (degrees, added to cam['roll'])
+
     For each feature j observed by cameras S_j (|S_j| ≥ 2):
       ┌─ For each i ∈ S_j
       │   d_cam   = K_i⁻¹ · [u, v, 1]ᵀ
-      │   d_world = R(yaw_i, pitch_i, roll_i) · d_cam
+      │   d_world = R(yaw_i + yaw_off_i, pitch_i, roll_i + roll_off_i) · d_cam
       │   W_ij    = ray_plane_intersect(C_i, d_world, z)
       └─ μ_j      = mean of all valid W_ij
 
@@ -125,6 +132,11 @@ def compute_residuals(
     The returned vector has FIXED length = 2 × Σ_j |S_j|, which is
     required by least_squares (constant across calls).
     """
+    N         = len(cameras)
+    pitches   = params[:N]
+    yaw_offs  = params[N:2*N]
+    roll_offs = params[2*N:3*N]
+
     K_invs = [np.linalg.inv(cam['K']) for cam in cameras]
     residuals: list[float] = []
 
@@ -140,7 +152,9 @@ def compute_residuals(
             u, v  = feat[i]
             d_cam = K_invs[i] @ np.array([u, v, 1.0])
 
-            R       = make_rotation(cam['yaw'], float(pitches[i]), cam['roll'])
+            R       = make_rotation(cam['yaw']  + float(yaw_offs[i]),
+                                    float(pitches[i]),
+                                    cam['roll'] + float(roll_offs[i]))
             d_world = R @ d_cam
 
             hits.append(ray_plane_intersect(cam['pos'], d_world, z=z_ground))
@@ -170,17 +184,20 @@ def compute_residuals(
 # Main optimisation function
 # ─────────────────────────────────────────────────────────────────────────────
 
-def optimize_pitches(
+def optimize_orientation(
     cameras:         list[dict],
     features:        list[dict],
     initial_pitches: list[float] | None = None,
     z_ground:        float = 0.0,
-    pitch_min:       float = -89.0,
-    pitch_max:       float =  15.0,
+    pitch_min:       float = config.SOLVER_PITCH_MIN,
+    pitch_max:       float = config.SOLVER_PITCH_MAX,
+    yaw_range:       float = config.SOLVER_YAW_OFFSET_RANGE,
+    roll_range:      float = config.SOLVER_ROLL_OFFSET_RANGE,
     verbose:         bool  = True,
-) -> tuple[np.ndarray, object]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, object]:
     """
-    Find the pitch of each camera that minimises ground-scatter.
+    Find the pitch, yaw offset, and roll offset of each camera that minimises
+    ground-scatter.
 
     Parameters
     ──────────
@@ -191,29 +208,36 @@ def optimize_pitches(
         'K'    : (3, 3) np.ndarray — camera intrinsic matrix
 
     features : list of M dicts, each mapping
-        int (camera index) → (u, v) pixel in that camera's image
+        int (camera index) → (u, v) pixel in that camera's image.
         Features seen by < 2 cameras are silently ignored.
 
-    initial_pitches : (N,) starting pitches in degrees.
-        Defaults to 0° for every camera if None.
-
-    z_ground  : height of the ground plane in world ENU metres.
-    pitch_min / pitch_max : search bounds in degrees.
+    initial_pitches : (N,) starting pitches in degrees. Defaults to 0°.
+    z_ground        : height of the ground plane in world ENU metres.
+    pitch_min/max   : pitch search bounds in degrees.
+    yaw_range       : yaw offset search bound (±degrees, from config).
+    roll_range      : roll offset search bound (±degrees, from config).
 
     Returns
     ───────
-    optimized_pitches : (N,) np.ndarray — refined pitch per camera (degrees)
-    result            : scipy OptimizeResult (cost, nfev, message, …)
+    pitches     : (N,) np.ndarray — refined pitch per camera (degrees)
+    yaw_offsets : (N,) np.ndarray — yaw correction per camera (degrees)
+    roll_offsets: (N,) np.ndarray — roll correction per camera (degrees)
+    result      : scipy OptimizeResult (cost, nfev, message, …)
     """
+    import config as _config
     N = len(cameras)
 
-    if initial_pitches is None:
-        x0 = np.zeros(N)
-    else:
-        x0 = np.clip(initial_pitches, pitch_min, pitch_max).astype(float)
+    pitch_init = np.zeros(N) if initial_pitches is None                  else np.clip(initial_pitches, pitch_min, pitch_max).astype(float)
 
-    lo = np.full(N, pitch_min)
-    hi = np.full(N, pitch_max)
+    # Parameter vector: [pitches | yaw_offsets | roll_offsets]
+    x0 = np.concatenate([pitch_init, np.zeros(N), np.zeros(N)])
+
+    lo = np.concatenate([np.full(N, pitch_min),
+                         np.full(N, -yaw_range),
+                         np.full(N, -roll_range)])
+    hi = np.concatenate([np.full(N, pitch_max),
+                         np.full(N,  yaw_range),
+                         np.full(N,  roll_range)])
 
     result = least_squares(
         compute_residuals,
@@ -230,4 +254,8 @@ def optimize_pitches(
         verbose = 2 if verbose else 0,
     )
 
-    return result.x, result
+    pitches      = result.x[:N]
+    yaw_offsets  = result.x[N:2*N]
+    roll_offsets = result.x[2*N:3*N]
+
+    return pitches, yaw_offsets, roll_offsets, result

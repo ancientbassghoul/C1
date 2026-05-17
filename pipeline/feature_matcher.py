@@ -27,7 +27,7 @@ from itertools import combinations
 import cv2
 import numpy as np
 
-from pipeline.pitch_solver import optimize_pitches, compute_residuals
+from pipeline.orientation_solver import optimize_orientation
 from pipeline.frame import Frame
 from pipeline.pose import build_rotation
 import config
@@ -318,12 +318,12 @@ def _cam_dict(frame: Frame) -> dict:
 
 
 def _run_optimizer(cameras, features, initial_pitches,
-                   label='') -> np.ndarray | None:
+                   label='') -> tuple | None:
     if not features:
         logger.warning("No features for optimizer%s.", f' ({label})' if label else '')
         return None
     try:
-        pitches, result = optimize_pitches(
+        pitches, yaw_offs, roll_offs, result = optimize_orientation(
             cameras, features,
             initial_pitches=initial_pitches,
             z_ground=0.0,
@@ -332,7 +332,7 @@ def _run_optimizer(cameras, features, initial_pitches,
         pf = result.cost / max(len(features), 1)
         logger.info("Optimizer%s done: per_feature=%.2f m²  nfev=%d",
                     f' ({label})' if label else '', pf, result.nfev)
-        return pitches
+        return pitches, yaw_offs, roll_offs
     except Exception as exc:
         logger.error("Optimizer failed%s: %s",
                      f' ({label})' if label else '', exc)
@@ -415,14 +415,20 @@ def refine_pitches(frames: list[Frame],
                 s_features.append({ia: (float(ua), float(va)),
                                     ib: (float(ub), float(vb_))})
 
-        pitches = _run_optimizer(s_cams, s_features,
-                                  [INITIAL_PITCH_DEG] * len(stable),
-                                  label='pass-1')
-        if pitches is not None:
+        result_tuple = _run_optimizer(s_cams, s_features,
+                                      [INITIAL_PITCH_DEG] * len(stable),
+                                      label='pass-1')
+        if result_tuple is not None:
+            pitches, yaw_offs, roll_offs = result_tuple
             for i, f in enumerate(stable):
-                p = float(pitches[i])
-                logger.info("  [%s] pass-1 pitch → %.1f°", f.stem[-12:], p)
-                f.gimbal_pitch_deg = p
+                p  = float(pitches[i])
+                yo = float(yaw_offs[i])
+                ro = float(roll_offs[i])
+                logger.info("  [%s] pass-1 pitch → %.1f°  yaw_off → %+.2f°  roll_off → %+.2f°",
+                            f.stem[-12:], p, yo, ro)
+                f.gimbal_pitch_deg  = p
+                f.heading_deg       = f.heading_deg      + yo
+                f.camera_roll_deg   = f.camera_roll_deg  + ro
                 f.R = build_rotation(f.heading_deg, p, f.camera_roll_deg)
 
     # ── Pass 2: solve each unstable frame against ALL calibrated cameras ──────
@@ -468,18 +474,20 @@ def refine_pitches(frames: list[Frame],
             if _cam_dict(fc) in cams_u[1:]
         ]
 
-        pitches_u, result_u = optimize_pitches(
+        pitches_u, yaw_offs_u, roll_offs_u, result_u = optimize_orientation(
             cams_u, features_u,
             initial_pitches=init,
             z_ground=0.0,
-            pitch_min=-89.0,
-            pitch_max=15.0,
             verbose=False,
         )
 
-        p = float(pitches_u[0])
+        p  = float(pitches_u[0])
+        yo = float(yaw_offs_u[0])
+        ro = float(roll_offs_u[0])
         pf = result_u.cost / max(len(features_u), 1)
-        logger.info("  [%s] pass-2 pitch → %.1f°  per_feature=%.2f m²",
-                    fu.stem[-12:], p, pf)
-        fu.gimbal_pitch_deg = p
+        logger.info("  [%s] pass-2 pitch → %.1f°  yaw_off → %+.2f°  roll_off → %+.2f°  per_feature=%.2f m²",
+                    fu.stem[-12:], p, yo, ro, pf)
+        fu.gimbal_pitch_deg  = p
+        fu.heading_deg       = fu.heading_deg     + yo
+        fu.camera_roll_deg   = fu.camera_roll_deg + ro
         fu.R = build_rotation(fu.heading_deg, p, fu.camera_roll_deg)

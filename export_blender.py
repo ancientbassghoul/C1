@@ -1,7 +1,7 @@
 import argparse, sys, os, json, math
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-def collect_data(frames_dir, out_dir, optimize_pitch=False, enhance=False, height_mode='agl'):
+def collect_data(frames_dir, out_dir, calculate_orientation=False, enhance=False, height_mode='tor', feature_matcher_debug=False):
     import config
     import cv2
     from pipeline.frame     import load_frames
@@ -16,9 +16,11 @@ def collect_data(frames_dir, out_dir, optimize_pitch=False, enhance=False, heigh
     extract_telemetry_all(frames)
     undistort_all(frames)
     estimate_poses(frames)   # sets frame.R using pitch overrides / 0deg
-    if optimize_pitch:
-        from pipeline.feature_matcher import refine_pitches, set_enhance
+    if calculate_orientation:
+        from pipeline.detect_van    import VanDetector
+        from pipeline.feature_matcher import refine_pitches, set_enhance, set_debug
         set_enhance(enhance)
+        set_debug(feature_matcher_debug)
         # Apply chosen height to position_enu before optimizer runs
         for f in frames:
             if f.position_enu is None: continue
@@ -30,8 +32,11 @@ def collect_data(frames_dir, out_dir, optimize_pitch=False, enhance=False, heigh
                 f.position_enu[2] = alt_ref
             else:
                 f.position_enu[2] = alt_agl
-        print('Running pitch optimizer...')
-        refine_pitches(frames)
+        detector   = VanDetector()
+        detections = detector.detect_all(frames)
+        van_bboxes = {f.stem: bbox for f, bbox in detections.items()}
+        print('Running orientation solver...')
+        refine_pitches(frames, van_bboxes=van_bboxes)
 
     origin = next(((f.lat, f.lon) for f in frames if f.lat is not None), None)
     rows = []
@@ -225,17 +230,21 @@ def generate_blender_script(data, out_path):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--frames_dir', required=True)
-    parser.add_argument('--optimize-pitch', action='store_true',
-                        help='Run ground-scatter pitch optimizer before export (slower).')
-    parser.add_argument('--height', choices=['agl','avg','tor'], default='agl',
-                        help='Camera Z: agl=AGL only (default), avg=average both, tor=takeoff_ref only.')
+    parser.add_argument('--calculate-orientation', action='store_true',
+                        dest='calculate_orientation',
+                        help='Run orientation solver (pitch, yaw offset, roll offset) before export (slower).')
+    parser.add_argument('--height', choices=['agl','avg','tor'], default='tor',
+                        help='Camera Z: tor=takeoff_ref (default), agl=AGL only, avg=average both.')
     parser.add_argument('--enhance', action='store_true',
                         help='Enable CLAHE+unsharp preprocessing before LightGlue (off by default).')
+    parser.add_argument('--feature-matcher-debug', action='store_true',
+                        dest='feature_matcher_debug',
+                        help='Save annotated match images to {out_dir}/debug/ for every matched frame pair.')
     parser.add_argument('--out_dir',    required=True,
                         help='Directory to save undistorted images and blender_scene.py')
     args = parser.parse_args()
 
-    data = collect_data(args.frames_dir, args.out_dir, optimize_pitch=args.optimize_pitch, enhance=args.enhance, height_mode=args.height)
+    data = collect_data(args.frames_dir, args.out_dir, calculate_orientation=args.calculate_orientation, enhance=args.enhance, height_mode=args.height, feature_matcher_debug=args.feature_matcher_debug)
 
     print(f"{len(data)} frame(s):")
     for d in data:

@@ -70,16 +70,9 @@ GIMBAL_PITCH_FALLBACK_DEG = -45.0 # Used when auto-detection is inconclusive.
 #       "2026-02-15_16-35-56_06892": -15.0,
 #       "2026-02-15_16-25-03_04569": -8.0,
 #   }
-# GIMBAL_PITCH_OVERRIDES: dict[str, float] = {
-#     # Calibrated via manual ground correspondences (manual_calibrate.py)
-#     "2026-02-15_16-25-03_10474": 1.24,
-#     "2026-02-15_16-25-03_10671": -6.73,
-# }
-
 GIMBAL_PITCH_OVERRIDES: dict[str, float] = {
     # Calibrated via manual ground correspondences (manual_calibrate.py)
 }
-
 
 # ── Camera roll ───────────────────────────────────────────────────────────────
 # Drone banking angle (degrees).  Positive = roll right.
@@ -150,6 +143,23 @@ VAN_CALIB_F_BOUNDS     = (200.0, 1200.0)
 
 # Pitch search bounds [degrees].
 VAN_CALIB_PITCH_BOUNDS = (-90.0, 0.0)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ORIENTATION SOLVER
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-camera bounds used by orientation_solver.py when jointly refining
+# pitch, yaw offset, and roll offset from ground-feature scatter.
+#
+# Pitch: full physical range (near-nadir to slightly above horizon).
+# Yaw offset: small correction on top of the OCR compass heading.
+#   ±5° handles typical magnetometer drift and HUD rounding errors.
+# Roll offset: small correction on top of the bracket-detected roll.
+#   ±1° handles residual HUD-detection error at near-level flight.
+
+SOLVER_PITCH_MIN         = -89.0   # degrees
+SOLVER_PITCH_MAX         =  15.0   # degrees
+SOLVER_YAW_OFFSET_RANGE  =   5.0   # ± degrees
+SOLVER_ROLL_OFFSET_RANGE =   1.0   # ± degrees
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ROLL DETECTION
