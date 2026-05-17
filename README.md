@@ -28,6 +28,26 @@ venv\Scripts\python raycast.py --frames_dir ./frames ^
 
 ---
 
+## CLI reference
+
+All arguments to `raycast.py`:
+
+| Argument | Default | Description |
+|---|---|---|
+| `--frames_dir` | *(required)* | Directory containing the drone frames (PNG/JPG). |
+| `--batch` | off | Headless mode: reproject a fixed pixel and save the proof sheet without opening the GUI. Requires `--source-frame` and `--pick`. |
+| `--source-frame` | — | *(Batch mode)* Filename stem of the source frame, e.g. `2026-02-15_16-28-05_04752`. |
+| `--pick PX PY` | — | *(Batch mode)* Pixel coordinates to pick in the source frame, e.g. `640 400`. |
+| `--height` | `tor` | Camera Z source: `tor` = takeoff-relative altitude (recommended), `agl` = above-ground-level only, `avg` = average of both. |
+| `--output_dir` | from config.py | Override the output directory for proof sheets and debug images. |
+| `--preview-undistort` | off | Show each undistorted frame one by one, then exit. Use to tune `FOCAL_LENGTH` and `FISHEYE_K*` in `config.py`. |
+| `--preview-enhanced` | off | Show the CLAHE+unsharp frames fed to SuperPoint, then exit. Useful for diagnosing poor feature detection. |
+| `--enhance` | off | Enable CLAHE+unsharp preprocessing before LightGlue feature matching. |
+| `--no-refine` | off | Skip pitch refinement entirely; use only manual overrides from `config.py`. |
+| `--feature-matcher-debug` | off | Save annotated side-by-side match images (keypoints, ground region band, van bbox, connecting lines) to `{output_dir}/debug/` for every matched frame pair. |
+
+---
+
 ## Setup
 
 ### 1 — Python 3.11

@@ -60,6 +60,98 @@ def set_enhance(on: bool) -> None:
     global _ENHANCE
     _ENHANCE = on
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Debug visualisation toggle
+# ─────────────────────────────────────────────────────────────────────────────
+_DEBUG = False
+
+def set_debug(on: bool) -> None:
+    global _DEBUG
+    _DEBUG = on
+
+
+def _save_debug_matches(
+    frame_a:    'Frame',
+    frame_b:    'Frame',
+    pts_a:      np.ndarray,
+    pts_b:      np.ndarray,
+    ground_a:   tuple[int, int],
+    ground_b:   tuple[int, int],
+    van_bbox_a: tuple | None,
+    van_bbox_b: tuple | None,
+) -> None:
+    """
+    Save a side-by-side debug image for one matched frame pair.
+
+    Left panel  – frame_a:  ground region (green band), van bbox (red),
+                             matched keypoints (yellow dots).
+    Right panel – frame_b:  same annotations.
+    Cyan lines connect corresponding matched pairs across the two panels.
+
+    Saved to {OUTPUT_DIR}/debug/match_{stem_a}__{stem_b}.png.
+    """
+    import pathlib
+
+    out_dir = pathlib.Path(config.OUTPUT_DIR) / 'debug'
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    img_a = frame_a.undistorted.copy()
+    img_b = frame_b.undistorted.copy()
+    ha, wa = img_a.shape[:2]
+    hb, wb = img_b.shape[:2]
+
+    # ── Ground region band (semi-transparent green) ───────────────────────────
+    for img, (g0, g1) in [(img_a, ground_a), (img_b, ground_b)]:
+        overlay = img.copy()
+        h = img.shape[0]
+        cv2.rectangle(overlay, (0, g0), (img.shape[1], g1), (0, 180, 0), -1)
+        cv2.addWeighted(overlay, 0.15, img, 0.85, 0, img)
+        cv2.line(img, (0, g0), (img.shape[1], g0), (0, 200, 0), 1)
+        cv2.line(img, (0, g1), (img.shape[1], g1), (0, 200, 0), 1)
+
+    # ── Van bboxes (red rectangle) ────────────────────────────────────────────
+    for img, bbox in [(img_a, van_bbox_a), (img_b, van_bbox_b)]:
+        if bbox is not None:
+            x1, y1, x2, y2 = (int(v) for v in bbox)
+            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 220), 2)
+            cv2.putText(img, 'van', (x1, max(0, y1 - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 220), 1, cv2.LINE_AA)
+
+    # ── Matched keypoints (yellow dots) ──────────────────────────────────────
+    for img, pts in [(img_a, pts_a), (img_b, pts_b)]:
+        for x, y in pts:
+            cv2.circle(img, (int(x), int(y)), 4, (0, 220, 220), -1, cv2.LINE_AA)
+
+    # ── Side-by-side canvas ───────────────────────────────────────────────────
+    h_out = max(ha, hb)
+    canvas = np.zeros((h_out, wa + wb, 3), dtype=np.uint8)
+    canvas[:ha, :wa]      = img_a
+    canvas[:hb, wa:wa+wb] = img_b
+
+    # ── Connecting lines (cyan, subsampled for readability) ───────────────────
+    step = max(1, len(pts_a) // 40)
+    for (xa, ya), (xb, yb) in zip(pts_a[::step], pts_b[::step]):
+        p1 = (int(xa),      int(ya))
+        p2 = (int(xb) + wa, int(yb))
+        cv2.line(canvas, p1, p2, (255, 200, 0), 1, cv2.LINE_AA)
+
+    # ── Labels ────────────────────────────────────────────────────────────────
+    for x, label in [(8, frame_a.stem[-20:]), (wa + 8, frame_b.stem[-20:])]:
+        cv2.rectangle(canvas, (x - 2, 0), (x + len(label) * 9, 20), (0, 0, 0), -1)
+        cv2.putText(canvas, label, (x, 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
+
+    n = len(pts_a)
+    summary = f'{n} matches'
+    cv2.putText(canvas, summary, (wa // 2 - 40, h_out - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 220), 1, cv2.LINE_AA)
+
+    fname = f'match_{frame_a.stem[-16:]}__{frame_b.stem[-16:]}.png'
+    out_path = out_dir / fname
+    cv2.imwrite(str(out_path), canvas)
+    logger.debug('Debug match image saved: %s', out_path)
+
 def _enhance_np(img_bgr: np.ndarray) -> np.ndarray:
     """CLAHE + unsharp mask for better SuperPoint keypoint detection."""
     gray  = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
@@ -201,6 +293,13 @@ def _match(frame_a: Frame, frame_b: Frame,
         step  = len(pts_a) // MAX_MATCHES_PAIR
         pts_a = pts_a[::step][:MAX_MATCHES_PAIR]
         pts_b = pts_b[::step][:MAX_MATCHES_PAIR]
+
+    if _DEBUG:
+        _save_debug_matches(
+            frame_a, frame_b, pts_a, pts_b,
+            (ga0, ga1), (gb0, gb1),
+            van_bbox_a, van_bbox_b,
+        )
 
     return pts_a, pts_b
 

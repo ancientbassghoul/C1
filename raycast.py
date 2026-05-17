@@ -85,8 +85,8 @@ def parse_args() -> argparse.Namespace:
         help="Override output directory from config.py.",
     )
     p.add_argument(
-        "--height", choices=["agl","avg","tor"], default="agl",
-        help="Camera Z: agl=AGL only (default, matches original), avg=average both, tor=takeoff_ref.",
+        "--height", choices=["agl","avg","tor"], default="tor",
+        help="Camera Z: tor=takeoff_ref (default), agl=AGL only, avg=average both.",
     )
     p.add_argument(
         "--enhance", action="store_true",
@@ -94,11 +94,16 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--preview-enhanced", action="store_true",
-        help="Show edge-enhanced frames used for SIFT, then exit.",
+        help="Show edge-enhanced frames used for SuperPoint, then exit.",
     )
     p.add_argument(
         "--no-refine", action="store_true",
         help="Skip automatic pitch refinement (use config overrides only).",
+    )
+    p.add_argument(
+        "--feature-matcher-debug", action="store_true", dest="feature_matcher_debug",
+        help="Save annotated match images (keypoints, ground region, van bbox) "
+             "to {OUTPUT_DIR}/debug/ for every matched frame pair.",
     )
     return p.parse_args()
 
@@ -125,7 +130,7 @@ def preview_enhanced(frames: list) -> None:
             break
 
 
-def run_pipeline(frames_dir: str, no_refine: bool = False, no_enhance: bool = False, height_mode: str = 'agl') -> list:
+def run_pipeline(frames_dir: str, no_refine: bool = False, no_enhance: bool = False, height_mode: str = 'tor', feature_matcher_debug: bool = False) -> list:
     """Load, OCR, undistort, pose-estimate, detect van, and refine pitches. Return ready frames."""
     from pipeline.frame     import load_frames
     from pipeline.ocr       import extract_telemetry_all
@@ -170,8 +175,9 @@ def run_pipeline(frames_dir: str, no_refine: bool = False, no_enhance: bool = Fa
         logger.info("Step 6/6 – Pitch refinement SKIPPED (--no-refine)")
     else:
         logger.info("Step 6/6 – Refining gimbal pitch via ground-scatter (LightGlue)")
-        from pipeline.feature_matcher import refine_pitches, set_enhance
+        from pipeline.feature_matcher import refine_pitches, set_enhance, set_debug
         set_enhance(not no_enhance)
+        set_debug(feature_matcher_debug)
         refine_pitches(frames, van_bboxes=van_bboxes)
 
     ready = [f for f in frames if f.ready]
@@ -263,7 +269,7 @@ def main() -> None:
         config.OUTPUT_DIR = args.output_dir
 
     # Run the shared pipeline
-    frames = run_pipeline(args.frames_dir, no_refine=args.no_refine, no_enhance=not args.enhance, height_mode=args.height)
+    frames = run_pipeline(args.frames_dir, no_refine=args.no_refine, no_enhance=not args.enhance, height_mode=args.height, feature_matcher_debug=args.feature_matcher_debug)
 
     # Mode dispatch
     if args.preview_enhanced:
