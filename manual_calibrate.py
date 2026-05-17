@@ -27,18 +27,17 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 # ── pipeline imports ──────────────────────────────────────────────────────────
-sys.path.insert(0, os.path.dirname(__file__))
 from pipeline.frame      import Frame
 from pipeline.ocr        import extract_telemetry_all
 from pipeline.undistort  import undistort_all
 from pipeline.pose       import estimate_poses
-from pitch_optimizer     import optimize_pitches
+from pipeline.pitch_solver import optimize_pitches
 
 import config
 
 
 def run_pipeline(frames_dir: str) -> list[Frame]:
-    """Run OCR → undistort → pose (no refine)."""
+    """Run OCR → undistort → pose (no pitch solving)."""
     from pipeline.frame import load_frames
     frames = load_frames(frames_dir)
     extract_telemetry_all(frames)

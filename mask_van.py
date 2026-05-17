@@ -18,6 +18,7 @@ import argparse, sys, os, cv2
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from pipeline.detect_van import _detect_white_blob
 
 
 VEHICLE_CLASSES = {2, 5, 7}   # COCO: car, bus, truck
@@ -121,6 +122,8 @@ def main():
     parser.add_argument('--padding',    type=int,   default=10)
     parser.add_argument('--use_yolo',   action='store_true',
                         help='Use YOLOv8 instead of GroundingDINO (default: GroundingDINO).')
+    parser.add_argument('--no-blob',    action='store_true', dest='no_blob',
+                        help='Disable white-blob fallback when primary detector fails.')
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -172,7 +175,7 @@ def main():
 
         # 2. Fallback to white blob
         if bbox is None and not args.no_blob:
-            bbox   = detect_blob(img)
+            bbox   = _detect_white_blob(img)
             method = 'blob'
 
         if bbox is not None:

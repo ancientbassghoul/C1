@@ -17,7 +17,7 @@ def collect_data(frames_dir, out_dir, optimize_pitch=False, enhance=False, heigh
     undistort_all(frames)
     estimate_poses(frames)   # sets frame.R using pitch overrides / 0deg
     if optimize_pitch:
-        from pipeline.refine import refine_pitches, set_enhance
+        from pipeline.feature_matcher import refine_pitches, set_enhance
         set_enhance(enhance)
         # Apply chosen height to position_enu before optimizer runs
         for f in frames:

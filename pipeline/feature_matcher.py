@@ -1,5 +1,5 @@
 """
-pipeline/refine.py – Pitch calibration via ground-scatter (SuperPoint + LightGlue).
+pipeline/feature_matcher.py – Ground feature matching for pitch calibration (SuperPoint + LightGlue).
 
 Key design decisions
 ────────────────────
@@ -22,14 +22,12 @@ from __future__ import annotations
 
 import logging
 import os
-import sys
 from itertools import combinations
 
 import cv2
 import numpy as np
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from pitch_optimizer import optimize_pitches
+from pipeline.pitch_solver import optimize_pitches, compute_residuals
 from pipeline.frame import Frame
 from pipeline.pose import build_rotation
 import config

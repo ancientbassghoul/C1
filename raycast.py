@@ -109,7 +109,7 @@ def parse_args() -> argparse.Namespace:
 
 def preview_enhanced(frames: list) -> None:
     """Show the CLAHE+unsharp edge-enhanced frames used for SuperPoint matching."""
-    from pipeline.refine import _enhance_np
+    from pipeline.feature_matcher import _enhance_np
     import cv2
     for frame in frames:
         if frame.undistorted is None:
@@ -126,22 +126,23 @@ def preview_enhanced(frames: list) -> None:
 
 
 def run_pipeline(frames_dir: str, no_refine: bool = False, no_enhance: bool = False, height_mode: str = 'agl') -> list:
-    """Load, OCR, undistort, and pose-estimate all frames. Return ready frames."""
-    from pipeline.frame    import load_frames
-    from pipeline.ocr      import extract_telemetry_all
+    """Load, OCR, undistort, pose-estimate, detect van, and refine pitches. Return ready frames."""
+    from pipeline.frame     import load_frames
+    from pipeline.ocr       import extract_telemetry_all
     from pipeline.undistort import undistort_all
-    from pipeline.pose     import estimate_poses
+    from pipeline.pose      import estimate_poses
+    from pipeline.detect_van import VanDetector
 
     logger.info("═" * 60)
-    logger.info("Step 1/4 – Loading frames from %s", frames_dir)
+    logger.info("Step 1/6 – Loading frames from %s", frames_dir)
     frames = load_frames(frames_dir)
 
     logger.info("═" * 60)
-    logger.info("Step 2/4 – Extracting telemetry via OCR")
+    logger.info("Step 2/6 – Extracting telemetry via OCR")
     extract_telemetry_all(frames)
 
     logger.info("═" * 60)
-    logger.info("Step 3/4 – Undistorting frames (fisheye model)")
+    logger.info("Step 3/6 – Undistorting frames (fisheye model)")
     undistort_all(frames)
 
     logger.info("═" * 60)
@@ -159,18 +160,19 @@ def run_pipeline(frames_dir: str, no_refine: bool = False, no_enhance: bool = Fa
         # 'agl' is already set by estimate_poses — no change needed
 
     logger.info("═" * 60)
-    # Van calibration disabled — focus on ground reprojection first.
-    # Re-enable once ground pipeline is validated.
-    van_model = None
-    logger.info("Step 5/6 – Van calibration DISABLED (ground pipeline validation mode)")
+    logger.info("Step 5/6 – Detecting van (GroundingDINO → white-blob fallback)")
+    detector   = VanDetector()
+    detections = detector.detect_all(frames)
+    # Convert Frame-keyed dict to stem-keyed dict for refine_pitches
+    van_bboxes = {f.stem: bbox for f, bbox in detections.items()}
 
     if no_refine:
         logger.info("Step 6/6 – Pitch refinement SKIPPED (--no-refine)")
     else:
-        logger.info("Step 6/6 – Refining gimbal pitch via homography decomposition")
-        from pipeline.refine import refine_pitches, set_enhance
+        logger.info("Step 6/6 – Refining gimbal pitch via ground-scatter (LightGlue)")
+        from pipeline.feature_matcher import refine_pitches, set_enhance
         set_enhance(not no_enhance)
-        refine_pitches(frames)
+        refine_pitches(frames, van_bboxes=van_bboxes)
 
     ready = [f for f in frames if f.ready]
     logger.info("═" * 60)
@@ -183,7 +185,7 @@ def run_pipeline(frames_dir: str, no_refine: bool = False, no_enhance: bool = Fa
     for f in not_ready:
         logger.warning("  NOT READY: %s  (check OCR output above)", f.stem)
 
-    return frames, van_model
+    return frames
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -206,10 +208,10 @@ def preview_undistort(frames: list) -> None:
             break
 
 
-def run_interactive(frames: list, van_model=None) -> None:
+def run_interactive(frames: list) -> None:
     """Launch the click-to-reproject GUI."""
     from pipeline.ui import ReprojectionViewer
-    viewer = ReprojectionViewer(frames, van_model=van_model)
+    viewer = ReprojectionViewer(frames)
     viewer.run()
 
 
@@ -217,7 +219,6 @@ def run_batch(
     frames: list,
     source_stem: str,
     pick: tuple[float, float],
-    van_model=None,
 ) -> None:
     """Headless: reproject *pick* from *source_stem* and save proof sheet."""
     from pipeline.geometry import reproject_pick
@@ -239,7 +240,7 @@ def run_batch(
     px, py = pick
     logger.info("Batch reproject: source=%s  pick=(%.0f, %.0f)", source_stem, px, py)
 
-    results = reproject_pick(px, py, source, frames, van_model=van_model)
+    results = reproject_pick(px, py, source, frames)
 
     if not results:
         logger.error("No successful reprojections.  Check telemetry and config.py.")
@@ -262,7 +263,7 @@ def main() -> None:
         config.OUTPUT_DIR = args.output_dir
 
     # Run the shared pipeline
-    frames, van_model = run_pipeline(args.frames_dir, no_refine=args.no_refine, no_enhance=not args.enhance, height_mode=args.height)
+    frames = run_pipeline(args.frames_dir, no_refine=args.no_refine, no_enhance=not args.enhance, height_mode=args.height)
 
     # Mode dispatch
     if args.preview_enhanced:
@@ -271,16 +272,14 @@ def main() -> None:
 
     if args.preview_undistort:
         preview_undistort(frames)
-        van_model = None  # not needed for undistort preview
-
     elif args.batch:
         if not args.source_frame or not args.pick:
             print("Batch mode requires --source-frame and --pick.  See --help.")
             sys.exit(1)
-        run_batch(frames, args.source_frame, tuple(args.pick), van_model)
+        run_batch(frames, args.source_frame, tuple(args.pick))
 
     else:
-        run_interactive(frames, van_model)
+        run_interactive(frames)
 
 
 if __name__ == "__main__":

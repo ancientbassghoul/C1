@@ -75,7 +75,7 @@ LightGlue is installed from source and is not in `requirements.txt`:
 venv\Scripts\pip install git+https://github.com/cvg/LightGlue.git
 ```
 
-### 6 — GroundingDINO  *(van detection in mask_van.py)*
+### 6 — GroundingDINO  *(van detection — step 5 of the pipeline)*
 
 GroundingDINO must be compiled with the MSVC toolchain set up in steps 2–3. Run these commands **in order** in a plain `cmd.exe` window (not PowerShell):
 
@@ -107,7 +107,6 @@ Nothing is installed globally. To start fresh, delete the `venv` folder and re-r
 raycast_challenge/
 ├── raycast.py           Entry point & CLI (pipeline + mode dispatch)
 ├── config.py            All tunable parameters — start here if accuracy is poor
-├── pitch_optimizer.py   Ground-scatter pitch calibration (called by refine.py)
 ├── manual_calibrate.py  Interactive tool: click ground correspondences → pitch overrides
 ├── export_blender.py    Export camera poses as a Blender Python scene script
 ├── mask_van.py          Undistort frames and paint a black rectangle over the van
@@ -115,28 +114,30 @@ raycast_challenge/
 ├── setup.bat            One-click Windows environment setup
 ├── setup.py             Package definition (for reference / pip install -e .)
 └── pipeline/
-    ├── frame.py         Frame dataclass + bulk image loader
-    ├── ocr.py           Telemetry extraction from HUD overlays (EasyOCR)
-    ├── undistort.py     Fisheye lens correction (OpenCV fisheye model)
-    ├── pose.py          Camera pose estimation: GPS → ENU, roll detection, R matrix
-    ├── refine.py        Ground-scatter pitch refinement (SuperPoint + LightGlue)
-    ├── geometry.py      Ray–ground-plane intersection + reprojection math
-    ├── ui.py            Interactive grid viewer + proof-sheet export
-    └── van.py           Van 3D model and YOLO/blob detector (currently unused)
+    ├── frame.py             Frame dataclass + bulk image loader
+    ├── ocr.py               Telemetry extraction from HUD overlays (EasyOCR)
+    ├── undistort.py         Fisheye lens correction (OpenCV fisheye model)
+    ├── pose.py              Camera pose estimation: GPS → ENU, roll detection, R matrix
+    ├── detect_van.py        Van detection (GroundingDINO → white-blob fallback)
+    ├── pitch_solver.py      Ground-scatter residual function and least-squares solver
+    ├── feature_matcher.py   Ground feature matching and pitch refinement orchestration
+    ├── geometry.py          Ray–ground-plane intersection + reprojection math
+    └── ui.py                Interactive grid viewer + proof-sheet export
 ```
 
 ---
 
 ## Pipeline overview
 
-The pipeline runs in 5 sequential steps each time you launch `raycast.py`:
+The pipeline runs in 6 sequential steps each time you launch `raycast.py`:
 
 ```
 Step 1  Load frames         – read all images from --frames_dir
 Step 2  OCR telemetry       – extract GPS, heading, altitudes from HUD
 Step 3  Undistort           – correct fisheye lens distortion
 Step 4  Estimate poses      – build camera positions + rotation matrices
-Step 5  Refine pitches      – ground-scatter feature matching improves pitch estimates
+Step 5  Detect van          – GroundingDINO (→ white-blob fallback) locates the van in each frame
+Step 6  Refine pitches      – ground-scatter matching, van region excluded from keypoints
         ↓
         Interactive viewer / batch output
 ```
@@ -206,21 +207,27 @@ R_world_from_cam = [right | down | fwd]   (columns = camera axes in world)
 R_cam_from_world = R_world_from_cam.T     (orthonormal → transpose = inverse)
 ```
 
-### Step 4 — Ground-scatter pitch refinement
+### Step 4 — Van detection
+
+Before feature matching, each undistorted frame is searched for the white van using **GroundingDINO** with the text prompt `"white van . delivery van . cargo van"`. If GroundingDINO returns no result above the confidence threshold, a **white-blob fallback** kicks in: the frame is converted to HSV, pixels with low saturation and high value are thresholded, and the largest blob with a plausible aspect ratio in the lower 60% of the image is returned as the bounding box.
+
+The detected bounding box per frame is passed directly to the pitch refinement step so that van pixels are excluded from feature matching. The van sits above the ground plane, so any keypoints on it would produce ray–ground intersections with systematic Z errors — corrupting the pitch estimate. Detection results are logged; frames where neither method finds a van proceed to refinement without masking.
+
+### Step 5 — Ground-scatter pitch refinement
 
 The camera gimbal pitch is not available in the HUD. This step recovers it by minimising the scatter of ray–ground intersections for shared ground features across frame pairs.
 
-**Feature matching** — SuperPoint keypoints are extracted from each frame and matched with LightGlue. Matches are filtered to the lower 55% of the image content area (ground region) and validated with RANSAC homography.
+**Feature matching** — SuperPoint keypoints are extracted from each frame and matched with LightGlue. Matches are filtered to the lower 55% of the image content area (ground region), any matches falling inside the van bounding box are excluded, and the remainder are validated with RANSAC homography.
 
-**Pitch optimisation** — For each matched feature seen in two or more frames, each camera shoots a ray from its pixel through the ground plane. A perfect pitch would make all rays from different cameras converge on the same point. The optimizer minimises the 2D scatter (East, North) of these intersections using `scipy.optimize.least_squares` with a Cauchy robust loss (down-weights incorrect correspondences).
+**Pitch optimisation** — For each matched feature seen in two or more frames, each camera shoots a ray from its pixel through the ground plane. A perfect pitch would make all rays converge on the same point. The optimizer minimises the 2D scatter (East, North) of these intersections using `scipy.optimize.least_squares` with a Cauchy robust loss (down-weights incorrect correspondences).
 
 **Two-pass incremental solve:**
-- *Pass 1* — frames with ≥ `MIN_MATCHES_STABLE` total matched keypoints across all their pairs are solved jointly in a global optimization.
+- *Pass 1* — frames with ≥ `MIN_MATCHES_STABLE` total matched keypoints across all their pairs are solved jointly in a global optimisation.
 - *Pass 2* — remaining frames are solved one at a time, with all pass-1 pitches held fixed, making each a 1-DOF problem.
 
 The key enabler is the **takeoff-relative altitude**: because all camera Z coordinates share the same datum, the GPS-derived positions are geometrically consistent across the dataset. This gives the optimizer a fixed scale reference and lifts the scale ambiguity that normally prevents pitch recovery from feature matches alone.
 
-### Step 5 — Ray-casting (the re-projection pipeline)
+### Step 6 — Ray-casting (the re-projection pipeline)
 
 ```
 Pick pixel (u, v) in source frame
@@ -244,7 +251,7 @@ The ground plane is placed at `Z = terrain_offset_m` (not hardcoded to 0). Both 
 | Too much black border around undistorted frame | Increase `UNDISTORT_SCALE` toward 1.0 |
 | Reprojection consistently offset in one direction | Pitch wrong for that frame; add entry to `GIMBAL_PITCH_OVERRIDES` |
 | Near-nadir frames reproject poorly | Add manual pitch override (~-85°) if refinement fails to converge |
-| Only 1–2 frames get pitch refined | Not enough LightGlue ground matches; check `MIN_GROUND_MATCHES` and `MIN_MATCHES_STABLE` in refine.py |
+| Only 1–2 frames get pitch refined | Not enough LightGlue ground matches; check `MIN_GROUND_MATCHES` and `MIN_MATCHES_STABLE` in feature_matcher.py |
 | Reprojection correct for ground, wrong for van roof | Expected — van roof is ~2 m above the ground plane |
 | OCR returns None for some frames | Check log output; glare may corrupt a crop; set manual overrides in config.py |
 

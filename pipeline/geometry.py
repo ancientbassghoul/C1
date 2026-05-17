@@ -174,17 +174,12 @@ def reproject_pick(
     py: float,
     source_frame,            # pipeline.frame.Frame
     target_frames: list,     # list[pipeline.frame.Frame]
-    van_model=None,          # Optional[pipeline.van.VanModel]
 ) -> dict:
     """
     Full re-projection pipeline for a single pixel pick.
 
     Given a pixel (px, py) in *source_frame*'s undistorted image, compute
     the corresponding pixel in every *target_frame* that has a valid pose.
-
-    If *van_model* is provided and the ray hits the van's 3D bounding box,
-    the box surface intersection is used instead of the ground plane.
-    This gives correct reprojection for clicks on the van body/roof.
 
     Returns a dict mapping Frame → (px, py) for every successful projection.
     """
@@ -206,23 +201,11 @@ def reproject_pick(
         *origin, *direction,
     )
 
-    # Step 2 – Intersect: try van box first, fall back to ground plane.
-    world_pt = None
-
-    if van_model is not None and van_model.calibrated:
-        world_pt = van_model.intersect_ray(origin, direction)
-        if world_pt is not None:
-            logger.info(
-                "Ray hit van box at [%.2f E, %.2f N, %.2f U] m", *world_pt,
-            )
-
+    # Step 2 – Intersect with ground plane (Z = 0, AGL convention).
+    world_pt = intersect_ground_plane(origin, direction, z=0.0)
     if world_pt is None:
-        # Ground plane is at Z = 0 (camera Z = alt_agl, ground = 0 by definition).
-        world_pt = intersect_ground_plane(origin, direction, z=0.0)
-        if world_pt is None:
-            logger.warning("Ray did not intersect the ground plane.")
-            return {}
-        logger.info("Ray hit ground plane at Z=0 (AGL convention).")
+        logger.warning("Ray did not intersect the ground plane.")
+        return {}
 
     logger.info("Ground intersection: [%.2f E, %.2f N, %.2f U] m", *world_pt)
 

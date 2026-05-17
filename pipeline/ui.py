@@ -140,15 +140,14 @@ class ReprojectionViewer:
 
     Usage::
 
-        viewer = ReprojectionViewer(frames, van_model=van_model)
+        viewer = ReprojectionViewer(frames)
         viewer.run()
     """
 
     WINDOW = "Raycast Challenge  [click=pick | s=save | r=reset | q=quit]"
 
-    def __init__(self, frames: list[Frame], van_model=None) -> None:
+    def __init__(self, frames: list[Frame]) -> None:
         self.frames      = [f for f in frames if f.ready]
-        self.van_model   = van_model   # Optional[VanModel] for ray-box intersection
         self.annotations: dict[Frame, dict] = {f: {} for f in self.frames}
         self._grid       = self._rebuild_grid()
         self._n_cols     = min(MAX_COLS, len(self.frames))
@@ -198,7 +197,7 @@ class ReprojectionViewer:
         self.annotations = {f: {} for f in self.frames}
         self.annotations[source]["src"] = (px, py)
 
-        results = reproject_pick(px, py, source, self.frames, van_model=self.van_model)
+        results = reproject_pick(px, py, source, self.frames)
         for tf, proj in results.items():
             self.annotations[tf]["dst"] = proj
 

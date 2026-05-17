@@ -30,7 +30,7 @@ The pitch (camera tilt) is not directly encoded in the HUD.
 
 Priority order used by estimate_gimbal_pitch():
   1. Manual override from config.GIMBAL_PITCH_OVERRIDES  (always wins).
-  2. 0° (horizontal) — the ground-scatter optimizer in refine.py then
+  2. 0° (horizontal) — the ground-scatter optimizer in feature_matcher.py then
      refines this to the correct value using SuperPoint + LightGlue
      ground-feature matches across frames.
 
@@ -87,7 +87,7 @@ def estimate_gimbal_pitch(frame: Frame, roll_deg: float = 0.0) -> float:
 
     Priority:
       1. Manual override from config.GIMBAL_PITCH_OVERRIDES (always wins).
-      2. 0° — the ground-scatter optimizer (refine.py) refines this later.
+      2. 0° — the ground-scatter optimizer (feature_matcher.py) refines this later.
     """
     if frame.stem in config.GIMBAL_PITCH_OVERRIDES:
         pitch = config.GIMBAL_PITCH_OVERRIDES[frame.stem]
