@@ -52,75 +52,68 @@ All arguments to `raycast.py`:
 
 ## Setup
 
-### 1 — Python 3.11
+### Step 1 — Python 3.11
 
-**Requires Python 3.11.** Python 3.12+ causes build failures for some dependencies (they lack pre-built wheels and require compilers that are not normally present on Windows). Install Python 3.11 from https://www.python.org/downloads/release/python-3119/ before continuing.
+**Requires Python 3.11.** Python 3.12+ causes build failures for some dependencies. Install from https://www.python.org/downloads/release/python-3119/
 
 ```cmd
 python --version
 :: Should print: Python 3.11.x
 ```
 
-### 2 — CUDA Toolkit 12.1  *(GPU / GroundingDINO only)*
+### Step 2 — CUDA Toolkit 12.1
 
-GroundingDINO requires a CUDA build environment. Skip this section if you intend to run on CPU only (GroundingDINO and LightGlue will be slower but functional).
+Required for GroundingDINO; also accelerates LightGlue and GeoCalib at runtime.
 
-1. Download and install **CUDA Toolkit 12.1** from https://developer.nvidia.com/cuda-12-1-0-download-archive  
-   During installation, choose **Custom** and **uncheck the driver component** if you already have a newer driver installed — installing an older driver over a newer one will break things.
+1. Download and install **CUDA Toolkit 12.1** from https://developer.nvidia.com/cuda-12-1-0-download-archive
+   During installation choose **Custom** and uncheck the driver component if you already have a newer driver.
 2. Add the `CUDA_HOME` environment variable (System → Advanced → Environment Variables → New):
    - **Name:** `CUDA_HOME`
    - **Value:** `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.1`
 
-### 3 — Visual Studio Build Tools  *(GroundingDINO only)*
+### Step 3 — Run SETUP_FIRST.bat
 
-GroundingDINO must be compiled from source and requires the MSVC C++ compiler.
-
-1. Download **Build Tools for Visual Studio** from https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022
-2. In the installer, select the **Desktop development with C++** workload.
-3. In the right-hand panel, make sure **MSVC v143 – VS 2022 C++ x64/x86 build tools (v14.36)** is checked (the exact minor version matters for GroundingDINO's build system).
-
-### 4 — Core environment
-
-Run once to create the virtual environment and install all standard dependencies:
+Installs the venv, PyTorch, all `requirements.txt` dependencies, LightGlue, and the local package.
 
 ```cmd
-setup.bat
+SETUP_FIRST.bat
 ```
 
-This creates `./venv`, installs PyTorch (CPU build), pins `python-bidi 0.4.2`, then installs everything in `requirements.txt` including `transformers==4.38.1` (required by GroundingDINO).
+### Step 4 — Install GroundingDINO  *(manual — requires VS Build Tools + CUDA)*
 
-### 5 — LightGlue  *(pitch refinement)*
+**a) Install Visual Studio Build Tools**
 
-LightGlue is installed from source and is not in `requirements.txt`:
+Download from https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022 and select **Desktop development with C++**. In the right-hand panel ensure **MSVC v143 – VS 2022 C++ x64/x86 build tools (v14.36)** is checked.
 
-```cmd
-venv\Scripts\pip install git+https://github.com/cvg/LightGlue.git
-```
-
-### 6 — GroundingDINO  *(van detection — step 5 of the pipeline)*
-
-GroundingDINO must be compiled with the MSVC toolchain set up in steps 2–3. Run these commands **in order** in a plain `cmd.exe` window (not PowerShell):
+**b) Install GroundingDINO** — run in a plain `cmd.exe` window (not PowerShell):
 
 ```cmd
-:: 1. Activate the MSVC compiler for this session
+:: 1. Activate MSVC compiler for this session
 "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" -vcvars_ver=14.36
 
-:: 2. Tell distutils to use the SDK compiler (required for the CUDA extension build)
+:: 2. Tell distutils to use the SDK compiler
 set DISTUTILS_USE_SDK=1
 
-:: 3. Ensure build tools are up to date inside the venv
+:: 3. Ensure build tools are fresh
 venv\Scripts\pip install wheel setuptools
 
-:: 4. Build and install GroundingDINO (--no-build-isolation keeps our pinned transformers)
+:: 4. Build and install (--no-build-isolation keeps our pinned transformers)
 venv\Scripts\pip install git+https://github.com/IDEA-Research/GroundingDINO.git --no-build-isolation
 ```
 
 The model weights (~700 MB) are downloaded automatically on first use.
 
+### Step 5 — Run SETUP_SECOND.bat
+
+Installs pyceres and GeoCalib (both are pre-built wheels, no compiler needed).
+
+```cmd
+SETUP_SECOND.bat
+```
+
 ---
 
-Nothing is installed globally. To start fresh, delete the `venv` folder and re-run from step 4.
-
+Nothing is installed globally. To start fresh, delete `venv` and re-run from Step 3
 ---
 
 ## Project structure
@@ -140,8 +133,10 @@ raycast_challenge/
     ├── ocr.py               Telemetry extraction from HUD overlays (EasyOCR)
     ├── undistort.py         Fisheye lens correction (OpenCV fisheye model)
     ├── pose.py              Camera pose estimation: GPS → ENU, roll detection, R matrix
-    ├── detect_van.py        Van detection (GroundingDINO → white-blob fallback)
-    ├── orientation_solver.py  Ground-scatter residual function and orientation least-squares solver
+    ├── detect_van.py            Van detection (GroundingDINO → white-blob fallback)
+    ├── van_corners.py           Van corner geometry, visibility, and bbox matching
+    ├── pitch_from_geocalib.py   Batch pitch + roll estimation via GeoCalib (shared intrinsics)
+    ├── orientation_solver.py  Pyceres cost functions + joint solve (ground scatter + van corners)
     ├── feature_matcher.py   Ground feature matching and pitch refinement orchestration
     ├── geometry.py          Ray–ground-plane intersection + reprojection math
     └── ui.py                Interactive grid viewer + proof-sheet export
@@ -157,7 +152,7 @@ The pipeline runs in 6 sequential steps each time you launch `raycast.py`:
 Step 1  Load frames         – read all images from --frames_dir
 Step 2  OCR telemetry       – extract GPS, heading, altitudes from HUD
 Step 3  Undistort           – correct fisheye lens distortion
-Step 4  Estimate poses      – build camera positions + rotation matrices
+Step 4  Estimate poses      – build camera positions + rotation matrices; GeoCalib batch-estimates pitch + roll for all frames
 Step 5  Detect van          – GroundingDINO (→ white-blob fallback) locates the van in each frame
 Step 6  Refine pitches      – ground-scatter matching, van region excluded from keypoints
         ↓
@@ -217,7 +212,21 @@ The ENU origin is the GPS position of the first frame.
 
 **Camera roll** is detected from the artificial horizon bracket indicator in the HUD. Two symmetric white bracket symbols (⌐ ¬) are extracted by thresholding at ≥235 and finding the connected component pair that is most equidistant and opposite about the image centre. The angle of the line joining them gives the roll.
 
-**Gimbal pitch** defaults to 0° and is refined in Step 5. Manual overrides can be set in `config.py` under `GIMBAL_PITCH_OVERRIDES` for frames where the optimizer cannot converge.
+**Gimbal pitch and roll** are both estimated in a single GeoCalib batch call across all frames before the per-frame pose loop. GeoCalib is a neural camera calibration model (same cvg group as LightGlue) that estimates the gravity direction in the camera frame from visual cues (line distributions, vanishing points). Running with `shared_intrinsics=True` constrains all frames to share a single focal length — physically correct since all frames come from the same camera body. From the per-frame gravity vector `g_cam`:
+
+```
+pitch = arcsin(-g_cam[2])          # exact, roll-independent
+roll  = arctan2(-g_cam[0], g_cam[1])  # exact, pitch-independent
+```
+
+The pitch estimate seeds the Ceres orientation solver in Step 5 and sets each camera's search window (±`SOLVER_PITCH_OFFSET`). The roll estimate is used as a fallback for frames where HUD bracket detection fails. Priority order:
+
+| | Pitch | Roll |
+|---|---|---|
+| 1st | `GIMBAL_PITCH_OVERRIDES` | `CAMERA_ROLL_OVERRIDES` |
+| 2nd | GeoCalib | HUD bracket detection |
+| 3rd | 0° seed | GeoCalib |
+| 4th | — | `CAMERA_ROLL_DEG` (0°) |
 
 From position + yaw + pitch + roll we build the rotation matrix R that maps world vectors to camera vectors:
 
@@ -241,11 +250,9 @@ The camera gimbal pitch is not available in the HUD. This step recovers it by mi
 
 **Feature matching** — SuperPoint keypoints are extracted from each frame and matched with LightGlue. Matches are filtered to the lower 55% of the image content area (ground region), any matches falling inside the van bounding box are excluded, and the remainder are validated with RANSAC homography.
 
-**Orientation optimisation** — For each matched feature seen in two or more frames, each camera shoots a ray from its pixel through the ground plane. A perfect orientation would make all rays converge on the same point. The optimizer (`orientation_solver.py`) minimises the 2D scatter (East, North) of these intersections using `scipy.optimize.least_squares` with a Cauchy robust loss. It simultaneously solves for three unknowns per camera: **pitch** (−89° → +15°), **yaw offset** (±5°, correction on the OCR heading), and **roll offset** (±1°, correction on the bracket-detected roll). Bounds are set in `config.py` under `SOLVER_*`.
+**Orientation optimisation** — For each matched feature seen in two or more frames, each camera shoots a ray from its pixel through the ground plane. A perfect orientation would make all rays converge on the same point. The optimizer (`orientation_solver.py`, pyceres) minimises the 2D scatter (East, North) of these intersections with a Cauchy robust loss. It simultaneously solves for three unknowns per camera: **pitch**, **yaw offset** (±`SOLVER_YAW_OFFSET_RANGE`, correction on the OCR heading), and **roll offset** (±`SOLVER_ROLL_OFFSET_RANGE`, correction on the bracket-detected roll). Each camera's pitch search window is centred on its GeoCalib seed and extends ±`SOLVER_PITCH_OFFSET` degrees (default ±20°), clamped to [`SOLVER_PITCH_FLOOR`, `SOLVER_PITCH_CEILING`]. All bounds are set in `config.py`.
 
-**Two-pass incremental solve:**
-- *Pass 1* — frames with ≥ `MIN_MATCHES_STABLE` total matched keypoints across all their pairs are solved jointly in a global optimisation.
-- *Pass 2* — remaining frames are solved one at a time, with all pass-1 pitches held fixed, making each a 1-DOF problem.
+**Single joint solve (pyceres):** all cameras and the van pose are solved simultaneously in one Ceres optimisation. The sparse block structure — each ground residual touches exactly two camera parameter blocks — is exploited by Ceres's `SPARSE_NORMAL_CHOLESKY` linear solver, giving dramatically faster convergence than the previous dense scipy approach.
 
 The key enabler is the **takeoff-relative altitude**: because all camera Z coordinates share the same datum, the GPS-derived positions are geometrically consistent across the dataset. This gives the optimizer a fixed scale reference and lifts the scale ambiguity that normally prevents pitch recovery from feature matches alone.
 
@@ -273,7 +280,7 @@ The ground plane is placed at `Z = terrain_offset_m` (not hardcoded to 0). Both 
 | Too much black border around undistorted frame | Increase `UNDISTORT_SCALE` toward 1.0 |
 | Reprojection consistently offset in one direction | Pitch wrong for that frame; add entry to `GIMBAL_PITCH_OVERRIDES` |
 | Near-nadir frames reproject poorly | Add manual pitch override (~-85°) if refinement fails to converge |
-| Only 1–2 frames get pitch refined | Not enough LightGlue ground matches; check `MIN_GROUND_MATCHES` and `MIN_MATCHES_STABLE` in feature_matcher.py |
+| Very few ground matches found | Not enough LightGlue inliers; lower `MIN_GROUND_MATCHES` in feature_matcher.py or increase `MATCH_GRID_COLS`/`MATCH_GRID_ROWS` in config.py |
 | Reprojection correct for ground, wrong for van roof | Expected — van roof is ~2 m above the ground plane |
 | OCR returns None for some frames | Check log output; glare may corrupt a crop; set manual overrides in config.py |
 
@@ -281,8 +288,8 @@ The ground plane is placed at `Z = terrain_offset_m` (not hardcoded to 0). Both 
 
 ## Known limitations
 
-- **Gimbal pitch is inferred, not measured.** The HUD does not expose it directly. Ground-scatter refinement handles most frames, but near-nadir frames with no usable ground features and poor overlap with other frames may still need a manual override in `config.py`.
+- **Gimbal pitch is estimated, not measured.** The HUD does not expose it directly. GeoCalib provides the initial estimate; the Ceres solver refines it. Near-nadir frames with no usable ground features and poor overlap with other frames may still need a manual override in `config.py` under `GIMBAL_PITCH_OVERRIDES`.
 - **Single flat ground plane.** Points on elevated objects (van roof, tree canopy) will reproject with a Z error equal to their height above ground (~2 m for the van), producing a visible pixel offset in the target frame. This is physically correct behaviour, not a bug.
 - **OCR is the most fragile step.** Sun glare and HUD overlaps can corrupt individual field reads. The log prints every parsed value — check it on first run and add manual overrides in `config.py` for any frame that reads incorrectly.
-- **Roll assumed zero if detection fails.** Drone banking visible in some frames is detected from HUD bracket indicators. Per-frame roll overrides can be set in `config.py` under `CAMERA_ROLL_OVERRIDES` if detection gives wrong results.
+- **Roll falls back to GeoCalib when bracket detection fails.** HUD bracket detection is the primary roll source; GeoCalib provides the fallback. Per-frame roll overrides can always be set in `config.py` under `CAMERA_ROLL_OVERRIDES`.
 - **LightGlue requires a separate install.** See Setup above.

@@ -1,13 +1,12 @@
 import argparse, sys, os, json, math
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-def collect_data(frames_dir, out_dir, calculate_orientation=False, enhance=False, height_mode='tor', feature_matcher_debug=False):
+def collect_data(frames_dir, out_dir, calculate_orientation=False, enhance=False, height_mode='tor', feature_matcher_debug=False, no_horizon_indicator_reading=False):
     import config
     import cv2
     from pipeline.frame     import load_frames
     from pipeline.ocr       import extract_telemetry_all
     from pipeline.undistort import undistort_all
-    from pipeline.pose      import detect_camera_roll
 
     os.makedirs(out_dir, exist_ok=True)
 
@@ -15,7 +14,7 @@ def collect_data(frames_dir, out_dir, calculate_orientation=False, enhance=False
     frames = load_frames(frames_dir)
     extract_telemetry_all(frames)
     undistort_all(frames)
-    estimate_poses(frames)   # sets frame.R using pitch overrides / 0deg
+    estimate_poses(frames, skip_bracket_roll=no_horizon_indicator_reading)
     if calculate_orientation:
         from pipeline.detect_van    import VanDetector
         from pipeline.feature_matcher import refine_pitches, set_enhance, set_debug
@@ -60,11 +59,10 @@ def collect_data(frames_dir, out_dir, calculate_orientation=False, enhance=False
             z = alt_ref
         else:  # 'agl' default
             z = alt_agl
-        roll  = 0.0
-        if f.raw is not None:
-            det = detect_camera_roll(f.raw)
-            if det is not None:
-                roll = -det   # negate to match pose.py convention
+        # camera_roll_deg is set by estimate_poses using whichever roll source
+        # was active (GeoCalib or bracket detector). Using it here ensures the
+        # rigged cameras match the app cameras exactly.
+        roll = f.camera_roll_deg
         pitch   = f.gimbal_pitch_deg if f.gimbal_pitch_deg is not None else 0.0
         fov_deg = 90.0
         if f.K_undist is not None and f.undistorted is not None:
@@ -240,11 +238,14 @@ if __name__ == '__main__':
     parser.add_argument('--feature-matcher-debug', action='store_true',
                         dest='feature_matcher_debug',
                         help='Save annotated match images to {out_dir}/debug/ for every matched frame pair.')
+    parser.add_argument('--no-horizon-indicator-reading', action='store_true',
+                        dest='no_horizon_indicator_reading',
+                        help='Skip HUD bracket roll detection; use GeoCalib roll for all frames instead.')
     parser.add_argument('--out_dir',    required=True,
                         help='Directory to save undistorted images and blender_scene.py')
     args = parser.parse_args()
 
-    data = collect_data(args.frames_dir, args.out_dir, calculate_orientation=args.calculate_orientation, enhance=args.enhance, height_mode=args.height, feature_matcher_debug=args.feature_matcher_debug)
+    data = collect_data(args.frames_dir, args.out_dir, calculate_orientation=args.calculate_orientation, enhance=args.enhance, height_mode=args.height, feature_matcher_debug=args.feature_matcher_debug, no_horizon_indicator_reading=args.no_horizon_indicator_reading)
 
     print(f"{len(data)} frame(s):")
     for d in data:

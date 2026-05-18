@@ -28,14 +28,18 @@ Gimbal pitch
 ────────────
 The pitch (camera tilt) is not directly encoded in the HUD.
 
-Priority order used by estimate_gimbal_pitch():
+Priority order (applied in estimate_poses):
   1. Manual override from config.GIMBAL_PITCH_OVERRIDES  (always wins).
-  2. 0° (horizontal) — the ground-scatter optimizer in feature_matcher.py then
-     refines this to the correct value using SuperPoint + LightGlue
-     ground-feature matches across frames.
+  2. GeoCalib batch estimate (shared_intrinsics=True across all frames).
+  3. 0° fallback — the Ceres orientation solver refines from there.
 
-Near-nadir frames or frames with poor feature overlap may still need a
-manual pitch override in config.py if the optimizer cannot converge.
+Roll
+────
+Priority order:
+  1. Manual override from config.CAMERA_ROLL_OVERRIDES.
+  2. HUD bracket indicator detection.
+  3. GeoCalib estimate (fallback when bracket detection fails).
+  4. config.CAMERA_ROLL_DEG (default 0°).
 """
 
 from __future__ import annotations
@@ -75,26 +79,6 @@ def gps_to_enu(
     up    = alt
 
     return np.array([east, north, up], dtype=np.float64)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Gimbal pitch
-# ─────────────────────────────────────────────────────────────────────────────
-
-def estimate_gimbal_pitch(frame: Frame, roll_deg: float = 0.0) -> float:
-    """
-    Return the camera gimbal pitch for *frame* (degrees, negative = down).
-
-    Priority:
-      1. Manual override from config.GIMBAL_PITCH_OVERRIDES (always wins).
-      2. 0° — the ground-scatter optimizer (feature_matcher.py) refines this later.
-    """
-    if frame.stem in config.GIMBAL_PITCH_OVERRIDES:
-        pitch = config.GIMBAL_PITCH_OVERRIDES[frame.stem]
-        logger.info("[%s] Using manual pitch override: %.1f°", frame.stem, pitch)
-        return pitch
-
-    return 0.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -298,18 +282,16 @@ def detect_camera_roll(raw_img: np.ndarray) -> Optional[float]:
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
 
-def estimate_poses(frames: list[Frame]) -> None:
+def estimate_poses(frames: list[Frame], skip_bracket_roll: bool = False) -> None:
     """
     Compute position_enu, R, and gimbal_pitch_deg for every frame in-place.
 
     Frames without valid GPS/heading/altitude telemetry are skipped with a
     warning (they will not be usable for ray-casting).
     """
-    # ── Choose ENU origin ──────────────────────────────────────────────────
-    # Use the first frame that has valid GPS as the world origin.
+    # ── Choose ENU origin ─────────────────────────────────────────────────
     origin_frame = next(
-        (f for f in frames if f.lat is not None and f.lon is not None),
-        None,
+        (f for f in frames if f.lat is not None and f.lon is not None), None,
     )
     if origin_frame is None:
         raise RuntimeError("No frame has valid GPS telemetry – cannot establish ENU origin.")
@@ -318,6 +300,16 @@ def estimate_poses(frames: list[Frame]) -> None:
     lon_ref = origin_frame.lon
     logger.info("ENU origin: lat=%.6f  lon=%.6f  (frame: %s)",
                 lat_ref, lon_ref, origin_frame.stem)
+
+    # ── GeoCalib batch estimation ─────────────────────────────────────────
+    # Run once across all frames with shared focal length constraint.
+    # Returns {frame: (pitch_deg, roll_deg)} for every eligible frame.
+    geocalib: dict = {}
+    if config.GEOCALIB_ENABLED:
+        from pipeline.pitch_from_geocalib import calibrate_all_frames
+        geocalib = calibrate_all_frames(frames)
+        logger.info("GeoCalib estimated pitch+roll for %d/%d frame(s).",
+                    len(geocalib), len(frames))
 
     # ── Per-frame pose ─────────────────────────────────────────────────────
     for frame in frames:
@@ -329,29 +321,40 @@ def estimate_poses(frames: list[Frame]) -> None:
             frame.lat, frame.lon, frame.alt_takeoff_ref_m,
             lat_ref, lon_ref,
         )
-        # Ground plane is defined as Z = 0.
-        # Camera Z = AGL altitude (direct radar measurement, most reliable).
         frame.position_enu = np.array([_enu[0], _enu[1], frame.alt_agl_m])
 
-        # ── Roll — detected from HUD bracket indicator ────────────────────────
+        # ── Roll ──────────────────────────────────────────────────────────────
+        # Priority: manual override → bracket detection (unless skipped) → GeoCalib → default
         if frame.stem in config.CAMERA_ROLL_OVERRIDES:
             roll = config.CAMERA_ROLL_OVERRIDES[frame.stem]
-            logger.info("[%s] Using manual roll override: %.1f°", frame.stem, roll)
+            frame.camera_roll_deg = -roll   # override: same convention as bracket
+            logger.info("[%s] Roll from manual override: %.1f°", frame.stem, roll)
+        elif not skip_bracket_roll and (detected_roll := detect_camera_roll(frame.raw)) is not None:
+            roll = detected_roll
+            frame.camera_roll_deg = -roll   # bracket: image-space convention, needs negation
+            logger.info("[%s] Roll from horizon indicator: %.1f°", frame.stem, roll)
+        elif frame in geocalib:
+            _, roll = geocalib[frame]
+            frame.camera_roll_deg = roll   # GeoCalib: already in camera convention, no negation
+            logger.info("[%s] Roll from GeoCalib%s: %.1f°", frame.stem,
+                        " (bracket skipped)" if skip_bracket_roll else "", roll)
         else:
-            detected_roll = detect_camera_roll(frame.raw)
-            if detected_roll is not None:
-                roll = detected_roll
-                logger.info("[%s] Roll from horizon indicator: %.1f°",
-                            frame.stem, roll)
-            else:
-                roll = config.CAMERA_ROLL_DEG
-                logger.debug("[%s] Roll detection failed – using default %.1f°",
-                             frame.stem, roll)
+            roll = config.CAMERA_ROLL_DEG
+            frame.camera_roll_deg = -roll
+            logger.info("[%s] Roll: no source available – using default %.1f°",
+                        frame.stem, roll)
 
-        frame.camera_roll_deg = -roll   # negated: detector convention is opposite to rotation convention
+        # ── Pitch ─────────────────────────────────────────────────────────────
+        # Priority: manual override → GeoCalib → 0° seed for Ceres
+        if frame.stem in config.GIMBAL_PITCH_OVERRIDES:
+            pitch = config.GIMBAL_PITCH_OVERRIDES[frame.stem]
+            logger.info("[%s] Pitch from manual override: %.1f°", frame.stem, pitch)
+        elif frame in geocalib:
+            pitch, _ = geocalib[frame]
+        else:
+            pitch = 0.0
+            logger.info("[%s] Pitch: no GeoCalib result – using 0° seed.", frame.stem)
 
-        # ── Pitch — manual override wins; otherwise 0° for the optimizer ──────
-        pitch = estimate_gimbal_pitch(frame, roll_deg=roll)
         frame.gimbal_pitch_deg = pitch
 
         # ── Rotation matrix ───────────────────────────────────────────────────
@@ -363,7 +366,6 @@ def estimate_poses(frames: list[Frame]) -> None:
 
         logger.info(
             "[%s] Pose: pos=[%.1f, %.1f, %.1f]m  hdg=%.0f°  pitch=%.1f°  roll=%.1f°",
-            frame.stem,
-            *frame.position_enu,
+            frame.stem, *frame.position_enu,
             frame.heading_deg, pitch, roll,
         )

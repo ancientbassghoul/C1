@@ -13,7 +13,7 @@ length and distortion coefficients have the biggest impact).
 # The lens shows strong barrel / fisheye distortion, so k1 is strongly negative.
 #
 # Tuning guide:
-#   1. Run undistort.py --preview on one frame and adjust until straight lines
+#   1. Run raycast.py --preview-undistort and adjust until straight lines
 #      (vegetation boundary, tyre tracks) look straight in the output.
 #   2. Lower FOCAL_LENGTH → wider corrected FOV (more black edges).
 #      Higher FOCAL_LENGTH → tighter corrected FOV (less wasted pixels).
@@ -54,43 +54,24 @@ UNDISTORT_SCALE = 0.6
 # Valid for areas < ~10 km; this scene is well within that.
 EARTH_RADIUS_M = 6_371_000.0
 
-# ── Gimbal pitch ──────────────────────────────────────────────────────────────
-# The camera's vertical tilt angle in degrees.
-#   0°  = horizontal (looking at the horizon)
-# -90°  = nadir (straight down)
-# We auto-detect this per frame from the horizon position; override below
-# for any frame where auto-detection fails (e.g. no sky visible).
-
-GIMBAL_PITCH_AUTO = True          # Set False to use manual overrides only.
-GIMBAL_PITCH_FALLBACK_DEG = -45.0 # Used when auto-detection is inconclusive.
-
-# Per-frame manual overrides.  Key = filename stem (no extension).
+# ── Gimbal pitch overrides ────────────────────────────────────────────────────
+# The orientation solver (feature_matcher.py) refines pitch automatically.
+# Use these overrides only for frames where the solver cannot converge —
+# e.g. a frame with no usable ground features and no overlap with other frames.
+# Key = filename stem (no extension).
+#
 # Example:
 #   GIMBAL_PITCH_OVERRIDES = {
 #       "2026-02-15_16-35-56_06892": -15.0,
 #       "2026-02-15_16-25-03_04569": -8.0,
 #   }
-GIMBAL_PITCH_OVERRIDES: dict[str, float] = {
-    # Calibrated via manual ground correspondences (manual_calibrate.py)
-}
+GIMBAL_PITCH_OVERRIDES: dict[str, float] = {}
 
-# ── Camera roll ───────────────────────────────────────────────────────────────
-# Drone banking angle (degrees).  Positive = roll right.
-# The artificial-horizon indicator in the HUD encodes this; currently read
-# as 0 (level) for all frames.  Override per frame if you see a tilted horizon.
+# ── Camera roll overrides ─────────────────────────────────────────────────────
+# Roll is detected automatically from HUD bracket indicators.
+# Override per frame if detection gives wrong results.
 CAMERA_ROLL_DEG = 0.0
 CAMERA_ROLL_OVERRIDES: dict[str, float] = {}
-
-# ── Horizon detection ─────────────────────────────────────────────────────────
-# Row-fraction search window for finding the sky/ground boundary.
-# Excludes the top HUD strip and the bottom status bar.
-HORIZON_SEARCH_TOP    = 0.10   # 10 % from top
-HORIZON_SEARCH_BOTTOM = 0.80   # 80 % from top  (stop before bottom HUD)
-
-# Minimum sky-fraction above the detected horizon for the result to be accepted.
-# If the horizon is very close to the bottom of the search window (nadir view),
-# auto-detection falls back to GIMBAL_PITCH_FALLBACK_DEG.
-HORIZON_MIN_SKY_FRACTION = 0.05
 
 # ─────────────────────────────────────────────────────────────────────────────
 # OCR
@@ -110,66 +91,111 @@ OCR_CROP_ALT     = (640, 718, 840, 1160)  # "XX.X  M  XX.X  M" (bottom-right)
 OUTPUT_DIR = "./output"
 
 # Radius of the reprojection marker drawn on frames (pixels, in undistorted space).
-MARKER_RADIUS   = 14
+MARKER_RADIUS    = 14
 MARKER_COLOR_SRC = (0, 220, 0)    # Green  – source pick
 MARKER_COLOR_DST = (0, 60,  220)  # Blue   – reprojected point
 MARKER_THICKNESS = 3
 
 # ─────────────────────────────────────────────────────────────────────────────
-# VAN MODEL
+# VAN DETECTION
 # ─────────────────────────────────────────────────────────────────────────────
-# Approximate dimensions of the white transit van visible in the frames.
-# Measure from the overhead shot (frame 12035) if you want to refine these.
-VAN_WIDTH_M  = 2.0    # metres, side-to-side
-VAN_LENGTH_M = 4.8    # metres, nose-to-tail
-VAN_HEIGHT_M = 2.0    # metres, ground-to-roof
+# Confidence threshold for GroundingDINO van detection (0–1).
+# Detections below this score are discarded and the white-blob fallback is used.
+YOLO_CONF_THRESH = 0.15
+
+# Minimum white-blob area (pixels²) for the fallback blob detector.
+# Increase if small bright patches (glare, HUD elements) cause false positives.
+VAN_BLOB_MIN_AREA = 200
 
 # ─────────────────────────────────────────────────────────────────────────────
-# YOLO DETECTION
+# VAN GEOMETRY
 # ─────────────────────────────────────────────────────────────────────────────
-# Model is auto-downloaded by ultralytics on first run (~6 MB for nano).
-YOLO_MODEL       = "yolov8s.pt"   # small model — better on small/unusual viewpoints
-YOLO_CONF_THRESH = 0.15           # minimum detection confidence (0-1)
+# Physical bounding box dimensions of the white transit van (metres).
+VAN_LENGTH_M = 4.959
+VAN_WIDTH_M  = 2.204
+VAN_HEIGHT_M = 1.895
+
+# Approximate terrain height at the van's location in the shared ENU frame.
+# Derived from terrain_offset of the nearest camera frame (frame 04709: +1.3 m).
+# Used as the fixed Z of the van base — tune if reprojection is vertically off.
+VAN_Z_M = 1.0
+
+# Frames whose van detections are used as 3-D corner reprojection constraints.
+# Each must have a valid GroundingDINO bbox.  Selected for angular diversity:
+#   12035 – near-nadir  (roof visible)
+#   04752 – front-left  oblique
+#   04681 – rear-left   oblique
+#   04709 – pure left-side view
+#   10474 – bridging angle between nadir and oblique
+VAN_FRAMES: list[str] = [
+    "2026-02-15_16-25-03_12035",
+    "2026-02-15_16-25-03_04752",
+    "2026-02-15_16-25-03_04681",
+    "2026-02-15_16-25-03_04709",
+    "2026-02-15_16-25-03_10474",
+]
+
+# Van heading prior (degrees, CW from North).
+# Derived from frame 04709: drone heading 152°, van perpendicular with left
+# face visible → right face outward normal = 152° → van heading = 62°.
+VAN_HEADING_PRIOR_DEG = 62.0
+
+# Solver is free to adjust van heading ± this many degrees from the prior.
+VAN_HEADING_RANGE_DEG = 45.0
+
+# Relative weight of each van corner reprojection residual vs a ground scatter
+# residual.  Higher = van corners dominate; lower = ground scatter dominates.
+# Van corners provide the crucial vertical constraint (known height), so they
+# should be weighted above ground scatter.
+VAN_CORNER_WEIGHT = 5.0
 
 # ─────────────────────────────────────────────────────────────────────────────
-# VAN CALIBRATION
+# GEOCALIB
 # ─────────────────────────────────────────────────────────────────────────────
-# Maximum pixel distance for matching a Shi-Tomasi corner to a predicted corner.
-VAN_CORNER_MATCH_THRESHOLD_PX = 20
+# GeoCalib estimates gimbal pitch from a single undistorted frame using
+# learned line/vanishing-point detection.  Used as the initial pitch seed
+# for each camera before the Ceres orientation solver refines it.
+# Set False to use 0° seed for all frames (faster startup, worse convergence).
+GEOCALIB_ENABLED = True
 
-# Focal length search bounds [pixels] for the joint optimiser.
-# The current estimate (FOCAL_LENGTH * UNDISTORT_SCALE) is used as the seed.
-VAN_CALIB_F_BOUNDS     = (200.0, 1200.0)
-
-# Pitch search bounds [degrees].
-VAN_CALIB_PITCH_BOUNDS = (-90.0, 0.0)
+# ─────────────────────────────────────────────────────────────────────────────
+# FEATURE MATCHING
+# ─────────────────────────────────────────────────────────────────────────────
+# Spatial grid for match subsampling.  After LightGlue matching and RANSAC,
+# the ground region is divided into MATCH_GRID_COLS × MATCH_GRID_ROWS cells
+# and at most one match is kept per cell.  This ensures spatial diversity and
+# limits matches to at most MATCH_GRID_COLS × MATCH_GRID_ROWS per frame pair.
+MATCH_GRID_COLS = 5   # default: 5 × 4 = 20 matches max per pair
+MATCH_GRID_ROWS = 4
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ORIENTATION SOLVER
 # ─────────────────────────────────────────────────────────────────────────────
-# Per-camera bounds used by orientation_solver.py when jointly refining
-# pitch, yaw offset, and roll offset from ground-feature scatter.
+# Per-camera bounds for the pyceres joint optimisation.
 #
-# Pitch: full physical range (near-nadir to slightly above horizon).
-# Yaw offset: small correction on top of the OCR compass heading.
-#   ±5° handles typical magnetometer drift and HUD rounding errors.
-# Roll offset: small correction on top of the bracket-detected roll.
-#   ±1° handles residual HUD-detection error at near-level flight.
-
-SOLVER_PITCH_MIN         = -89.0   # degrees
-SOLVER_PITCH_MAX         =  15.0   # degrees
+# Pitch window: Ceres searches ± SOLVER_PITCH_OFFSET degrees around the
+#   GeoCalib seed for each frame.  The result is further clamped to
+#   [SOLVER_PITCH_FLOOR, SOLVER_PITCH_CEILING] so no frame can land in a
+#   physically impossible orientation regardless of the GeoCalib estimate.
+#
+# Yaw offset: correction on top of the OCR compass heading.
+#   ±5° covers typical magnetometer drift and HUD rounding errors.
+# Roll offset: correction on top of the bracket-detected roll.
+#   ±1° covers residual HUD-detection error at near-level flight.
+SOLVER_PITCH_OFFSET  =  20.0   # ± degrees around the GeoCalib seed
+SOLVER_PITCH_FLOOR   = -89.0   # absolute minimum pitch (near-nadir clamp)
+SOLVER_PITCH_CEILING =  30.0   # absolute maximum pitch (upward-tilt clamp)
 SOLVER_YAW_OFFSET_RANGE  =   5.0   # ± degrees
 SOLVER_ROLL_OFFSET_RANGE =   1.0   # ± degrees
+
+# Maximum Ceres solver iterations.  Increase if the solve terminates early
+# without converging (check the summary BriefReport in the log).
+SOLVER_MAX_ITERATIONS = 200
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ROLL DETECTION
 # ─────────────────────────────────────────────────────────────────────────────
-# Area bounds (pixels) for connected-component blobs to be considered a
-# bracket.  Too small = noise;  too large = HUD banner or sky glare.
-# Tune if roll detection fails on your specific footage.
-# Minimum white-blob area (pixels²) to be considered the van in the fallback detector.
-# Increase if small bright patches (glare, HUD) cause false positives.
-VAN_BLOB_MIN_AREA = 200
-
+# Area bounds (pixels²) for white connected-component blobs to be considered
+# a HUD bracket symbol.  Too small = noise;  too large = HUD banner or glare.
 ROLL_BRACKET_MIN_AREA = 80
 ROLL_BRACKET_MAX_AREA = 2500

@@ -1,21 +1,24 @@
 """
-pipeline/feature_matcher.py – Ground feature matching for pitch calibration (SuperPoint + LightGlue).
+pipeline/feature_matcher.py – Ground feature matching for camera orientation calibration.
 
 Key design decisions
 ────────────────────
-1. AGL filter: frames below MIN_AGL_M are skipped (too low, weird
-   perspective, ground features look like horizon features in other cams).
+1. AGL filter: frames below MIN_AGL_M are skipped — perspective too extreme.
 
-2. Van masking: detected van bbox is excluded from keypoint matches
-   via post-match pixel filtering.
+2. Van masking: detected van bbox is excluded from keypoint matches via
+   post-match pixel filtering.  The van sits above the ground plane and
+   would otherwise corrupt the ground-scatter geometry.
 
-3. Incremental solve:
-   Pass 1 – solve "stable" frames globally (those with enough cross-frame
-             ground matches, MIN_MATCHES_STABLE threshold).
-   Pass 2 – for each remaining frame, fix all previously solved cameras
-             and solve for this frame's pitch alone (1 unknown → robust).
+3. Van corner constraints: for frames listed in config.VAN_FRAMES, the
+   GroundingDINO bbox is used to generate 3-D corner reprojection constraints
+   that provide a crucial vertical anchor (known van height) the ground
+   scatter alone cannot supply.
 
-4. Manual overrides (config.GIMBAL_PITCH_OVERRIDES) are never touched.
+4. Single joint solve (pyceres): all cameras + van pose are solved together
+   in one Ceres optimisation using pairwise ground scatter + van corner costs.
+   The sparse block structure is exploited by SPARSE_NORMAL_CHOLESKY.
+
+5. Manual overrides (config.GIMBAL_PITCH_OVERRIDES) are never modified.
 """
 
 from __future__ import annotations
@@ -27,7 +30,10 @@ from itertools import combinations
 import cv2
 import numpy as np
 
-from pipeline.orientation_solver import optimize_orientation
+from pipeline.orientation_solver import solve as ceres_solve
+from pipeline.van_corners import (
+    get_van_observations, estimate_van_position,
+)
 from pipeline.frame import Frame
 from pipeline.pose import build_rotation
 import config
@@ -39,16 +45,12 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 MIN_BASELINE_M       = 3.0
 MIN_GROUND_MATCHES   = 6
-MAX_MATCHES_PAIR     = 80
 RANSAC_THRESHOLD     = 4.0
 INITIAL_PITCH_DEG    = 0.0
 
 # Frames below this AGL are skipped — perspective is too extreme.
 MIN_AGL_M            = 3.5
 
-# Minimum matches a frame needs across ALL its pairs to be considered "stable"
-# and included in the first global pass.
-MIN_MATCHES_STABLE   = 12
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -159,6 +161,49 @@ def _enhance_np(img_bgr: np.ndarray) -> np.ndarray:
     eq    = clahe.apply(gray)
     blur  = cv2.GaussianBlur(eq, (0, 0), sigmaX=2.0)
     return cv2.addWeighted(eq, 1.8, blur, -0.8, 0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Spatial grid subsampling
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _grid_subsample(
+    pts_a: np.ndarray,
+    pts_b: np.ndarray,
+    image_w: int,
+    ground_rows: tuple[int, int],
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Keep at most one match per spatial grid cell.
+
+    The grid is defined over the source frame's (pts_a) ground region.
+    Cell assignment is by pts_a pixel coordinates.  The first match found
+    in each cell is kept; since LightGlue outputs matches in descending
+    confidence order, this keeps the best match per cell.
+
+    Grid dimensions are set by config.MATCH_GRID_COLS × MATCH_GRID_ROWS
+    (default 5 × 4 = 20 cells maximum per frame pair).
+    """
+    ga0, ga1   = ground_rows
+    n_cols     = config.MATCH_GRID_COLS
+    n_rows     = config.MATCH_GRID_ROWS
+    row_height = max(ga1 - ga0, 1)
+
+    cell_first: dict[tuple[int, int], int] = {}
+    for i, pa in enumerate(pts_a):
+        col = int(pa[0] / max(image_w, 1) * n_cols)
+        row = int((pa[1] - ga0) / row_height * n_rows)
+        col = max(0, min(col, n_cols - 1))
+        row = max(0, min(row, n_rows - 1))
+        key = (col, row)
+        if key not in cell_first:
+            cell_first[key] = i
+
+    if not cell_first:
+        return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.float32)
+
+    idx = list(cell_first.values())
+    return pts_a[idx], pts_b[idx]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -289,10 +334,10 @@ def _match(frame_a: Frame, frame_b: Frame,
     if len(pts_a) < MIN_GROUND_MATCHES:
         return np.empty((0, 2)), np.empty((0, 2))
 
-    if len(pts_a) > MAX_MATCHES_PAIR:
-        step  = len(pts_a) // MAX_MATCHES_PAIR
-        pts_a = pts_a[::step][:MAX_MATCHES_PAIR]
-        pts_b = pts_b[::step][:MAX_MATCHES_PAIR]
+    # Spatial grid subsampling — replaces random step subsampling
+    pts_a, pts_b = _grid_subsample(pts_a, pts_b,
+                                   frame_a.undistorted.shape[1],
+                                   (ga0, ga1))
 
     if _DEBUG:
         _save_debug_matches(
@@ -304,39 +349,7 @@ def _match(frame_a: Frame, frame_b: Frame,
     return pts_a, pts_b
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
-def _cam_dict(frame: Frame) -> dict:
-    return {
-        'pos':  frame.position_enu.copy(),
-        'yaw':  frame.heading_deg,
-        'roll': frame.camera_roll_deg,
-        'K':    frame.K_undist,
-    }
-
-
-def _run_optimizer(cameras, features, initial_pitches,
-                   label='') -> tuple | None:
-    if not features:
-        logger.warning("No features for optimizer%s.", f' ({label})' if label else '')
-        return None
-    try:
-        pitches, yaw_offs, roll_offs, result = optimize_orientation(
-            cameras, features,
-            initial_pitches=initial_pitches,
-            z_ground=0.0,
-            verbose=True,
-        )
-        pf = result.cost / max(len(features), 1)
-        logger.info("Optimizer%s done: per_feature=%.2f m²  nfev=%d",
-                    f' ({label})' if label else '', pf, result.nfev)
-        return pitches, yaw_offs, roll_offs
-    except Exception as exc:
-        logger.error("Optimizer failed%s: %s",
-                     f' ({label})' if label else '', exc)
-        return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -346,19 +359,18 @@ def _run_optimizer(cameras, features, initial_pitches,
 def refine_pitches(frames: list[Frame],
                    van_bboxes: dict | None = None) -> None:
     """
-    Refine gimbal pitch using SuperPoint + LightGlue ground-feature matching.
+    Refine camera orientation (pitch, yaw offset, roll offset) jointly using
+    pyceres with pairwise ground-scatter and van corner reprojection costs.
 
-    van_bboxes : optional dict mapping frame.stem → (x1,y1,x2,y2) to exclude
-                 the van region from feature matching.
-
-    Two-pass incremental solve:
-      Pass 1 – global solve on stable frames (enough cross-frame matches,
-               ≥ MIN_MATCHES_STABLE total matched keypoints).
-      Pass 2 – remaining frames solved one at a time against calibrated cams.
+    van_bboxes : dict mapping frame.stem → (x1,y1,x2,y2) from GroundingDINO.
+                 Used both to mask keypoint matches and to build van corner
+                 reprojection constraints for frames in config.VAN_FRAMES.
 
     Frames listed in config.GIMBAL_PITCH_OVERRIDES are never modified.
     """
-    # Exclude only frames with manual overrides — optimizer handles everything else
+    vb = van_bboxes or {}
+
+    # ── Eligible frames ───────────────────────────────────────────────────────
     ready = [
         f for f in frames
         if f.undistorted   is not None
@@ -372,11 +384,8 @@ def refine_pitches(frames: list[Frame],
         logger.warning("refine_pitches: fewer than 2 eligible frames.")
         return
 
-    # ── Build match table ─────────────────────────────────────────────────────
-    # pair_features[stem_a][stem_b] = list of {ia: pix_a, ib: pix_b}
-    vb = van_bboxes or {}
-    match_count: dict[str, int] = {f.stem: 0 for f in ready}
-    pair_data: dict[tuple, list] = {}
+    # ── Feature matching ──────────────────────────────────────────────────────
+    pairwise_features: list[tuple] = []   # (fi, pixel_i, fj, pixel_j)
 
     for fa, fb in combinations(ready, 2):
         if np.linalg.norm(fb.position_enu - fa.position_enu) < MIN_BASELINE_M:
@@ -388,106 +397,90 @@ def refine_pitches(frames: list[Frame],
             continue
         logger.info("  %s ↔ %s : %d matches",
                     fa.stem[-12:], fb.stem[-12:], len(pts_a))
-        match_count[fa.stem] += len(pts_a)
-        match_count[fb.stem] += len(pts_a)
-        pair_data[(fa.stem, fb.stem)] = (fa, fb, pts_a, pts_b)
+        for (ua, va), (ub, vb_) in zip(pts_a, pts_b):
+            pairwise_features.append(
+                (fa, (float(ua), float(va)),
+                 fb, (float(ub), float(vb_)))
+            )
 
-    if not pair_data:
+    if not pairwise_features:
         logger.warning("No ground matches found — skipping refinement.")
         return
 
-    # ── Pass 1: global solve on stable frames ─────────────────────────────────
-    stable   = [f for f in ready if match_count[f.stem] >= MIN_MATCHES_STABLE]
-    unstable = [f for f in ready if match_count[f.stem] < MIN_MATCHES_STABLE]
+    logger.info("%d total ground feature pairs across %d frames.",
+                len(pairwise_features), len(ready))
 
-    logger.info("Pass 1: %d stable, %d unstable frame(s).",
-                len(stable), len(unstable))
+    # ── Van pose initialisation ───────────────────────────────────────────────
+    # Find the best van frame with a bbox to seed the van position
+    van_frames_with_bbox = [
+        f for f in ready
+        if f.stem in config.VAN_FRAMES and f.stem in vb
+    ]
 
-    if len(stable) >= 2:
-        s_idx     = {f.stem: i for i, f in enumerate(stable)}
-        s_cams    = [_cam_dict(f) for f in stable]
-        s_features: list[dict] = []
-        for (sa, sb), (fa, fb, pts_a, pts_b) in pair_data.items():
-            if fa.stem not in s_idx or fb.stem not in s_idx:
-                continue
-            ia, ib = s_idx[fa.stem], s_idx[fb.stem]
-            for (ua, va), (ub, vb_) in zip(pts_a, pts_b):
-                s_features.append({ia: (float(ua), float(va)),
-                                    ib: (float(ub), float(vb_))})
+    van_east_init  = 0.0
+    van_north_init = 0.0
 
-        result_tuple = _run_optimizer(s_cams, s_features,
-                                      [INITIAL_PITCH_DEG] * len(stable),
-                                      label='pass-1')
-        if result_tuple is not None:
-            pitches, yaw_offs, roll_offs = result_tuple
-            for i, f in enumerate(stable):
-                p  = float(pitches[i])
-                yo = float(yaw_offs[i])
-                ro = float(roll_offs[i])
-                logger.info("  [%s] pass-1 pitch → %.1f°  yaw_off → %+.2f°  roll_off → %+.2f°",
-                            f.stem[-12:], p, yo, ro)
-                f.gimbal_pitch_deg  = p
-                f.heading_deg       = f.heading_deg      + yo
-                f.camera_roll_deg   = f.camera_roll_deg  + ro
-                f.R = build_rotation(f.heading_deg, p, f.camera_roll_deg)
-
-    # ── Pass 2: solve each unstable frame against ALL calibrated cameras ──────
-    calibrated = [f for f in ready
-                  if f.gimbal_pitch_deg is not None
-                  and f.stem not in [u.stem for u in unstable]]
-
-    for fu in unstable:
-        logger.info("Pass 2: solving [%s] against %d calibrated frame(s)…",
-                    fu.stem[-12:], len(calibrated))
-        features_u: list[dict] = []
-        cams_u = [_cam_dict(fu)]   # index 0 = this frame (unknown pitch)
-
-        for i, fc in enumerate(calibrated):
-            key  = (fu.stem, fc.stem) if (fu.stem, fc.stem) in pair_data \
-                   else (fc.stem, fu.stem) if (fc.stem, fu.stem) in pair_data \
-                   else None
-            if key is None:
-                continue
-            fa, fb, pts_a, pts_b = pair_data[key]
-            # Determine which is fu and which is fc
-            if fa.stem == fu.stem:
-                pa, pb = pts_a, pts_b
-            else:
-                pa, pb = pts_b, pts_a
-
-            cams_u.append(_cam_dict(fc))
-            ci = len(cams_u) - 1   # index of this calibrated cam
-            for (ua, va), (ub, vb_) in zip(pa, pb):
-                features_u.append({0: (float(ua), float(va)),
-                                    ci: (float(ub), float(vb_))})
-
-        if not features_u:
-            logger.info("  [%s] no matches with calibrated frames — skip.",
-                        fu.stem[-12:])
-            continue
-
-        # Build initial pitches matching cams_u order:
-        # index 0 is the unknown frame; indices 1+ are calibrated (fixed tightly).
-        init = [INITIAL_PITCH_DEG] + [
-            fc.gimbal_pitch_deg or INITIAL_PITCH_DEG
-            for fc in calibrated
-            if _cam_dict(fc) in cams_u[1:]
-        ]
-
-        pitches_u, yaw_offs_u, roll_offs_u, result_u = optimize_orientation(
-            cams_u, features_u,
-            initial_pitches=init,
-            z_ground=0.0,
-            verbose=False,
+    if van_frames_with_bbox:
+        seed_frame = van_frames_with_bbox[0]
+        van_east_init, van_north_init = estimate_van_position(
+            seed_frame, vb[seed_frame.stem], van_z=config.VAN_Z_M,
+        )
+        logger.info(
+            "Van pose seed: east=%.1f m  north=%.1f m  heading=%.1f°",
+            van_east_init, van_north_init, config.VAN_HEADING_PRIOR_DEG,
+        )
+    else:
+        logger.warning(
+            "No VAN_FRAMES with bbox found — van corner constraints disabled."
         )
 
-        p  = float(pitches_u[0])
-        yo = float(yaw_offs_u[0])
-        ro = float(roll_offs_u[0])
-        pf = result_u.cost / max(len(features_u), 1)
-        logger.info("  [%s] pass-2 pitch → %.1f°  yaw_off → %+.2f°  roll_off → %+.2f°  per_feature=%.2f m²",
-                    fu.stem[-12:], p, yo, ro, pf)
-        fu.gimbal_pitch_deg  = p
-        fu.heading_deg       = fu.heading_deg     + yo
-        fu.camera_roll_deg   = fu.camera_roll_deg + ro
-        fu.R = build_rotation(fu.heading_deg, p, fu.camera_roll_deg)
+    van_pose_init = [van_east_init, van_north_init, config.VAN_HEADING_PRIOR_DEG]
+
+    # ── Van corner observations ───────────────────────────────────────────────
+    van_observations: list[tuple] = []
+
+    for f in van_frames_with_bbox:
+        obs = get_van_observations(
+            f, vb[f.stem],
+            van_east_init, van_north_init,
+            config.VAN_HEADING_PRIOR_DEG,
+            van_z=config.VAN_Z_M,
+        )
+        van_observations.extend((f, corner_local, pixel_obs)
+                                 for corner_local, pixel_obs in obs)
+
+    logger.info("%d van corner observations across %d frame(s).",
+                len(van_observations), len(van_frames_with_bbox))
+
+    # ── Joint Ceres solve ─────────────────────────────────────────────────────
+    # Pass GeoCalib pitch estimates as seeds so Ceres uses a tight per-frame
+    # window rather than the full physical pitch range.
+    pitch_seeds = {
+        f: f.gimbal_pitch_deg
+        for f in ready
+        if f.gimbal_pitch_deg is not None
+    }
+    cam_results, van_pose_solved, report = ceres_solve(
+        ready, pairwise_features, van_observations, van_pose_init,
+        pitch_seeds=pitch_seeds,
+    )
+
+    logger.info(
+        "Van pose solved: east=%.1f m  north=%.1f m  heading=%.1f°",
+        van_pose_solved[0], van_pose_solved[1], van_pose_solved[2],
+    )
+
+    # ── Apply results to frames ───────────────────────────────────────────────
+    for f in ready:
+        params = cam_results[f]
+        pitch = float(params[0])
+        yo    = float(params[1])
+        ro    = float(params[2])
+        logger.info(
+            "  [%s] pitch → %.1f°  yaw_off → %+.2f°  roll_off → %+.2f°",
+            f.stem[-12:], pitch, yo, ro,
+        )
+        f.gimbal_pitch_deg  = pitch
+        f.heading_deg       = f.heading_deg     + yo
+        f.camera_roll_deg   = f.camera_roll_deg + ro
+        f.R = build_rotation(f.heading_deg, pitch, f.camera_roll_deg)

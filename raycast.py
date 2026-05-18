@@ -101,6 +101,12 @@ def parse_args() -> argparse.Namespace:
         help="Skip automatic pitch refinement (use config overrides only).",
     )
     p.add_argument(
+        "--no-horizon-indicator-reading", action="store_true",
+        dest="no_horizon_indicator_reading",
+        help="Skip HUD bracket roll detection; use GeoCalib roll for all frames instead. "
+             "Useful for diagnosing whether GeoCalib roll estimates are better than bracket detection.",
+    )
+    p.add_argument(
         "--feature-matcher-debug", action="store_true", dest="feature_matcher_debug",
         help="Save annotated match images (keypoints, ground region, van bbox) "
              "to {OUTPUT_DIR}/debug/ for every matched frame pair.",
@@ -130,7 +136,7 @@ def preview_enhanced(frames: list) -> None:
             break
 
 
-def run_pipeline(frames_dir: str, no_refine: bool = False, no_enhance: bool = False, height_mode: str = 'tor', feature_matcher_debug: bool = False) -> list:
+def run_pipeline(frames_dir: str, no_refine: bool = False, no_enhance: bool = False, height_mode: str = 'tor', feature_matcher_debug: bool = False, no_horizon_indicator_reading: bool = False) -> list:
     """Load, OCR, undistort, pose-estimate, detect van, and refine pitches. Return ready frames."""
     from pipeline.frame     import load_frames
     from pipeline.ocr       import extract_telemetry_all
@@ -152,7 +158,7 @@ def run_pipeline(frames_dir: str, no_refine: bool = False, no_enhance: bool = Fa
 
     logger.info("═" * 60)
     logger.info("Step 4/6 – Estimating camera poses from telemetry")
-    estimate_poses(frames)
+    estimate_poses(frames, skip_bracket_roll=no_horizon_indicator_reading)
     # Override camera Z according to --height
     for f in frames:
         if f.position_enu is None: continue
@@ -269,7 +275,7 @@ def main() -> None:
         config.OUTPUT_DIR = args.output_dir
 
     # Run the shared pipeline
-    frames = run_pipeline(args.frames_dir, no_refine=args.no_refine, no_enhance=not args.enhance, height_mode=args.height, feature_matcher_debug=args.feature_matcher_debug)
+    frames = run_pipeline(args.frames_dir, no_refine=args.no_refine, no_enhance=not args.enhance, height_mode=args.height, feature_matcher_debug=args.feature_matcher_debug, no_horizon_indicator_reading=args.no_horizon_indicator_reading)
 
     # Mode dispatch
     if args.preview_enhanced:

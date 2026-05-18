@@ -1,261 +1,310 @@
 """
-pipeline/orientation_solver.py – Ground-scatter orientation calibration for a multi-camera rig.
+pipeline/orientation_solver.py – Camera orientation calibration using pyceres.
 
-Given : camera positions, yaw, roll, intrinsics, and matched 2-D pixel
-        coordinates for shared ground features (z = ground_z).
-Find  : the pitch, yaw offset, and roll offset of each camera that minimises
-        the scatter of ray-ground intersections across cameras observing the same feature.
+Jointly optimises:
+  Per-camera  : pitch, yaw_offset, roll_offset        (3 × N parameters)
+  Van pose    : east, north, heading                  (3 parameters, Z fixed)
 
-Rotation convention (ENU world frame, OpenCV camera frame)
-──────────────────────────────────────────────────────────
-  yaw   : degrees, 0 = North (+Y), 90 = East (+X), clockwise positive
-  pitch : degrees, 0 = horizontal, negative = looking DOWN
-  roll  : degrees, positive = roll right
+Two types of constraints:
+  1. Ground scatter (pairwise): for each matched ground feature seen in two
+     frames, the ray-ground intersections from both cameras must agree.
+     Residual: [ΔEast, ΔNorth] of the two intersection points.
 
-  make_rotation(yaw, pitch, roll) returns the 3×3 matrix R_world_from_cam
-  such that:  d_world = R @ d_cam
+  2. Van corner reprojection: for each visible van corner in a selected frame,
+     the 3-D corner (known local coordinates + solved van pose) must project
+     to the observed bounding-box pixel.
+     Residual: [Δu, Δv] in image space, scaled by VAN_CORNER_WEIGHT.
 
-  At pitch=0 the camera looks horizontally in the heading direction.
-  At pitch=-90° the camera looks straight down (-Z in ENU).
+pyceres cost functions are subclasses of pyceres.CostFunction that implement
+evaluate(parameters, residuals, jacobians).  Jacobians are computed via central
+finite differences inside a generic _NumericDiff wrapper so that the cost
+functors stay as plain Python callables.
+
+Install pyceres:
+  venv\\Scripts\\pip install pyceres
 """
 
 from __future__ import annotations
 
+import logging
+import math
+
 import numpy as np
-from scipy.optimize import least_squares
 
 import config
+from pipeline.pose import build_rotation
+
+logger = logging.getLogger(__name__)
+
+_MISS_PENALTY = 1000.0
+_FD_EPS       = 1e-5   # central-difference step size
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Rotation matrix  (ENU world + OpenCV camera convention)
+# Math helpers (plain Python / numpy — no pyceres dependency)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def make_rotation(yaw_deg: float, pitch_deg: float, roll_deg: float) -> np.ndarray:
-    """
-    Build the camera-to-world rotation matrix R_world_from_cam.
-
-    Matches build_rotation() in pipeline/pose.py exactly so that the
-    optimizer and the ray-caster use identical geometry.
-
-    Returns R_world_from_cam such that:  d_world = R @ d_cam
-    (build_rotation returns the transpose: R_cam_from_world)
-    """
-    import math as _math
-    yaw   = _math.radians(yaw_deg)
-    pitch = _math.radians(pitch_deg)
-    roll  = _math.radians(roll_deg)
-
-    fwd = np.array([
-        _math.sin(yaw) * _math.cos(pitch),
-        _math.cos(yaw) * _math.cos(pitch),
-        _math.sin(pitch),
-    ])
-
-    world_up = np.array([0.0, 0.0, 1.0])
-    if abs(fwd[2]) > 0.99:
-        ref   = np.array([_math.sin(yaw), _math.cos(yaw), 0.0])
-        right = np.cross(fwd, ref)
-    else:
-        right = np.cross(fwd, world_up)
-    right /= np.linalg.norm(right)
-
-    down = np.cross(fwd, right)
-    down /= np.linalg.norm(down)
-
-    # Roll: rotate right and down around the optical axis (fwd).
-    cr, sr   = _math.cos(roll), _math.sin(roll)
-    right_r  =  cr * right + sr * down
-    down_r   = -sr * right + cr * down
-
-    R_world_from_cam = np.column_stack([right_r, down_r, fwd])
-    return R_world_from_cam
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Ray – ground plane intersection
-# ─────────────────────────────────────────────────────────────────────────────
-
-def ray_plane_intersect(
-    origin:    np.ndarray,   # (3,) camera position in world (ENU metres)
-    direction: np.ndarray,   # (3,) ray direction in world (need not be unit)
-    z:         float = 0.0,  # ground plane height in ENU metres
-) -> np.ndarray | None:
-    """
-    Intersect ray  P(t) = origin + t * direction  with plane  z = const.
-
-    Returns the 3-D intersection point, or None if:
-      - the ray is parallel to the plane  (|dz| < 1e-9)
-      - the intersection is behind the camera  (t ≤ 0)
-    """
-    dz = float(direction[2])
+def _ray_ground(pos, d_world, z):
+    dz = float(d_world[2])
     if abs(dz) < 1e-9:
         return None
-    t = (z - float(origin[2])) / dz
+    t = (z - float(pos[2])) / dz
     if t <= 0:
         return None
-    return origin + t * direction
+    return pos + t * d_world
+
+
+def _unproject(u, v, K_inv, yaw, pitch, roll, pos, z_ground):
+    d_cam   = K_inv @ np.array([u, v, 1.0])
+    R       = build_rotation(yaw, pitch, roll)
+    d_world = R.T @ d_cam
+    norm    = np.linalg.norm(d_world)
+    if norm < 1e-12:
+        return None
+    d_world = d_world / norm
+    return _ray_ground(pos, d_world, z_ground)
+
+
+def _van_corner_world(corner_local, van_east, van_north, van_heading_deg, van_z):
+    H = math.radians(van_heading_deg)
+    s, c = math.sin(H), math.cos(H)
+    cx, cy, cz = corner_local
+    return np.array([
+        van_east  + cx * s - cy * c,
+        van_north + cx * c + cy * s,
+        van_z     + cz,
+    ])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Residual function
+# Plain-callable cost functors
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Penalty applied (metres, per axis) when a ray fails to hit the ground.
-_MISS_PENALTY = 1000.0
-
-
-def compute_residuals(
-    params:   np.ndarray,      # (3N,) [pitch_0..N, yaw_off_0..N, roll_off_0..N]
-    cameras:  list[dict],      # N dicts – see optimize_orientation() docstring
-    features: list[dict],      # M dicts {cam_idx: (u, v), ...}
-    z_ground: float = 0.0,
-) -> np.ndarray:
+class GroundScatterCost:
     """
-    Flat residual vector for scipy.optimize.least_squares.
+    Pairwise ground-scatter cost functor.
 
-    Parameter vector layout (length 3N):
-      params[:N]    = pitch per camera (degrees)
-      params[N:2N]  = yaw offset per camera (degrees, added to cam['yaw'])
-      params[2N:3N] = roll offset per camera (degrees, added to cam['roll'])
-
-    For each feature j observed by cameras S_j (|S_j| ≥ 2):
-      ┌─ For each i ∈ S_j
-      │   d_cam   = K_i⁻¹ · [u, v, 1]ᵀ
-      │   d_world = R(yaw_i + yaw_off_i, pitch_i, roll_i + roll_off_i) · d_cam
-      │   W_ij    = ray_plane_intersect(C_i, d_world, z)
-      └─ μ_j      = mean of all valid W_ij
-
-      Residual for camera i:  [W_ij_x − μ_j_x,  W_ij_y − μ_j_y]
-      (If ray misses the plane a penalty of ±1000 m is used.)
-
-    The returned vector has FIXED length = 2 × Σ_j |S_j|, which is
-    required by least_squares (constant across calls).
+    Call signature: (params_i, params_j) -> np.ndarray shape (2,)
+    params_* = [pitch, yaw_offset, roll_offset]
+    Residuals = [P_i.east - P_j.east,  P_i.north - P_j.north]
     """
-    N         = len(cameras)
-    pitches   = params[:N]
-    yaw_offs  = params[N:2*N]
-    roll_offs = params[2*N:3*N]
+    def __init__(self, pixel_i, pixel_j, pos_i, pos_j,
+                 K_i, K_j, heading_i, heading_j, roll_i, roll_j,
+                 z_ground=0.0):
+        self._ui, self._vi = pixel_i
+        self._uj, self._vj = pixel_j
+        self._pos_i  = pos_i.copy()
+        self._pos_j  = pos_j.copy()
+        self._Ki_inv = np.linalg.inv(K_i)
+        self._Kj_inv = np.linalg.inv(K_j)
+        self._hdg_i  = heading_i
+        self._hdg_j  = heading_j
+        self._roll_i = roll_i
+        self._roll_j = roll_j
+        self._z      = z_ground
 
-    K_invs = [np.linalg.inv(cam['K']) for cam in cameras]
-    residuals: list[float] = []
+    def __call__(self, params_i, params_j):
+        Pi = _unproject(self._ui, self._vi, self._Ki_inv,
+                        self._hdg_i + params_i[1], params_i[0],
+                        self._roll_i + params_i[2], self._pos_i, self._z)
+        Pj = _unproject(self._uj, self._vj, self._Kj_inv,
+                        self._hdg_j + params_j[1], params_j[0],
+                        self._roll_j + params_j[2], self._pos_j, self._z)
+        if Pi is None or Pj is None:
+            return np.array([_MISS_PENALTY, _MISS_PENALTY])
+        return np.array([Pi[0] - Pj[0], Pi[1] - Pj[1]])
 
-    for feat in features:
-        cam_indices = sorted(i for i in feat if isinstance(i, int))
-        if len(cam_indices) < 2:
-            continue
 
-        # ── Shoot rays → ground hits ──────────────────────────────────────────
-        hits: list[np.ndarray | None] = []
-        for i in cam_indices:
-            cam   = cameras[i]
-            u, v  = feat[i]
-            d_cam = K_invs[i] @ np.array([u, v, 1.0])
+class VanCornerCost:
+    """
+    Van corner reprojection cost functor.
 
-            R       = make_rotation(cam['yaw']  + float(yaw_offs[i]),
-                                    float(pitches[i]),
-                                    cam['roll'] + float(roll_offs[i]))
-            d_world = R @ d_cam
+    Call signature: (camera_params, van_params) -> np.ndarray shape (2,)
+    camera_params = [pitch, yaw_offset, roll_offset]
+    van_params    = [van_east, van_north, van_heading_deg]
+    Residuals     = VAN_CORNER_WEIGHT * [u_pred - u_obs, v_pred - v_obs]
+    """
+    def __init__(self, pixel_obs, corner_local, K, pos_enu,
+                 heading_deg, roll_deg, van_z):
+        self._u_obs, self._v_obs = pixel_obs
+        self._corner_local = corner_local.copy()
+        self._K      = K.copy()
+        self._pos    = pos_enu.copy()
+        self._hdg    = heading_deg
+        self._roll   = roll_deg
+        self._van_z  = van_z
+        self._weight = config.VAN_CORNER_WEIGHT
 
-            hits.append(ray_plane_intersect(cam['pos'], d_world, z=z_ground))
+    def __call__(self, camera_params, van_params):
+        yaw   = self._hdg  + camera_params[1]
+        pitch = camera_params[0]
+        roll  = self._roll + camera_params[2]
+        R_cam = build_rotation(yaw, pitch, roll)
 
-        # ── Centroid of valid hits ────────────────────────────────────────────
-        valid = [h for h in hits if h is not None]
-        if len(valid) >= 2:
-            mu = np.mean(valid, axis=0)
-        elif len(valid) == 1:
-            mu = valid[0]
-        else:
-            mu = np.zeros(3)
+        corner_world = _van_corner_world(
+            self._corner_local,
+            float(van_params[0]), float(van_params[1]), float(van_params[2]),
+            self._van_z,
+        )
+        p_cam = R_cam @ (corner_world - self._pos)
+        if p_cam[2] <= 1e-6:
+            return np.array([_MISS_PENALTY * self._weight,
+                             _MISS_PENALTY * self._weight])
 
-        # ── Per-camera residuals (fixed size) ─────────────────────────────────
-        for h in hits:
-            if h is not None:
-                residuals.append(float(h[0] - mu[0]))   # x (East)
-                residuals.append(float(h[1] - mu[1]))   # y (North)
-            else:
-                residuals.append(_MISS_PENALTY)
-                residuals.append(_MISS_PENALTY)
-
-    return np.array(residuals, dtype=np.float64)
+        u_pred = self._K[0, 0] * p_cam[0] / p_cam[2] + self._K[0, 2]
+        v_pred = self._K[1, 1] * p_cam[1] / p_cam[2] + self._K[1, 2]
+        return np.array([(u_pred - self._u_obs) * self._weight,
+                         (v_pred - self._v_obs) * self._weight])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main optimisation function
+# Public API
 # ─────────────────────────────────────────────────────────────────────────────
 
-def optimize_orientation(
-    cameras:         list[dict],
-    features:        list[dict],
-    initial_pitches: list[float] | None = None,
-    z_ground:        float = 0.0,
-    pitch_min:       float = config.SOLVER_PITCH_MIN,
-    pitch_max:       float = config.SOLVER_PITCH_MAX,
-    yaw_range:       float = config.SOLVER_YAW_OFFSET_RANGE,
-    roll_range:      float = config.SOLVER_ROLL_OFFSET_RANGE,
-    verbose:         bool  = True,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, object]:
+def solve(frames, pairwise_features, van_observations, van_pose_init,
+          pitch_seeds=None):
     """
-    Find the pitch, yaw offset, and roll offset of each camera that minimises
-    ground-scatter.
+    Build and solve the pyceres orientation problem.
 
-    Parameters
-    ──────────
-    cameras : list of N dicts, each with:
-        'pos'  : (3,) np.ndarray  — camera position [East, North, Up] metres
-        'yaw'  : float            — heading in degrees (0 = N, 90 = E, CW)
-        'roll' : float            — roll in degrees (positive = roll right)
-        'K'    : (3, 3) np.ndarray — camera intrinsic matrix
-
-    features : list of M dicts, each mapping
-        int (camera index) → (u, v) pixel in that camera's image.
-        Features seen by < 2 cameras are silently ignored.
-
-    initial_pitches : (N,) starting pitches in degrees. Defaults to 0°.
-    z_ground        : height of the ground plane in world ENU metres.
-    pitch_min/max   : pitch search bounds in degrees.
-    yaw_range       : yaw offset search bound (±degrees, from config).
-    roll_range      : roll offset search bound (±degrees, from config).
+    Args
+    ----
+    frames            : list of Frame objects (all eligible frames).
+    pairwise_features : list of (frame_i, pixel_i, frame_j, pixel_j).
+    van_observations  : list of (frame, corner_local_3d, pixel_obs).
+    van_pose_init     : [van_east, van_north, van_heading_deg].
+    pitch_seeds       : optional dict Frame -> float (degrees).  When provided,
+                        each camera's pitch search window is centred on the seed
+                        (± SOLVER_PITCH_OFFSET) rather than the full physical
+                        range.  Supplied by GeoCalib estimates from pose.py.
 
     Returns
-    ───────
-    pitches     : (N,) np.ndarray — refined pitch per camera (degrees)
-    yaw_offsets : (N,) np.ndarray — yaw correction per camera (degrees)
-    roll_offsets: (N,) np.ndarray — roll correction per camera (degrees)
-    result      : scipy OptimizeResult (cost, nfev, message, …)
+    -------
+    cam_results : dict  Frame -> np.ndarray([pitch, yaw_off, roll_off])
+    van_pose    : np.ndarray([van_east, van_north, van_heading_deg])
+    report      : Ceres BriefReport string
     """
-    import config as _config
-    N = len(cameras)
+    try:
+        import pyceres
+    except ImportError:
+        raise ImportError(
+            "\npyceres not installed. Run:\n"
+            "  venv\\Scripts\\pip install pyceres\n"
+        )
 
-    pitch_init = np.zeros(N) if initial_pitches is None                  else np.clip(initial_pitches, pitch_min, pitch_max).astype(float)
+    # ── Generic numeric-diff wrapper ──────────────────────────────────────────
+    # Defined here so it can subclass pyceres.CostFunction after import.
+    class _NumericDiff(pyceres.CostFunction):
+        """
+        Wraps a plain Python callable as a pyceres.CostFunction.
+        Jacobians are computed via central finite differences.
 
-    # Parameter vector: [pitches | yaw_offsets | roll_offsets]
-    x0 = np.concatenate([pitch_init, np.zeros(N), np.zeros(N)])
+        callable : (*param_blocks) -> np.ndarray of shape (num_residuals,)
+        """
+        def __init__(self, callable_cost, num_residuals, block_sizes):
+            super().__init__()
+            self._cost        = callable_cost
+            self._block_sizes = block_sizes
+            self.set_num_residuals(num_residuals)
+            self.set_parameter_block_sizes(block_sizes)
 
-    lo = np.concatenate([np.full(N, pitch_min),
-                         np.full(N, -yaw_range),
-                         np.full(N, -roll_range)])
-    hi = np.concatenate([np.full(N, pitch_max),
-                         np.full(N,  yaw_range),
-                         np.full(N,  roll_range)])
+        def Evaluate(self, parameters, residuals, jacobians):
+            # parameters is a list of numpy arrays (one per block)
+            res = self._cost(*parameters)
+            residuals[:] = res
 
-    result = least_squares(
-        compute_residuals,
-        x0,
-        args    = (cameras, features, z_ground),
-        bounds  = (lo, hi),
-        method  = 'trf',        # Trust Region Reflective – handles bounds well
-        loss    = 'cauchy',     # Robust: down-weights wrong correspondences
-        f_scale = 5.0,          # residuals > 5 m get suppressed (wrong matches)
-        ftol    = 1e-5,
-        xtol    = 1e-5,
-        gtol    = 1e-5,
-        max_nfev= 2000,
-        verbose = 2 if verbose else 0,
+            if jacobians is not None:
+                for bi, bs in enumerate(self._block_sizes):
+                    if jacobians[bi] is None:
+                        continue
+                    jac = jacobians[bi]          # flat (num_residuals * bs,), row-major
+                    for k in range(bs):
+                        p_plus  = [p.copy() for p in parameters]
+                        p_minus = [p.copy() for p in parameters]
+                        p_plus[bi][k]  += _FD_EPS
+                        p_minus[bi][k] -= _FD_EPS
+                        jac[k::bs] = (
+                            self._cost(*p_plus) - self._cost(*p_minus)
+                        ) / (2.0 * _FD_EPS)
+
+            return True
+
+    # ── Problem setup ─────────────────────────────────────────────────────────
+    logger.info(
+        "Building Ceres problem: %d frames, %d ground pairs, %d van observations.",
+        len(frames), len(pairwise_features), len(van_observations),
     )
 
-    pitches      = result.x[:N]
-    yaw_offsets  = result.x[N:2*N]
-    roll_offsets = result.x[2*N:3*N]
+    problem    = pyceres.Problem()
+    # Initialise camera parameters from GeoCalib seeds where available
+    cam_params = {}
+    for f in frames:
+        seed_pitch = pitch_seeds.get(f, 0.0) if pitch_seeds else 0.0
+        cam_params[f] = np.array([seed_pitch, 0.0, 0.0])
+    van_params = np.array(van_pose_init, dtype=np.float64)
 
-    return pitches, yaw_offsets, roll_offsets, result
+    ground_loss = pyceres.CauchyLoss(5.0)
+    van_loss    = pyceres.HuberLoss(3.0)
+
+    # Ground scatter residuals
+    for fi, pixel_i, fj, pixel_j in pairwise_features:
+        functor = GroundScatterCost(
+            pixel_i, pixel_j,
+            fi.position_enu, fj.position_enu,
+            fi.K_undist,     fj.K_undist,
+            fi.heading_deg,  fj.heading_deg,
+            fi.camera_roll_deg, fj.camera_roll_deg,
+        )
+        cost = _NumericDiff(functor, num_residuals=2, block_sizes=[3, 3])
+        problem.add_residual_block(cost, ground_loss,
+                                 [cam_params[fi], cam_params[fj]])
+
+    # Van corner residuals
+    for frame, corner_local, pixel_obs in van_observations:
+        functor = VanCornerCost(
+            pixel_obs, corner_local,
+            frame.K_undist, frame.position_enu,
+            frame.heading_deg, frame.camera_roll_deg,
+            van_z=config.VAN_Z_M,
+        )
+        cost = _NumericDiff(functor, num_residuals=2, block_sizes=[3, 3])
+        problem.add_residual_block(cost, van_loss,
+                                 [cam_params[frame], van_params])
+
+    # Camera bounds — pitch window centred on GeoCalib seed, clamped to floor/ceiling
+    for f in frames:
+        p          = cam_params[f]
+        seed_pitch = float(p[0])   # already set from GeoCalib
+        p_lo = max(seed_pitch - config.SOLVER_PITCH_OFFSET, config.SOLVER_PITCH_FLOOR)
+        p_hi = min(seed_pitch + config.SOLVER_PITCH_OFFSET, config.SOLVER_PITCH_CEILING)
+        problem.set_parameter_lower_bound(p, 0, p_lo)
+        problem.set_parameter_upper_bound(p, 0, p_hi)
+        problem.set_parameter_lower_bound(p, 1, -config.SOLVER_YAW_OFFSET_RANGE)
+        problem.set_parameter_upper_bound(p, 1,  config.SOLVER_YAW_OFFSET_RANGE)
+        problem.set_parameter_lower_bound(p, 2, -config.SOLVER_ROLL_OFFSET_RANGE)
+        problem.set_parameter_upper_bound(p, 2,  config.SOLVER_ROLL_OFFSET_RANGE)
+        logger.debug("[%s] pitch window: [%.1f°, %.1f°]  seed=%.1f°",
+                     f.stem[-12:], p_lo, p_hi, seed_pitch)
+
+    # Van heading bounds (east/north are free)
+    h_lo = config.VAN_HEADING_PRIOR_DEG - config.VAN_HEADING_RANGE_DEG
+    h_hi = config.VAN_HEADING_PRIOR_DEG + config.VAN_HEADING_RANGE_DEG
+    problem.set_parameter_lower_bound(van_params, 2, h_lo)
+    problem.set_parameter_upper_bound(van_params, 2, h_hi)
+
+    # Solver options
+    options = pyceres.SolverOptions()
+    options.linear_solver_type         = pyceres.LinearSolverType.SPARSE_NORMAL_CHOLESKY
+    options.minimizer_progress_to_stdout = True
+    options.max_num_iterations         = config.SOLVER_MAX_ITERATIONS
+    options.function_tolerance         = 1e-6
+    options.gradient_tolerance         = 1e-8
+    options.parameter_tolerance        = 1e-8
+
+    logger.info("Starting Ceres orientation solve…")
+    summary = pyceres.SolverSummary()
+    pyceres.solve(options, problem, summary)
+
+    report = summary.BriefReport()
+    logger.info("Ceres solve complete: %s", report)
+
+    return cam_params, van_params, report
