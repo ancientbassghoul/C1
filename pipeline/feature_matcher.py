@@ -167,44 +167,6 @@ def _enhance_np(img_bgr: np.ndarray) -> np.ndarray:
 # Spatial grid subsampling
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _grid_subsample(
-    pts_a: np.ndarray,
-    pts_b: np.ndarray,
-    image_w: int,
-    ground_rows: tuple[int, int],
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Keep at most one match per spatial grid cell.
-
-    The grid is defined over the source frame's (pts_a) ground region.
-    Cell assignment is by pts_a pixel coordinates.  The first match found
-    in each cell is kept; since LightGlue outputs matches in descending
-    confidence order, this keeps the best match per cell.
-
-    Grid dimensions are set by config.MATCH_GRID_COLS × MATCH_GRID_ROWS
-    (default 5 × 4 = 20 cells maximum per frame pair).
-    """
-    ga0, ga1   = ground_rows
-    n_cols     = config.MATCH_GRID_COLS
-    n_rows     = config.MATCH_GRID_ROWS
-    row_height = max(ga1 - ga0, 1)
-
-    cell_first: dict[tuple[int, int], int] = {}
-    for i, pa in enumerate(pts_a):
-        col = int(pa[0] / max(image_w, 1) * n_cols)
-        row = int((pa[1] - ga0) / row_height * n_rows)
-        col = max(0, min(col, n_cols - 1))
-        row = max(0, min(row, n_rows - 1))
-        key = (col, row)
-        if key not in cell_first:
-            cell_first[key] = i
-
-    if not cell_first:
-        return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.float32)
-
-    idx = list(cell_first.values())
-    return pts_a[idx], pts_b[idx]
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LightGlue lazy init
@@ -236,22 +198,6 @@ def _load_models():
 # Image helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _content_bounds(gray: np.ndarray) -> tuple[int, int]:
-    rows = np.where((gray > 8).mean(axis=1) > 0.10)[0]
-    return (int(rows[0]), int(rows[-1])) if len(rows) >= 20 else (0, gray.shape[0] - 1)
-
-
-def _ground_rows(frame: Frame) -> tuple[int, int]:
-    """Lower 55% of content area, excluding HUD strips."""
-    gray = cv2.cvtColor(frame.undistorted, cv2.COLOR_BGR2GRAY)
-    c_top, c_bot = _content_bounds(gray)
-    h = c_bot - c_top
-    if h < 50:
-        return c_top, c_bot
-    top = c_top + 70 + int(0.45 * h)
-    bot = c_bot - int(0.05 * h)
-    return max(top, c_top + 70), bot
-
 
 def _to_tensor(img_bgr: np.ndarray, device):
     import torch
@@ -282,9 +228,6 @@ def _match(frame_a: Frame, frame_b: Frame,
 
     _load_models()
 
-    ga0, ga1 = _ground_rows(frame_a)
-    gb0, gb1 = _ground_rows(frame_b)
-
     img_t_a = _to_tensor(frame_a.undistorted, _device)
     img_t_b = _to_tensor(frame_b.undistorted, _device)
 
@@ -303,11 +246,19 @@ def _match(frame_a: Frame, frame_b: Frame,
     kp_a = feats_a['keypoints'][matches[:, 0]].cpu().numpy()
     kp_b = feats_b['keypoints'][matches[:, 1]].cpu().numpy()
 
-    # Keep only ground-region matches
-    mask = (
-        (kp_a[:, 1] >= ga0) & (kp_a[:, 1] <= ga1) &
-        (kp_b[:, 1] >= gb0) & (kp_b[:, 1] <= gb1)
-    )
+    # Ground mask filter (pixel-level, from GroundedSAM)
+    gm_a = frame_a.ground_mask
+    gm_b = frame_b.ground_mask
+    ha, wa = gm_a.shape
+    hb, wb = gm_b.shape
+    xa = np.clip(kp_a[:, 0].astype(int), 0, wa - 1)
+    ya = np.clip(kp_a[:, 1].astype(int), 0, ha - 1)
+    xb = np.clip(kp_b[:, 0].astype(int), 0, wb - 1)
+    yb = np.clip(kp_b[:, 1].astype(int), 0, hb - 1)
+    mask = gm_a[ya, xa] & gm_b[yb, xb]
+    from pipeline.ground_mask import mask_to_row_bounds
+    ga0, ga1 = mask_to_row_bounds(gm_a)
+    gb0, gb1 = mask_to_row_bounds(gm_b)
 
     # Exclude van regions
     if van_bbox_a is not None:
@@ -334,11 +285,6 @@ def _match(frame_a: Frame, frame_b: Frame,
     if len(pts_a) < MIN_GROUND_MATCHES:
         return np.empty((0, 2)), np.empty((0, 2))
 
-    # Spatial grid subsampling — replaces random step subsampling
-    pts_a, pts_b = _grid_subsample(pts_a, pts_b,
-                                   frame_a.undistorted.shape[1],
-                                   (ga0, ga1))
-
     if _DEBUG:
         _save_debug_matches(
             frame_a, frame_b, pts_a, pts_b,
@@ -352,12 +298,152 @@ def _match(frame_a: Frame, frame_b: Frame,
 
 
 
+
+
+def _global_match_filter(
+    pair_matches: dict,
+    spatial_thresh: float,
+) -> dict:
+    """
+    Filter matches globally across all frame pairs using multi-frame coverage.
+
+    Algorithm
+    ---------
+    1. REACH -- for every match endpoint (a pixel in some frame), count how
+       many distinct OTHER frames have a matched pixel within spatial_thresh
+       pixels in that same frame.  A pixel seen in pairs (A,B) and (A,C)
+       has reach 2 in frame A.
+
+    2. SCORE -- each match (pA, pB) scores reach_A + reach_B.
+       A score of 4 means both endpoints each connect to 2+ other frames,
+       i.e. the physical point is visible in 3+ frames.
+
+    3. GREEDY SELECTION -- process matches in descending score order.
+       Keep a match if its pixels are not BOTH within spatial_thresh of
+       already-kept matches in their respective frames.
+       High-score matches claim their neighbourhood first, so weak nearby
+       duplicates are discarded.
+    """
+    from collections import defaultdict
+    from scipy.spatial import cKDTree
+
+    if not pair_matches:
+        return {}
+
+    # Step 1: per-frame observation lists
+    frame_obs: dict = defaultdict(list)
+    for pair_key, (pts_a, pts_b) in pair_matches.items():
+        fa, fb = pair_key
+        for i in range(len(pts_a)):
+            frame_obs[fa].append((pts_a[i], pair_key, i))
+            frame_obs[fb].append((pts_b[i], pair_key, i))
+
+    # Step 2: reach per observation
+    reach: dict = {}
+
+    for frame, obs in frame_obs.items():
+        if len(obs) < 2:
+            for (pixel, pair_key, local_idx) in obs:
+                reach[(pair_key, local_idx, frame)] = 1
+            continue
+
+        pixels = np.array([o[0] for o in obs])
+        tree   = cKDTree(pixels)
+
+        for j, (pixel, pair_key, local_idx) in enumerate(obs):
+            fa_k, fb_k = pair_key
+            partner = fb_k if fa_k is frame else fa_k
+            nearby = tree.query_ball_point(pixel, spatial_thresh)
+            other_frames: set = set()
+            for k in nearby:
+                _, pk, _ = obs[k]
+                fa_n, fb_n = pk
+                other_frames.add(fb_n if fa_n is frame else fa_n)
+            other_frames.discard(partner)
+            reach[(pair_key, local_idx, frame)] = 1 + len(other_frames)
+
+    # Step 3: score and sort
+    scored: list = []
+    for pair_key, (pts_a, pts_b) in pair_matches.items():
+        fa, fb = pair_key
+        for i in range(len(pts_a)):
+            ra = reach.get((pair_key, i, fa), 1)
+            rb = reach.get((pair_key, i, fb), 1)
+            scored.append((ra + rb, pair_key, i))
+
+    scored.sort(key=lambda x: -x[0])
+
+    # Step 4: greedy spatial deduplication
+    kept_pts: dict = defaultdict(list)
+    kept_idx: dict = defaultdict(set)
+
+    for score, pair_key, i in scored:
+        fa, fb = pair_key
+        pts_a_all, pts_b_all = pair_matches[pair_key]
+        pa, pb = pts_a_all[i], pts_b_all[i]
+
+        def _near(frame, pixel):
+            pts_list = kept_pts[frame]
+            if not pts_list:
+                return False
+            d, _ = cKDTree(np.array(pts_list)).query(pixel)
+            return bool(d < spatial_thresh)
+
+        if not (_near(fa, pa) and _near(fb, pb)):
+            kept_pts[fa].append(pa)
+            kept_pts[fb].append(pb)
+            kept_idx[pair_key].add(i)
+
+    # Step 5: assemble output
+    result: dict = {}
+    for pair_key, (pts_a, pts_b) in pair_matches.items():
+        idxs = sorted(kept_idx.get(pair_key, set()))
+        if idxs:
+            result[pair_key] = (pts_a[idxs], pts_b[idxs])
+
+    n_in  = sum(len(v[0]) for v in pair_matches.values())
+    n_out = sum(len(v[0]) for v in result.values())
+    logger.info("Global filter: %d -> %d matches across %d/%d pairs.",
+                n_in, n_out, len(result), len(pair_matches))
+    return result
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _apply_pose_overrides(frames: list[Frame]) -> int:
+    """
+    Apply config.CAMERA_POSE_OVERRIDES to matching frames in-place.
+    Matches by the last 5 characters of frame.stem (the frame number).
+    Returns the number of frames updated.
+    """
+    overrides = config.CAMERA_POSE_OVERRIDES
+    if not overrides:
+        return 0
+    updated = 0
+    for f in frames:
+        frame_num = f.stem[-5:]
+        if frame_num not in overrides:
+            continue
+        ov = overrides[frame_num]
+        f.position_enu     = np.array([ov['x'], ov['y'], ov['z']])
+        f.heading_deg      = ov['heading']
+        f.gimbal_pitch_deg = ov['pitch']
+        f.camera_roll_deg  = ov['roll']
+        f.R = build_rotation(f.heading_deg, f.gimbal_pitch_deg, f.camera_roll_deg)
+        logger.info(
+            "[%s] Pose from config override: pos=(%.2f, %.2f, %.2f)m  "
+            "hdg=%.1f°  pitch=%.1f°  roll=%.1f°",
+            f.stem, ov['x'], ov['y'], ov['z'],
+            ov['heading'], ov['pitch'], ov['roll'],
+        )
+        updated += 1
+    return updated
+
+
 def refine_pitches(frames: list[Frame],
-                   van_bboxes: dict | None = None) -> None:
+                   van_bboxes: dict | None = None,
+                   cameras_init_from_config: bool = False) -> None:
     """
     Refine camera orientation (pitch, yaw offset, roll offset) jointly using
     pyceres with pairwise ground-scatter and van corner reprojection costs.
@@ -369,6 +455,11 @@ def refine_pitches(frames: list[Frame],
     Frames listed in config.GIMBAL_PITCH_OVERRIDES are never modified.
     """
     vb = van_bboxes or {}
+
+    # ── Apply manual pose overrides from config (if requested) ────────────────
+    if cameras_init_from_config:
+        n_overridden = _apply_pose_overrides(frames)
+        logger.info("Applied config pose overrides to %d frame(s).", n_overridden)
 
     # ── Eligible frames ───────────────────────────────────────────────────────
     ready = [
@@ -384,8 +475,16 @@ def refine_pitches(frames: list[Frame],
         logger.warning("refine_pitches: fewer than 2 eligible frames.")
         return
 
-    # ── Feature matching ──────────────────────────────────────────────────────
-    pairwise_features: list[tuple] = []   # (fi, pixel_i, fj, pixel_j)
+    # ── Ground masks (GroundedSAM) ──────────────────────────────────────────
+    from pipeline.ground_mask import get_ground_masks
+    logger.info("Computing GroundedSAM ground masks for %d frame(s)...", len(ready))
+    ground_masks = get_ground_masks(ready)
+    for f, m in ground_masks.items():
+        f.ground_mask = m
+    logger.info("Ground masks ready.")
+
+    # ── Feature matching — pass 1: raw per-pair matches ─────────────────────
+    raw_pair_matches: dict = {}
 
     for fa, fb in combinations(ready, 2):
         if np.linalg.norm(fb.position_enu - fa.position_enu) < MIN_BASELINE_M:
@@ -393,19 +492,38 @@ def refine_pitches(frames: list[Frame],
         pts_a, pts_b = _match(fa, fb,
                                van_bbox_a=vb.get(fa.stem),
                                van_bbox_b=vb.get(fb.stem))
-        if len(pts_a) < MIN_GROUND_MATCHES:
-            continue
-        logger.info("  %s ↔ %s : %d matches",
+        if len(pts_a) >= MIN_GROUND_MATCHES:
+            raw_pair_matches[(fa, fb)] = (pts_a, pts_b)
+            logger.info("  %s ↔ %s : %d raw matches",
+                        fa.stem[-12:], fb.stem[-12:], len(pts_a))
+
+    # Clean up ground_mask — not needed beyond this point
+    for f in ready:
+        f.ground_mask = None
+
+    if not raw_pair_matches:
+        logger.warning("No ground matches found — skipping refinement.")
+        return
+
+    # ── Feature matching — pass 2: global multi-frame-aware filter ────────────
+    filtered = _global_match_filter(raw_pair_matches,
+                                    config.MATCH_SPATIAL_DEDUP_THRESH)
+
+    if not filtered:
+        logger.warning("Global filter removed all matches — skipping refinement.")
+        return
+
+    # ── Build pairwise_features ───────────────────────────────────────────────
+    pairwise_features: list[tuple] = []
+
+    for (fa, fb), (pts_a, pts_b) in filtered.items():
+        logger.info("  %s ↔ %s : %d matches (after global filter)",
                     fa.stem[-12:], fb.stem[-12:], len(pts_a))
         for (ua, va), (ub, vb_) in zip(pts_a, pts_b):
             pairwise_features.append(
                 (fa, (float(ua), float(va)),
                  fb, (float(ub), float(vb_)))
             )
-
-    if not pairwise_features:
-        logger.warning("No ground matches found — skipping refinement.")
-        return
 
     logger.info("%d total ground feature pairs across %d frames.",
                 len(pairwise_features), len(ready))
@@ -476,11 +594,16 @@ def refine_pitches(frames: list[Frame],
         pitch = float(params[0])
         yo    = float(params[1])
         ro    = float(params[2])
+        dx    = float(params[3])
+        dy    = float(params[4])
+        dz    = float(params[5])
         logger.info(
-            "  [%s] pitch → %.1f°  yaw_off → %+.2f°  roll_off → %+.2f°",
-            f.stem[-12:], pitch, yo, ro,
+            "  [%s] pitch → %.1f°  yaw_off → %+.2f°  roll_off → %+.2f°  "
+            "pos_off → (%+.2f, %+.2f, %+.2f) m",
+            f.stem[-12:], pitch, yo, ro, dx, dy, dz,
         )
         f.gimbal_pitch_deg  = pitch
         f.heading_deg       = f.heading_deg     + yo
         f.camera_roll_deg   = f.camera_roll_deg + ro
+        f.position_enu      = f.position_enu    + np.array([dx, dy, dz])
         f.R = build_rotation(f.heading_deg, pitch, f.camera_roll_deg)

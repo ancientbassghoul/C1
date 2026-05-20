@@ -93,7 +93,7 @@ class GroundScatterCost:
                  z_ground=0.0):
         self._ui, self._vi = pixel_i
         self._uj, self._vj = pixel_j
-        self._pos_i  = pos_i.copy()
+        self._pos_i  = pos_i.copy()   # GPS seed — params[3:6] adds correction
         self._pos_j  = pos_j.copy()
         self._Ki_inv = np.linalg.inv(K_i)
         self._Kj_inv = np.linalg.inv(K_j)
@@ -104,12 +104,15 @@ class GroundScatterCost:
         self._z      = z_ground
 
     def __call__(self, params_i, params_j):
+        # params layout: [pitch, yaw_off, roll_off, dx, dy, dz]
+        pos_i = self._pos_i + np.array([params_i[3], params_i[4], params_i[5]])
+        pos_j = self._pos_j + np.array([params_j[3], params_j[4], params_j[5]])
         Pi = _unproject(self._ui, self._vi, self._Ki_inv,
                         self._hdg_i + params_i[1], params_i[0],
-                        self._roll_i + params_i[2], self._pos_i, self._z)
+                        self._roll_i + params_i[2], pos_i, self._z)
         Pj = _unproject(self._uj, self._vj, self._Kj_inv,
                         self._hdg_j + params_j[1], params_j[0],
-                        self._roll_j + params_j[2], self._pos_j, self._z)
+                        self._roll_j + params_j[2], pos_j, self._z)
         if Pi is None or Pj is None:
             return np.array([_MISS_PENALTY, _MISS_PENALTY])
         return np.array([Pi[0] - Pj[0], Pi[1] - Pj[1]])
@@ -136,17 +139,19 @@ class VanCornerCost:
         self._weight = config.VAN_CORNER_WEIGHT
 
     def __call__(self, camera_params, van_params):
+        # params layout: [pitch, yaw_off, roll_off, dx, dy, dz]
         yaw   = self._hdg  + camera_params[1]
         pitch = camera_params[0]
         roll  = self._roll + camera_params[2]
         R_cam = build_rotation(yaw, pitch, roll)
+        pos   = self._pos + np.array([camera_params[3], camera_params[4], camera_params[5]])
 
         corner_world = _van_corner_world(
             self._corner_local,
             float(van_params[0]), float(van_params[1]), float(van_params[2]),
             self._van_z,
         )
-        p_cam = R_cam @ (corner_world - self._pos)
+        p_cam = R_cam @ (corner_world - pos)
         if p_cam[2] <= 1e-6:
             return np.array([_MISS_PENALTY * self._weight,
                              _MISS_PENALTY * self._weight])
@@ -236,10 +241,11 @@ def solve(frames, pairwise_features, van_observations, van_pose_init,
 
     problem    = pyceres.Problem()
     # Initialise camera parameters from GeoCalib seeds where available
+    # Layout: [pitch, yaw_off, roll_off, dx, dy, dz]
     cam_params = {}
     for f in frames:
         seed_pitch = pitch_seeds.get(f, 0.0) if pitch_seeds else 0.0
-        cam_params[f] = np.array([seed_pitch, 0.0, 0.0])
+        cam_params[f] = np.array([seed_pitch, 0.0, 0.0, 0.0, 0.0, 0.0])
     van_params = np.array(van_pose_init, dtype=np.float64)
 
     ground_loss = pyceres.CauchyLoss(5.0)
@@ -254,7 +260,7 @@ def solve(frames, pairwise_features, van_observations, van_pose_init,
             fi.heading_deg,  fj.heading_deg,
             fi.camera_roll_deg, fj.camera_roll_deg,
         )
-        cost = _NumericDiff(functor, num_residuals=2, block_sizes=[3, 3])
+        cost = _NumericDiff(functor, num_residuals=2, block_sizes=[6, 6])
         problem.add_residual_block(cost, ground_loss,
                                  [cam_params[fi], cam_params[fj]])
 
@@ -266,7 +272,7 @@ def solve(frames, pairwise_features, van_observations, van_pose_init,
             frame.heading_deg, frame.camera_roll_deg,
             van_z=config.VAN_Z_M,
         )
-        cost = _NumericDiff(functor, num_residuals=2, block_sizes=[3, 3])
+        cost = _NumericDiff(functor, num_residuals=2, block_sizes=[6, 3])
         problem.add_residual_block(cost, van_loss,
                                  [cam_params[frame], van_params])
 
@@ -282,6 +288,13 @@ def solve(frames, pairwise_features, van_observations, van_pose_init,
         problem.set_parameter_upper_bound(p, 1,  config.SOLVER_YAW_OFFSET_RANGE)
         problem.set_parameter_lower_bound(p, 2, -config.SOLVER_ROLL_OFFSET_RANGE)
         problem.set_parameter_upper_bound(p, 2,  config.SOLVER_ROLL_OFFSET_RANGE)
+        # Position correction bounds (dx, dy horizontal; dz vertical)
+        problem.set_parameter_lower_bound(p, 3, -config.SOLVER_POSITION_RANGE_H)
+        problem.set_parameter_upper_bound(p, 3,  config.SOLVER_POSITION_RANGE_H)
+        problem.set_parameter_lower_bound(p, 4, -config.SOLVER_POSITION_RANGE_H)
+        problem.set_parameter_upper_bound(p, 4,  config.SOLVER_POSITION_RANGE_H)
+        problem.set_parameter_lower_bound(p, 5, -config.SOLVER_POSITION_RANGE_V)
+        problem.set_parameter_upper_bound(p, 5,  config.SOLVER_POSITION_RANGE_V)
         logger.debug("[%s] pitch window: [%.1f°, %.1f°]  seed=%.1f°",
                      f.stem[-12:], p_lo, p_hi, seed_pitch)
 

@@ -107,9 +107,36 @@ def parse_args() -> argparse.Namespace:
              "Useful for diagnosing whether GeoCalib roll estimates are better than bracket detection.",
     )
     p.add_argument(
+        "--cameras-init-from-config", action="store_true",
+        dest="cameras_init_from_config",
+        help="Seed camera poses from CAMERA_POSE_OVERRIDES in config.py before running "
+             "the orientation solver. Bypasses GPS + GeoCalib for overridden frames.",
+    )
+    p.add_argument(
         "--feature-matcher-debug", action="store_true", dest="feature_matcher_debug",
         help="Save annotated match images (keypoints, ground region, van bbox) "
              "to {OUTPUT_DIR}/debug/ for every matched frame pair.",
+    )
+    p.add_argument(
+        "--preview-ground-masks", action="store_true", dest="preview_ground_masks",
+        help="Compute GroundedSAM ground masks for every frame, save three-panel "
+             "debug images (positive / exclusion / final) to {OUTPUT_DIR}/debug/masks/, "
+             "then exit.  Use to tune GROUND_INCLUDE/EXCLUDE prompts and thresholds "
+             "in config.py without running the full feature-matching pipeline.",
+    )
+    p.add_argument(
+        "--preview-hud-masks", action="store_true", dest="preview_hud_masks",
+        help="Detect HUD overlays on raw frames using GroundedSAM, save two-panel "
+             "debug images to {OUTPUT_DIR}/debug/hud_masks/, then exit.  "
+             "Only loads raw frames — no OCR, undistort, or matching needed.  "
+             "Use to tune HUD_REGIONS coordinates in config.py.",
+    )
+    p.add_argument(
+        "--preview-hsv-masks", action="store_true", dest="preview_hsv_masks",
+        help="Compute HSV-based ground masks and save 5-panel debug images "
+             "to {OUTPUT_DIR}/debug/hsv_masks/.  Runs load + undistort only — "
+             "no OCR, pose, or model inference.  Use to tune HSV_SKY_RANGES "
+             "and HSV_VEG_RANGES in config.py.",
     )
     return p.parse_args()
 
@@ -136,7 +163,7 @@ def preview_enhanced(frames: list) -> None:
             break
 
 
-def run_pipeline(frames_dir: str, no_refine: bool = False, no_enhance: bool = False, height_mode: str = 'tor', feature_matcher_debug: bool = False, no_horizon_indicator_reading: bool = False) -> list:
+def run_pipeline(frames_dir: str, no_refine: bool = False, no_enhance: bool = False, height_mode: str = 'tor', feature_matcher_debug: bool = False, preview_ground_masks: bool = False, preview_hsv_masks: bool = False, no_horizon_indicator_reading: bool = False, cameras_init_from_config: bool = False) -> list:
     """Load, OCR, undistort, pose-estimate, detect van, and refine pitches. Return ready frames."""
     from pipeline.frame     import load_frames
     from pipeline.ocr       import extract_telemetry_all
@@ -156,35 +183,45 @@ def run_pipeline(frames_dir: str, no_refine: bool = False, no_enhance: bool = Fa
     logger.info("Step 3/6 – Undistorting frames (fisheye model)")
     undistort_all(frames)
 
-    logger.info("═" * 60)
-    logger.info("Step 4/6 – Estimating camera poses from telemetry")
-    estimate_poses(frames, skip_bracket_roll=no_horizon_indicator_reading)
-    # Override camera Z according to --height
-    for f in frames:
-        if f.position_enu is None: continue
-        alt_ref = f.alt_takeoff_ref_m or 0.0
-        alt_agl = f.alt_agl_m         or 0.0
-        if height_mode == 'avg':
-            f.position_enu[2] = (alt_ref + alt_agl) / 2.0
-        elif height_mode == 'tor':
-            f.position_enu[2] = alt_ref
-        # 'agl' is already set by estimate_poses — no change needed
-
-    logger.info("═" * 60)
-    logger.info("Step 5/6 – Detecting van (GroundingDINO → white-blob fallback)")
-    detector   = VanDetector()
-    detections = detector.detect_all(frames)
-    # Convert Frame-keyed dict to stem-keyed dict for refine_pitches
-    van_bboxes = {f.stem: bbox for f, bbox in detections.items()}
-
-    if no_refine:
-        logger.info("Step 6/6 – Pitch refinement SKIPPED (--no-refine)")
+    skip_heavy = feature_matcher_debug or preview_ground_masks or preview_hsv_masks
+    if skip_heavy:
+        logger.info("═" * 60)
+        logger.info("Step 4/6 – SKIPPED (pose not needed for this mode)")
     else:
+        logger.info("═" * 60)
+        logger.info("Step 4/6 – Estimating camera poses from telemetry")
+        estimate_poses(frames, skip_bracket_roll=no_horizon_indicator_reading)
+        # Override camera Z according to --height
+        for f in frames:
+            if f.position_enu is None: continue
+            alt_ref = f.alt_takeoff_ref_m or 0.0
+            alt_agl = f.alt_agl_m         or 0.0
+            if height_mode == 'avg':
+                f.position_enu[2] = (alt_ref + alt_agl) / 2.0
+            elif height_mode == 'tor':
+                f.position_enu[2] = alt_ref
+            # 'agl' is already set by estimate_poses — no change needed
+
+    if skip_heavy:
+        logger.info("═" * 60)
+        logger.info("Steps 5-6 – SKIPPED (not needed for this mode)")
+        van_bboxes = {}
+    else:
+        logger.info("═" * 60)
+        logger.info("Step 5/6 – Detecting van (GroundingDINO → white-blob fallback)")
+        detector   = VanDetector()
+        detections = detector.detect_all(frames)
+        # Convert Frame-keyed dict to stem-keyed dict for refine_pitches
+        van_bboxes = {f.stem: bbox for f, bbox in detections.items()}
+
+    if no_refine and not skip_heavy:
+        logger.info("Step 6/6 – Pitch refinement SKIPPED (--no-refine)")
+    elif not skip_heavy:
         logger.info("Step 6/6 – Refining gimbal pitch via ground-scatter (LightGlue)")
-        from pipeline.feature_matcher import refine_pitches, set_enhance, set_debug
+        from pipeline.feature_matcher import refine_pitches, set_enhance
         set_enhance(not no_enhance)
-        set_debug(feature_matcher_debug)
-        refine_pitches(frames, van_bboxes=van_bboxes)
+        refine_pitches(frames, van_bboxes=van_bboxes,
+                       cameras_init_from_config=cameras_init_from_config)
 
     ready = [f for f in frames if f.ready]
     logger.info("═" * 60)
@@ -266,6 +303,96 @@ def run_batch(
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
+def preview_ground_masks(frames: list) -> None:
+    """
+    Compute GroundedSAM ground masks and save three-panel debug images.
+    Runs steps 1-3 only (load → OCR → undistort) then exits.
+    Outputs go to {OUTPUT_DIR}/debug/masks/<stem>_masks.png.
+    """
+    from pipeline.ground_mask import get_ground_masks
+    import config as cfg
+    from pathlib import Path
+
+    ready = [f for f in frames if f.undistorted is not None]
+    logger.info("Computing ground masks for %d frame(s)…", len(ready))
+    get_ground_masks(ready, save_debug=True)
+
+    out = Path(cfg.OUTPUT_DIR) / "debug" / "masks"
+    print(f"\nGround mask debug images saved to: {out}\n")
+    print("Each image shows three panels:")
+    print("  BLUE   = positive mask  (what GroundedSAM thinks IS ground)")
+    print("  RED    = exclusion mask (what GroundedSAM thinks is NOT ground)")
+    print("  GREEN  = final mask     (positive AND NOT exclusion AND NOT black border)")
+    print("\nTune GROUND_INCLUDE_PROMPT / GROUND_EXCLUDE_PROMPT and thresholds in config.py,")
+    print("then re-run --preview-ground-masks to iterate without running feature matching.\n")
+
+
+def preview_hud_masks_cmd(frames_dir: str) -> None:
+    """
+    Load + undistort frames, apply geometric HUD mask, save debug PNGs, exit.
+    No model inference — just geometry from config.HUD_REGIONS.
+    Fast enough to iterate in seconds when tuning region coordinates.
+    """
+    from pipeline.frame    import load_frames
+    from pipeline.undistort import undistort_all
+    from pipeline.ground_mask import save_hud_mask_preview
+    import config as cfg
+    from pathlib import Path
+
+    logger.info("Loading frames from %s", frames_dir)
+    frames = load_frames(frames_dir)
+
+    logger.info("Undistorting %d frame(s)…", len(frames))
+    undistort_all(frames)
+
+    logger.info("Building geometric HUD masks and saving previews…")
+    save_hud_mask_preview(frames)
+
+    out = Path(cfg.OUTPUT_DIR) / "debug" / "hud_masks"
+    print(f"\nHUD mask preview images saved to: {out}\n")
+    print("Each image shows two panels:")
+    print("  LEFT   = undistorted frame")
+    print("  RIGHT  = undistorted frame with HUD mask overlay (magenta)")
+    print("\nAdjust HUD_REGIONS coordinates in config.py and re-run — no model")
+    print("inference needed, so iteration is near-instant.\n")
+
+
+def preview_hsv_masks_cmd(frames_dir: str) -> None:
+    """
+    Load + undistort frames, compute HSV exclusion masks, save debug PNGs, exit.
+    No model inference — just HSV thresholding + geometric HUD mask.
+    Iterates in a few seconds.
+    """
+    from pipeline.frame          import load_frames
+    from pipeline.undistort      import undistort_all
+    from pipeline.hsv_ground_mask import get_hsv_ground_masks
+    from pathlib import Path
+    import config as cfg
+
+    logger.info("Loading frames from %s", frames_dir)
+    frames = load_frames(frames_dir)
+
+    logger.info("Undistorting %d frame(s)…", len(frames))
+    undistort_all(frames)
+
+    ready = [f for f in frames if f.undistorted is not None]
+    logger.info("Computing HSV ground masks for %d frame(s)…", len(ready))
+    # Van detection skipped during preview — add bbox exclusion manually via
+    # VanDetector if needed, or test without van first.
+    get_hsv_ground_masks(ready, van_detections=None, save_debug=True)
+
+    out = Path(cfg.OUTPUT_DIR) / "debug" / "hsv_masks"
+    print(f"\nHSV ground mask debug images saved to: {out}\n")
+    print("Each image shows five panels:")
+    print("  RED    = sky mask")
+    print("  GREEN  = vegetation mask")
+    print("  YELLOW = van + HUD mask")
+    print("  ORANGE = combined exclusion")
+    print("  TEAL   = final ground mask")
+    print("\nTune HSV_SKY_RANGES, HSV_VEG_RANGES, HSV_MORPH_KERNEL in config.py")
+    print("and re-run -- no model loading needed, iterates in seconds.\n")
+
+
 def main() -> None:
     args = parse_args()
 
@@ -274,8 +401,30 @@ def main() -> None:
         import config
         config.OUTPUT_DIR = args.output_dir
 
+    # HUD mask preview — needs only raw frames, no pipeline at all
+    if args.preview_hud_masks:
+        preview_hud_masks_cmd(args.frames_dir)
+        return
+
+    # HSV ground mask preview — load + undistort only, no model inference
+    if args.preview_hsv_masks:
+        preview_hsv_masks_cmd(args.frames_dir)
+        return
+
     # Run the shared pipeline
-    frames = run_pipeline(args.frames_dir, no_refine=args.no_refine, no_enhance=not args.enhance, height_mode=args.height, feature_matcher_debug=args.feature_matcher_debug, no_horizon_indicator_reading=args.no_horizon_indicator_reading)
+    frames = run_pipeline(args.frames_dir, no_refine=args.no_refine, no_enhance=not args.enhance, height_mode=args.height, feature_matcher_debug=args.feature_matcher_debug, preview_ground_masks=args.preview_ground_masks, preview_hsv_masks=args.preview_hsv_masks, no_horizon_indicator_reading=args.no_horizon_indicator_reading, cameras_init_from_config=args.cameras_init_from_config)
+
+    # Feature-matcher debug UI (replaces the old per-pair PNG file dumps)
+    if args.feature_matcher_debug:
+        from pipeline.feature_matcher_debug_ui import FeatureMatcherDebugViewer
+        viewer = FeatureMatcherDebugViewer(frames, enhance=args.enhance)
+        viewer.run()
+        return
+
+    # Ground mask preview — saves debug PNGs and exits
+    if args.preview_ground_masks:
+        preview_ground_masks(frames)
+        return
 
     # Mode dispatch
     if args.preview_enhanced:
