@@ -50,6 +50,11 @@ UNDISTORT_SCALE = 0.6
 # POSE ESTIMATION
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Set True to use the HUD horizon bracket indicator for roll detection.
+# Set False to use GeoCalib roll estimates for all frames instead.
+# Default is False — bracket detection is unreliable on heavily rolled frames.
+HORIZON_INDICATOR_READING = False
+
 # Earth radius used for the local flat-Earth (ENU) approximation.
 # Valid for areas < ~10 km; this scene is well within that.
 EARTH_RADIUS_M = 6_371_000.0
@@ -89,6 +94,18 @@ OCR_CROP_ALT     = (640, 718, 840, 1160)  # "XX.X  M  XX.X  M" (bottom-right)
 # OUTPUT
 # ─────────────────────────────────────────────────────────────────────────────
 OUTPUT_DIR = "./output"
+
+# Path where the manual correspondence picker saves / loads its JSON file.
+MANUAL_CORRESPONDENCES_FILE = "./output/manual_correspondences.json"
+
+# Path where the automatic LightGlue matches are saved after each pipeline run.
+# Saved by default so --show-scores can inspect them alongside manual picks.
+AUTO_MATCHES_FILE = "./output/auto_matches.json"
+
+# Weight of each manually-picked correspondence relative to a LightGlue match
+# in the Ceres solver.  10 means one hand-picked point counts as 10 automatic
+# matches.  Raise if the solver ignores manual picks; lower if they over-dominate.
+MANUAL_CORRESPONDENCE_WEIGHT = 10.0
 
 # Radius of the reprojection marker drawn on frames (pixels, in undistorted space).
 MARKER_RADIUS    = 14

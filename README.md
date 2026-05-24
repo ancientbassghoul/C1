@@ -44,7 +44,16 @@ All arguments to `raycast.py`:
 | `--preview-enhanced` | off | Show the CLAHE+unsharp frames fed to SuperPoint, then exit. Useful for diagnosing poor feature detection. |
 | `--enhance` | off | Enable CLAHE+unsharp preprocessing before LightGlue feature matching. |
 | `--no-refine` | off | Skip pitch refinement entirely; use only manual overrides from `config.py`. |
-| `--feature-matcher-debug` | off | Save annotated side-by-side match images (keypoints, ground region band, van bbox, connecting lines) to `{output_dir}/debug/` for every matched frame pair. |
+| `--feature-matcher-debug` | off | Open the interactive feature matcher debug viewer. Shows SuperPoint keypoints coloured by ground mask, filtered matches, and per-feature correspondences across frames. Much faster than a full pipeline run. |
+| `--preview-ground-masks` | off | Compute GroundedSAM ground masks and save four-panel debug images (positive / exclusion / HUD / final) to `{output_dir}/debug/masks/`. Use to tune `GROUND_INCLUDE_PROMPT`, `GROUND_EXCLUDE_PROMPT` and thresholds in `config.py`. |
+| `--preview-hud-masks` | off | Apply geometric HUD masks (from `HUD_REGIONS` in `config.py`) to undistorted frames and save debug images. No model inference — iterates in seconds. |
+| `--preview-hsv-masks` | off | Compute HSV-based sky/vegetation masks and save five-panel debug images. Use to tune `HSV_SKY_RANGES` and `HSV_VEG_RANGES` in `config.py`. |
+| `--manual-correspondences` | off | Open the manual ground correspondence picker. Click matching features across frames, save to JSON. See **Manual calibration** section below. |
+| `--show-scores [PATH]` | — | Score correspondences and open the viewer coloured red→blue by quality. Without `--manual-correspondences`: defaults to `AUTO_MATCHES_FILE` (LightGlue matches). With `--manual-correspondences`: defaults to `MANUAL_CORRESPONDENCES_FILE`. Optional PATH overrides either default. |
+| `--manual-correspondences --show-scores` | — | Score first, then open the picker in score+edit mode — see bad points and fix them without switching tools. |
+| `--manual-fm-json [PATH]` | — | Run the full pipeline but feed manual correspondences to Ceres instead of LightGlue. PATH defaults to `MANUAL_CORRESPONDENCES_FILE` from `config.py`. |
+| `--run-matcher-only` | off | Run steps 1–6 through LightGlue then exit after saving `auto_matches.json`. Skips the Ceres solve — use to generate the match file for `--show-scores` quickly. |
+| `--cameras-init-from-config` | off | Seed camera poses from `CAMERA_POSE_OVERRIDES` in `config.py` before running the solver. |
 
 `export_blender.py` accepts the same `--height`, `--enhance`, and `--feature-matcher-debug` flags. Its equivalent of `--calculate-orientation` (runs the orientation solver before export) replaces the old `--optimize-pitch`.
 
@@ -138,6 +147,11 @@ raycast_challenge/
     ├── pitch_from_geocalib.py   Batch pitch + roll estimation via GeoCalib (shared intrinsics)
     ├── orientation_solver.py  Pyceres cost functions + joint solve (ground scatter + van corners)
     ├── feature_matcher.py   Ground feature matching and pitch refinement orchestration
+    ├── feature_matcher_debug_ui.py  Interactive feature match explorer (--feature-matcher-debug)
+    ├── ground_mask.py           GroundedSAM ground segmentation (positive + exclusion passes)
+    ├── hsv_ground_mask.py       HSV-based sky/vegetation masking (experimental)
+    ├── manual_correspondence_ui.py  Manual ground feature picker with zoom/pan
+    ├── correspondence_scorer.py     SuperPoint descriptor quality scoring
     ├── geometry.py          Ray–ground-plane intersection + reprojection math
     └── ui.py                Interactive grid viewer + proof-sheet export
 ```
@@ -286,10 +300,188 @@ The ground plane is placed at `Z = terrain_offset_m` (not hardcoded to 0). Both 
 
 ---
 
+## Manual calibration
+
+When automatic feature matching produces poor solver convergence — cameras hitting
+their bounds, high final cost, reprojection errors of several metres — the manual
+calibration tools let you inspect, annotate, and correct the problem.
+
+### Ground mask tuning
+
+The feature matcher only uses keypoints in the **ground mask** — pixels identified
+as soil/dirt by GroundedSAM, minus sky, vegetation, van, HUD, and black border.
+
+**Iterate quickly without running the full pipeline:**
+
+```cmd
+:: Tune HUD regions (raw-frame pixel rectangles in config.py → HUD_REGIONS)
+venv\Scripts\python raycast.py --frames_dir ./frames --preview-hud-masks
+
+:: Tune GroundedSAM prompts and thresholds
+venv\Scripts\python raycast.py --frames_dir ./frames --preview-ground-masks
+
+:: Tune HSV sky/vegetation ranges (alternative to GroundedSAM for exclusion)
+venv\Scripts\python raycast.py --frames_dir ./frames --preview-hsv-masks
+```
+
+Debug images are saved to `{output_dir}/debug/` with labelled panels showing each
+masking stage. Tune the relevant entries in `config.py` and re-run — no model
+loading needed for HUD or HSV passes.
+
+### Feature matching inspection
+
+```cmd
+venv\Scripts\python raycast.py --frames_dir ./frames --feature-matcher-debug
+```
+
+Opens an interactive grid showing all frames. The pipeline runs steps 1–3 only
+(load → OCR → undistort) — no pose, no van detection, no Ceres.
+
+**Controls:**
+
+| Action | Effect |
+|---|---|
+| Click any frame | Make it the source; see its filtered ground keypoints (cyan dots) |
+| Click a cyan dot | Trace that physical point — orange rings appear in every paired frame |
+| Click a paired frame | Make it the new source |
+| `[Clear]` button | Reset to idle |
+| Scroll | Zoom centred on cursor |
+| Middle-drag | Pan |
+| Ctrl+Scroll | Adjust marker size |
+| `q` / Esc | Quit |
+
+The dots shown are **exactly** the keypoints that reach the Ceres solver — same
+ground mask filter, same RANSAC, same global deduplication filter.
+
+### Manual correspondence picking
+
+When automatic matching is insufficient, pick ground correspondences by hand:
+
+```cmd
+venv\Scripts\python raycast.py --frames_dir ./frames --manual-correspondences
+```
+
+**Workflow:**
+
+1. Zoom into a distinctive ground feature (a specific tyre track end, debris,
+   edge of dirt patch) in one frame.
+2. Left-click to place a point.
+3. Zoom/pan to the same feature in another frame, click to place its point.
+4. Repeat for as many frames as you can see the feature in.
+5. Press **Enter** or **n** to save the correspondence and start the next one.
+6. Aim for 15–20 well-distributed correspondences covering different parts of
+   the shared ground area.
+7. Press **s** to write to JSON (also happens on clean quit).
+
+**Controls:**
+
+| Key / action | Effect |
+|---|---|
+| Left-click | Place / move this frame's point for the current correspondence |
+| Enter / n | Save current correspondence (needs ≥ 2 frames) |
+| `[` | Enter edit mode / move to previous saved correspondence |
+| `]` | Move to next saved correspondence |
+| `c` | Cancel / restore current correspondence |
+| `d` | Delete last saved correspondence |
+| `s` | Write all to JSON immediately |
+| `R` | Reset zoom/pan to fit all |
+| Scroll | Zoom centred on cursor |
+| Middle-drag | Pan |
+| Ctrl+Scroll | Adjust marker size (down to 1 screen pixel) |
+| `q` / Esc | Quit (warns on unsaved changes) |
+
+Correspondences are saved to `MANUAL_CORRESPONDENCES_FILE` in `config.py`
+(default: `./output/manual_correspondences.json`).  The JSON persists between
+sessions — re-opening the tool loads existing correspondences automatically.
+
+**Feature selection tips:** choose features at the intersection of distinct
+textures (edge of tyre track meeting bare soil, corner of a mud patch, specific
+rock or debris). Avoid featureless areas like uniform dirt — they are ambiguous
+from different angles.
+
+### Scoring correspondences
+
+**Score automatic LightGlue matches** (generated after every normal pipeline run,
+or on demand with `--run-matcher-only`):
+
+```cmd
+:: Generate match file without running Ceres (fast)
+venv\Scripts\python raycast.py --frames_dir ./frames --run-matcher-only
+
+:: Inspect LightGlue matches coloured by quality
+venv\Scripts\python raycast.py --frames_dir ./frames --show-scores
+```
+
+**Score manual correspondences:**
+
+```cmd
+:: Score only — read-only colour view
+venv\Scripts\python raycast.py --frames_dir ./frames --manual-correspondences --show-scores
+
+:: Score + edit in one session
+venv\Scripts\python raycast.py --frames_dir ./frames --manual-correspondences --show-scores
+```
+
+**Score viewer controls:**
+
+| Key / action | Effect |
+|---|---|
+| Click near a marker | Select that correspondence (magenta ring + status bar update) |
+| `[` | Select previous correspondence |
+| `]` | Select next correspondence |
+| Scroll | Zoom centred on cursor |
+| Middle-drag | Pan |
+| Ctrl+Scroll | Adjust marker size |
+| `q` / Esc | Quit |
+
+Markers are coloured **red → yellow → green → cyan → blue** (worst → best).
+The selected correspondence is highlighted with a **magenta ring** in every
+frame it appears in.  The label shows index and score, e.g. `9:0.31`.
+
+Pass an explicit file to score either source:
+
+```cmd
+venv\Scripts\python raycast.py --frames_dir ./frames --show-scores path\to\matches.json
+```
+
+Scores are computed by finding the nearest SuperPoint keypoint to each
+picked location and computing cosine similarity of its descriptor to the
+corresponding location in each paired frame, averaged over all pairs.
+
+**Interpreting scores:** low scores across oblique frame pairs are expected —
+the same physical point looks different from different angles and lighting.
+Flag correspondences scoring below ~0.25 across **all** their pairs,
+especially between nearby frames with similar viewing angles.
+Grey markers mean no SuperPoint keypoint was found within 25 px of the
+pick — the location is featureless and the correspondence is unreliable.
+
+### Using manual correspondences in the solver
+
+```cmd
+:: Use default JSON path from config.py
+venv\Scripts\python raycast.py --frames_dir ./frames --manual-fm-json
+
+:: Use a specific file
+venv\Scripts\python raycast.py --frames_dir ./frames --manual-fm-json path\to\corr.json
+```
+
+This runs the **full pipeline** (OCR, undistort, pose, van detection) then feeds
+your manual correspondences directly to the Ceres solver, bypassing GroundedSAM
+and LightGlue entirely.  Each correspondence with N frames contributes N*(N-1)/2
+pairwise constraints.  Van corner reprojection constraints are still included.
+
+Combine with `--cameras-init-from-config` to start from hand-tuned Blender poses:
+
+```cmd
+venv\Scripts\python raycast.py --frames_dir ./frames --manual-fm-json --cameras-init-from-config
+```
+
+---
+
 ## Known limitations
 
 - **Gimbal pitch is estimated, not measured.** The HUD does not expose it directly. GeoCalib provides the initial estimate; the Ceres solver refines it. Near-nadir frames with no usable ground features and poor overlap with other frames may still need a manual override in `config.py` under `GIMBAL_PITCH_OVERRIDES`.
 - **Single flat ground plane.** Points on elevated objects (van roof, tree canopy) will reproject with a Z error equal to their height above ground (~2 m for the van), producing a visible pixel offset in the target frame. This is physically correct behaviour, not a bug.
 - **OCR is the most fragile step.** Sun glare and HUD overlaps can corrupt individual field reads. The log prints every parsed value — check it on first run and add manual overrides in `config.py` for any frame that reads incorrectly.
-- **Roll falls back to GeoCalib when bracket detection fails.** HUD bracket detection is the primary roll source; GeoCalib provides the fallback. Per-frame roll overrides can always be set in `config.py` under `CAMERA_ROLL_OVERRIDES`.
+- **Roll falls back to GeoCalib when bracket detection fails.** HUD bracket detection is the primary roll source; GeoCalib provides the fallback. Per-frame roll overrides can always be set in `config.py` under `CAMERA_ROLL_OVERRIDES`. Bracket detection is controlled by `HORIZON_INDICATOR_READING` in `config.py` (default `False` — GeoCalib roll used for all frames).
 - **LightGlue requires a separate install.** See Setup above.

@@ -19,3 +19,5 @@ Thumbs.db
 *.egg-info/
 
 blender_scene.py
+
+*.png

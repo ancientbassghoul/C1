@@ -39,6 +39,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import cv2
+import config
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -101,12 +102,6 @@ def parse_args() -> argparse.Namespace:
         help="Skip automatic pitch refinement (use config overrides only).",
     )
     p.add_argument(
-        "--no-horizon-indicator-reading", action="store_true",
-        dest="no_horizon_indicator_reading",
-        help="Skip HUD bracket roll detection; use GeoCalib roll for all frames instead. "
-             "Useful for diagnosing whether GeoCalib roll estimates are better than bracket detection.",
-    )
-    p.add_argument(
         "--cameras-init-from-config", action="store_true",
         dest="cameras_init_from_config",
         help="Seed camera poses from CAMERA_POSE_OVERRIDES in config.py before running "
@@ -138,6 +133,41 @@ def parse_args() -> argparse.Namespace:
              "no OCR, pose, or model inference.  Use to tune HSV_SKY_RANGES "
              "and HSV_VEG_RANGES in config.py.",
     )
+    p.add_argument(
+        "--manual-correspondences", action="store_true",
+        dest="manual_correspondences",
+        help="Open the manual correspondence picker.  Load and undistort frames, "
+             "then show an interactive grid where you can click to mark matching "
+             "ground features across frames.  Correspondences are saved to "
+             "MANUAL_CORRESPONDENCES_FILE in config.py and consumed by the "
+             "solver in the normal pipeline run.  No OCR, pose, or model "
+             "inference needed.",
+    )
+    p.add_argument(
+        "--show-scores", nargs="?", const="", default=None,
+        dest="show_scores", metavar="PATH",
+        help="Score correspondences and open the viewer coloured red→blue "
+             "by appearance quality.  Optional PATH overrides the JSON "
+             "file to score.  Without PATH: defaults to AUTO_MATCHES_FILE "
+             "when used alone, or MANUAL_CORRESPONDENCES_FILE when combined "
+             "with --manual-correspondences.",
+    )
+    p.add_argument(
+        "--manual-fm-json", nargs="?", const="", default=None,
+        dest="manual_fm_json", metavar="PATH",
+        help="Replace LightGlue feature matching with manually picked "
+             "correspondences.  PATH defaults to MANUAL_CORRESPONDENCES_FILE "
+             "in config.py if not specified.  Runs the full pipeline "
+             "(OCR, undistort, pose, van detection) then feeds manual "
+             "features directly to the Ceres solver.",
+    )
+    p.add_argument(
+        "--run-matcher-only", action="store_true", dest="run_matcher_only",
+        help="Run steps 1–6 (load → OCR → undistort → pose → van → LightGlue) "
+             "then exit after saving auto_matches.json.  Skips the Ceres solve. "
+             "Use to generate the match file for --show-scores without "
+             "waiting for the full orientation solve.",
+    )
     return p.parse_args()
 
 
@@ -163,7 +193,8 @@ def preview_enhanced(frames: list) -> None:
             break
 
 
-def run_pipeline(frames_dir: str, no_refine: bool = False, no_enhance: bool = False, height_mode: str = 'tor', feature_matcher_debug: bool = False, preview_ground_masks: bool = False, preview_hsv_masks: bool = False, no_horizon_indicator_reading: bool = False, cameras_init_from_config: bool = False) -> list:
+def run_pipeline(frames_dir: str, no_refine: bool = False, no_enhance: bool = False, height_mode: str = 'tor', feature_matcher_debug: bool = False, preview_ground_masks: bool = False, preview_hsv_masks: bool = False, cameras_init_from_config: bool = False, manual_fm_json: str | None = None,
+                 run_matcher_only: bool = False) -> list:
     """Load, OCR, undistort, pose-estimate, detect van, and refine pitches. Return ready frames."""
     from pipeline.frame     import load_frames
     from pipeline.ocr       import extract_telemetry_all
@@ -190,7 +221,7 @@ def run_pipeline(frames_dir: str, no_refine: bool = False, no_enhance: bool = Fa
     else:
         logger.info("═" * 60)
         logger.info("Step 4/6 – Estimating camera poses from telemetry")
-        estimate_poses(frames, skip_bracket_roll=no_horizon_indicator_reading)
+        estimate_poses(frames, skip_bracket_roll=not config.HORIZON_INDICATOR_READING)
         # Override camera Z according to --height
         for f in frames:
             if f.position_enu is None: continue
@@ -214,6 +245,37 @@ def run_pipeline(frames_dir: str, no_refine: bool = False, no_enhance: bool = Fa
         # Convert Frame-keyed dict to stem-keyed dict for refine_pitches
         van_bboxes = {f.stem: bbox for f, bbox in detections.items()}
 
+    # Load manual correspondences if requested
+    _manual_pf = None
+    if manual_fm_json is not None and not skip_heavy:
+        from pipeline.manual_correspondence_ui import ManualCorrespondenceViewer
+        import json as _json
+        from pathlib import Path as _Path
+        import config as _cfg
+        _path = Path(manual_fm_json) if manual_fm_json else _Path(_cfg.MANUAL_CORRESPONDENCES_FILE)
+        if not _path.exists():
+            raise FileNotFoundError(f"Manual correspondences not found: {_path}")
+        _data  = _json.loads(_path.read_text())
+        _stems = {f.stem: f for f in frames}
+        _manual_pf = []
+        for entry in _data.get("correspondences", []):
+            pts = entry.get("points", {})
+            stems = list(pts.keys())
+            from itertools import combinations as _comb
+            for sa, sb in _comb(stems, 2):
+                fa = _stems.get(sa)
+                fb = _stems.get(sb)
+                if fa is None or fb is None:
+                    continue
+                if not (fa.ready and fb.ready):
+                    continue
+                xa, ya = pts[sa]
+                xb, yb = pts[sb]
+                _manual_pf.append((fa, (float(xa), float(ya)),
+                                   fb, (float(xb), float(yb))))
+        logger.info("Loaded %d manual feature pairs from %s",
+                    len(_manual_pf), _path)
+
     if no_refine and not skip_heavy:
         logger.info("Step 6/6 – Pitch refinement SKIPPED (--no-refine)")
     elif not skip_heavy:
@@ -221,7 +283,9 @@ def run_pipeline(frames_dir: str, no_refine: bool = False, no_enhance: bool = Fa
         from pipeline.feature_matcher import refine_pitches, set_enhance
         set_enhance(not no_enhance)
         refine_pitches(frames, van_bboxes=van_bboxes,
-                       cameras_init_from_config=cameras_init_from_config)
+                       cameras_init_from_config=cameras_init_from_config,
+                       manual_pairwise_features=_manual_pf,
+                       matcher_only=run_matcher_only)
 
     ready = [f for f in frames if f.ready]
     logger.info("═" * 60)
@@ -393,6 +457,76 @@ def preview_hsv_masks_cmd(frames_dir: str) -> None:
     print("and re-run -- no model loading needed, iterates in seconds.\n")
 
 
+def manual_correspondences_cmd(frames_dir: str) -> None:
+    """
+    Open the manual correspondence picker.
+    Needs only load + undistort — no OCR, pose, or model inference.
+    """
+    from pipeline.frame                   import load_frames
+    from pipeline.undistort               import undistort_all
+    from pipeline.manual_correspondence_ui import ManualCorrespondenceViewer
+    import config as cfg
+    from pathlib import Path
+
+    logger.info("Loading frames from %s", frames_dir)
+    frames = load_frames(frames_dir)
+
+    logger.info("Undistorting %d frame(s)...", len(frames))
+    undistort_all(frames)
+
+    json_path = Path(cfg.MANUAL_CORRESPONDENCES_FILE)
+    logger.info("Opening correspondence picker.  JSON: %s", json_path)
+
+    viewer = ManualCorrespondenceViewer(frames, json_path)
+    viewer.run()
+
+    if json_path.exists():
+        print(f"\nCorrespondences saved to: {json_path}")
+        print("Run the normal pipeline (without --manual-correspondences) to use them.\n")
+
+
+def show_scores_cmd(frames_dir: str, json_path: str,
+                    edit_mode: bool = False) -> None:
+    """
+    Score correspondences in json_path with SuperPoint descriptors,
+    then open the viewer in score mode.
+    edit_mode=True: fully editable (--manual-correspondences + --show-scores).
+    edit_mode=False: score display only.
+    """
+    from pipeline.frame                    import load_frames
+    from pipeline.undistort                import undistort_all
+    from pipeline.correspondence_scorer    import score_correspondences
+    from pipeline.manual_correspondence_ui import ManualCorrespondenceViewer
+    from pathlib import Path
+
+    logger.info("Loading frames from %s", frames_dir)
+    frames = load_frames(frames_dir)
+
+    logger.info("Undistorting %d frame(s)...", len(frames))
+    undistort_all(frames)
+
+    path = Path(json_path)
+    if not path.exists():
+        print(f"Score file not found: {path}")
+        return
+
+    logger.info("Scoring correspondences in %s...", path)
+    scores = score_correspondences(frames, path)
+
+    if not scores:
+        print(f"No correspondences found in {path}.")
+        return
+
+    mode_str = "score+edit" if edit_mode else "score"
+    logger.info("Opening %s viewer...", mode_str)
+    viewer = ManualCorrespondenceViewer(
+        frames, path,
+        scores=scores,
+        score_mode=True,
+    )
+    viewer.run()
+
+
 def main() -> None:
     args = parse_args()
 
@@ -411,8 +545,42 @@ def main() -> None:
         preview_hsv_masks_cmd(args.frames_dir)
         return
 
+    # Resolve --show-scores json path
+    import config as _cfg_main
+    if args.show_scores is not None:
+        if args.show_scores:                          # explicit path supplied
+            _score_path = args.show_scores
+        elif args.manual_correspondences:             # --manual-correspondences default
+            _score_path = _cfg_main.MANUAL_CORRESPONDENCES_FILE
+        else:                                         # --show-scores alone default
+            _score_path = _cfg_main.AUTO_MATCHES_FILE
+    else:
+        _score_path = None
+
+    # Manual correspondence picker
+    if args.manual_correspondences:
+        if _score_path is not None:
+            # Score first, then open picker in score+edit mode
+            show_scores_cmd(args.frames_dir, _score_path, edit_mode=True)
+        else:
+            manual_correspondences_cmd(args.frames_dir)
+        return
+
+    # Score-only mode
+    if _score_path is not None:
+        show_scores_cmd(args.frames_dir, _score_path, edit_mode=False)
+        return
+
     # Run the shared pipeline
-    frames = run_pipeline(args.frames_dir, no_refine=args.no_refine, no_enhance=not args.enhance, height_mode=args.height, feature_matcher_debug=args.feature_matcher_debug, preview_ground_masks=args.preview_ground_masks, preview_hsv_masks=args.preview_hsv_masks, no_horizon_indicator_reading=args.no_horizon_indicator_reading, cameras_init_from_config=args.cameras_init_from_config)
+    frames = run_pipeline(args.frames_dir, no_refine=args.no_refine, no_enhance=not args.enhance, height_mode=args.height, feature_matcher_debug=args.feature_matcher_debug, preview_ground_masks=args.preview_ground_masks, preview_hsv_masks=args.preview_hsv_masks, cameras_init_from_config=args.cameras_init_from_config, manual_fm_json=args.manual_fm_json,
+                        run_matcher_only=args.run_matcher_only)
+
+    # Matcher-only mode exits here — auto_matches.json already written inside run_pipeline
+    if args.run_matcher_only:
+        import config as _cfg_mo
+        print(f"\nDone.  Matches saved to: {_cfg_mo.AUTO_MATCHES_FILE}")
+        print("Run --show-scores to inspect them.\n")
+        return
 
     # Feature-matcher debug UI (replaces the old per-pair PNG file dumps)
     if args.feature_matcher_debug:

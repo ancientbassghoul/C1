@@ -408,6 +408,32 @@ def _global_match_filter(
     return result
 
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _save_auto_matches(pairwise_features: list) -> None:
+    """
+    Serialise filtered LightGlue pairwise_features to JSON in the same
+    format as manual_correspondences.json so --show-scores can inspect them.
+    Saved to AUTO_MATCHES_FILE in config.py after every pipeline run.
+    """
+    import json
+    from pathlib import Path
+
+    entries = []
+    for i, (fi, (xi, yi), fj, (xj, yj)) in enumerate(pairwise_features):
+        entries.append({
+            "id"    : i,
+            "source": "lightglue",
+            "points": {
+                fi.stem: [round(xi, 2), round(yi, 2)],
+                fj.stem: [round(xj, 2), round(yj, 2)],
+            },
+        })
+
+    out_path = Path(config.AUTO_MATCHES_FILE)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps({"correspondences": entries}, indent=2))
+    logger.info("Auto matches saved to %s (%d pairs)", out_path, len(entries))
+
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -443,7 +469,9 @@ def _apply_pose_overrides(frames: list[Frame]) -> int:
 
 def refine_pitches(frames: list[Frame],
                    van_bboxes: dict | None = None,
-                   cameras_init_from_config: bool = False) -> None:
+                   cameras_init_from_config: bool = False,
+                   manual_pairwise_features: list | None = None,
+                   matcher_only: bool = False) -> None:
     """
     Refine camera orientation (pitch, yaw offset, roll offset) jointly using
     pyceres with pairwise ground-scatter and van corner reprojection costs.
@@ -475,58 +503,65 @@ def refine_pitches(frames: list[Frame],
         logger.warning("refine_pitches: fewer than 2 eligible frames.")
         return
 
-    # ── Ground masks (GroundedSAM) ──────────────────────────────────────────
-    from pipeline.ground_mask import get_ground_masks
-    logger.info("Computing GroundedSAM ground masks for %d frame(s)...", len(ready))
-    ground_masks = get_ground_masks(ready)
-    for f, m in ground_masks.items():
-        f.ground_mask = m
-    logger.info("Ground masks ready.")
+    if manual_pairwise_features is not None:
+        # Bypass GroundedSAM + LightGlue entirely
+        pairwise_features = manual_pairwise_features
+        logger.info("Using %d manual ground feature pairs (LightGlue skipped).",
+                    len(pairwise_features))
+        if not pairwise_features:
+            logger.warning("No manual features provided — skipping refinement.")
+            return
+    else:
+        # ── Ground masks (GroundedSAM) ──────────────────────────────
+        from pipeline.ground_mask import get_ground_masks
+        logger.info("Computing GroundedSAM ground masks for %d frame(s)...", len(ready))
+        ground_masks = get_ground_masks(ready)
+        for f, m in ground_masks.items():
+            f.ground_mask = m
+        logger.info("Ground masks ready.")
 
-    # ── Feature matching — pass 1: raw per-pair matches ─────────────────────
-    raw_pair_matches: dict = {}
+        # ── Feature matching — pass 1: raw per-pair matches ───────────
+        raw_pair_matches: dict = {}
+        for fa, fb in combinations(ready, 2):
+            if np.linalg.norm(fb.position_enu - fa.position_enu) < MIN_BASELINE_M:
+                continue
+            pts_a, pts_b = _match(fa, fb,
+                                   van_bbox_a=vb.get(fa.stem),
+                                   van_bbox_b=vb.get(fb.stem))
+            if len(pts_a) >= MIN_GROUND_MATCHES:
+                raw_pair_matches[(fa, fb)] = (pts_a, pts_b)
+                logger.info("  %s ↔ %s : %d raw matches",
+                            fa.stem[-12:], fb.stem[-12:], len(pts_a))
+        for f in ready:
+            f.ground_mask = None
+        if not raw_pair_matches:
+            logger.warning("No ground matches found — skipping refinement.")
+            return
 
-    for fa, fb in combinations(ready, 2):
-        if np.linalg.norm(fb.position_enu - fa.position_enu) < MIN_BASELINE_M:
-            continue
-        pts_a, pts_b = _match(fa, fb,
-                               van_bbox_a=vb.get(fa.stem),
-                               van_bbox_b=vb.get(fb.stem))
-        if len(pts_a) >= MIN_GROUND_MATCHES:
-            raw_pair_matches[(fa, fb)] = (pts_a, pts_b)
-            logger.info("  %s ↔ %s : %d raw matches",
+        # ── Feature matching — pass 2: global filter ─────────────────
+        filtered = _global_match_filter(raw_pair_matches,
+                                        config.MATCH_SPATIAL_DEDUP_THRESH)
+        if not filtered:
+            logger.warning("Global filter removed all matches — skipping refinement.")
+            return
+        pairwise_features: list[tuple] = []
+        for (fa, fb), (pts_a, pts_b) in filtered.items():
+            logger.info("  %s ↔ %s : %d matches (after global filter)",
                         fa.stem[-12:], fb.stem[-12:], len(pts_a))
+            for (ua, va), (ub, vb_) in zip(pts_a, pts_b):
+                pairwise_features.append(
+                    (fa, (float(ua), float(va)),
+                     fb, (float(ub), float(vb_)))
+                )
+        logger.info("%d total ground feature pairs across %d frames.",
+                    len(pairwise_features), len(ready))
 
-    # Clean up ground_mask — not needed beyond this point
-    for f in ready:
-        f.ground_mask = None
+        # ── Save auto matches to JSON (always on — enables --show-scores inspection) ──
+        _save_auto_matches(pairwise_features)
 
-    if not raw_pair_matches:
-        logger.warning("No ground matches found — skipping refinement.")
-        return
-
-    # ── Feature matching — pass 2: global multi-frame-aware filter ────────────
-    filtered = _global_match_filter(raw_pair_matches,
-                                    config.MATCH_SPATIAL_DEDUP_THRESH)
-
-    if not filtered:
-        logger.warning("Global filter removed all matches — skipping refinement.")
-        return
-
-    # ── Build pairwise_features ───────────────────────────────────────────────
-    pairwise_features: list[tuple] = []
-
-    for (fa, fb), (pts_a, pts_b) in filtered.items():
-        logger.info("  %s ↔ %s : %d matches (after global filter)",
-                    fa.stem[-12:], fb.stem[-12:], len(pts_a))
-        for (ua, va), (ub, vb_) in zip(pts_a, pts_b):
-            pairwise_features.append(
-                (fa, (float(ua), float(va)),
-                 fb, (float(ub), float(vb_)))
-            )
-
-    logger.info("%d total ground feature pairs across %d frames.",
-                len(pairwise_features), len(ready))
+        if matcher_only:
+            logger.info("--run-matcher-only: exiting after LightGlue + auto_matches.json.")
+            return
 
     # ── Van pose initialisation ───────────────────────────────────────────────
     # Find the best van frame with a bbox to seed the van position
