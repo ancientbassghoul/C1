@@ -84,7 +84,7 @@ def intersect_ground_plane(
     ──────────
     origin    : (3,) ray start point in world frame.
     direction : (3,) unit ray direction in world frame.
-    z         : height of the ground plane (default 0.0 m AGL).
+    z         : height of the ground plane in ENU metres (config.GROUND_Z_M).
 
     Returns
     ───────
@@ -201,8 +201,8 @@ def reproject_pick(
         *origin, *direction,
     )
 
-    # Step 2 – Intersect with ground plane (Z = 0, AGL convention).
-    world_pt = intersect_ground_plane(origin, direction, z=0.0)
+    # Step 2 – Intersect with ground plane.
+    world_pt = intersect_ground_plane(origin, direction, z=config.GROUND_Z_M)
     if world_pt is None:
         logger.warning("Ray did not intersect the ground plane.")
         return {}

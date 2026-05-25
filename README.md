@@ -276,12 +276,12 @@ The key enabler is the **takeoff-relative altitude**: because all camera Z coord
 Pick pixel (u, v) in source frame
   → normalised coords    p_n  = K⁻¹ · [u, v, 1]ᵀ
   → world ray direction  d    = R.T · p_n   (unit vector in ENU)
-  → ground plane Z       z    = terrain_offset = alt_takeoff_ref − alt_agl
+  → ground plane Z       z    = config.GROUND_Z_M  (fixed, default 0.0)
   → ground intersection  P    = origin + t·d   where t = (z − origin.Z) / d.Z
   → pixel in target      proj = K_t · R_t · (P − pos_t)  then perspective divide
 ```
 
-The ground plane is placed at `Z = terrain_offset_m` (not hardcoded to 0). Both altitude readings are used together: the takeoff-relative altitude positions the camera in the shared coordinate system, and the AGL altitude tells us how high the terrain sits in that same system. The difference between the two — the terrain offset — is the correct ground plane Z for ray intersection.
+The ground plane is placed at `Z = GROUND_Z_M` from `config.py` (default 0.0) — a single fixed height for all ray-ground intersections. The terrain is flat; the AGL and takeoff-relative altitudes should be identical on flat ground and their difference is sensor noise. Camera Z coordinates are still set from the takeoff-relative altitude, which provides a consistent height datum across all frames.
 
 ---
 

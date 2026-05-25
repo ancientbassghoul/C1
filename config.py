@@ -26,7 +26,7 @@ IMAGE_H = 720
 # Estimated fisheye focal length (pixels).  For a ~140° diagonal-FOV lens
 # with equidistant projection: f ≈ diag / (2 * FOV_rad) ≈ 660.
 # Adjust in ±50 px increments.
-FOCAL_LENGTH = 660.0
+FOCAL_LENGTH = 639.0
 
 # Principal point – almost always the image centre.
 CX = IMAGE_W / 2.0   # 640.0
@@ -94,6 +94,12 @@ OCR_CROP_ALT     = (640, 718, 840, 1160)  # "XX.X  M  XX.X  M" (bottom-right)
 # OUTPUT
 # ─────────────────────────────────────────────────────────────────────────────
 OUTPUT_DIR = "./output"
+
+# Fixed ground plane height in the shared ENU coordinate frame (metres).
+# The terrain is flat; this single value is used for all ray-ground
+# intersections in both the reprojection viewer and the Ceres solver.
+# Set to 0.0 — the ENU origin sits on the ground at the takeoff point.
+GROUND_Z_M = 0.0
 
 # Path where the manual correspondence picker saves / loads its JSON file.
 MANUAL_CORRESPONDENCES_FILE = "./output/manual_correspondences.json"
@@ -223,6 +229,17 @@ SOLVER_POSITION_RANGE_V  =   3.0   # ± metres vertical (Up/altitude)
 # Maximum Ceres solver iterations.  Increase if the solve terminates early
 # without converging (check the summary BriefReport in the log).
 SOLVER_MAX_ITERATIONS = 200
+
+# ── Focal length estimation ──────────────────────────────────────────────────
+# Set True to add focal length as a free parameter in the Ceres solve.
+# Requires good manual correspondences spanning frames at different altitudes.
+# When True, the solved value is logged — update FOCAL_LENGTH in config.py
+# manually after a successful solve, then re-run with this set back to False.
+ESTIMATE_FOCAL_LENGTH = False
+
+# Search range as a fraction of FOCAL_LENGTH (e.g. 0.22 → ±22%).
+# [660 × 0.78, 660 × 1.22] = [515, 805] for the default 660px seed.
+FOCAL_LENGTH_RANGE = 0.22
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CAMERA POSE OVERRIDES

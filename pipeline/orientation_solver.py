@@ -80,37 +80,59 @@ def _van_corner_world(corner_local, van_east, van_north, van_heading_deg, van_z)
 # Plain-callable cost functors
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _k_inv_from_f(f, cx, cy):
+    """Analytical K_inv for a camera with focal length f and principal point cx,cy."""
+    return np.array([
+        [1.0/f,   0.0, -cx/f],
+        [  0.0, 1.0/f, -cy/f],
+        [  0.0,   0.0,   1.0],
+    ])
+
+
 class GroundScatterCost:
     """
     Pairwise ground-scatter cost functor.
 
-    Call signature: (params_i, params_j) -> np.ndarray shape (2,)
-    params_* = [pitch, yaw_offset, roll_offset]
+    Call signature: (params_i, params_j) or
+                    (params_i, params_j, focal_params)
+    params_* = [pitch, yaw_offset, roll_offset, dx, dy, dz]
+    focal_params = [focal_length]  (optional shared block)
     Residuals = [P_i.east - P_j.east,  P_i.north - P_j.north]
     """
     def __init__(self, pixel_i, pixel_j, pos_i, pos_j,
                  K_i, K_j, heading_i, heading_j, roll_i, roll_j,
-                 z_ground=0.0):
+                 z_ground=None):
         self._ui, self._vi = pixel_i
         self._uj, self._vj = pixel_j
-        self._pos_i  = pos_i.copy()   # GPS seed — params[3:6] adds correction
+        self._pos_i  = pos_i.copy()
         self._pos_j  = pos_j.copy()
-        self._Ki_inv = np.linalg.inv(K_i)
-        self._Kj_inv = np.linalg.inv(K_j)
+        # Store fixed K_inv for when focal length is not free
+        self._Ki_inv_fixed = np.linalg.inv(K_i)
+        self._Kj_inv_fixed = np.linalg.inv(K_j)
+        # Store cx/cy for analytical K_inv recomputation when f is free
+        self._cx_i = float(K_i[0, 2]);  self._cy_i = float(K_i[1, 2])
+        self._cx_j = float(K_j[0, 2]);  self._cy_j = float(K_j[1, 2])
         self._hdg_i  = heading_i
         self._hdg_j  = heading_j
         self._roll_i = roll_i
         self._roll_j = roll_j
-        self._z      = z_ground
+        self._z      = z_ground if z_ground is not None else config.GROUND_Z_M
 
-    def __call__(self, params_i, params_j):
+    def __call__(self, params_i, params_j, focal_params=None):
         # params layout: [pitch, yaw_off, roll_off, dx, dy, dz]
         pos_i = self._pos_i + np.array([params_i[3], params_i[4], params_i[5]])
         pos_j = self._pos_j + np.array([params_j[3], params_j[4], params_j[5]])
-        Pi = _unproject(self._ui, self._vi, self._Ki_inv,
+        if focal_params is not None:
+            f      = float(focal_params[0])
+            Ki_inv = _k_inv_from_f(f, self._cx_i, self._cy_i)
+            Kj_inv = _k_inv_from_f(f, self._cx_j, self._cy_j)
+        else:
+            Ki_inv = self._Ki_inv_fixed
+            Kj_inv = self._Kj_inv_fixed
+        Pi = _unproject(self._ui, self._vi, Ki_inv,
                         self._hdg_i + params_i[1], params_i[0],
                         self._roll_i + params_i[2], pos_i, self._z)
-        Pj = _unproject(self._uj, self._vj, self._Kj_inv,
+        Pj = _unproject(self._uj, self._vj, Kj_inv,
                         self._hdg_j + params_j[1], params_j[0],
                         self._roll_j + params_j[2], pos_j, self._z)
         if Pi is None or Pj is None:
@@ -138,13 +160,16 @@ class VanCornerCost:
         self._van_z  = van_z
         self._weight = config.VAN_CORNER_WEIGHT
 
-    def __call__(self, camera_params, van_params):
-        # params layout: [pitch, yaw_off, roll_off, dx, dy, dz]
+    def __call__(self, camera_params, van_params, focal_params=None):
         yaw   = self._hdg  + camera_params[1]
         pitch = camera_params[0]
         roll  = self._roll + camera_params[2]
         R_cam = build_rotation(yaw, pitch, roll)
         pos   = self._pos + np.array([camera_params[3], camera_params[4], camera_params[5]])
+
+        f  = float(focal_params[0]) if focal_params is not None else self._K[0, 0]
+        cx = self._K[0, 2]
+        cy = self._K[1, 2]
 
         corner_world = _van_corner_world(
             self._corner_local,
@@ -156,8 +181,8 @@ class VanCornerCost:
             return np.array([_MISS_PENALTY * self._weight,
                              _MISS_PENALTY * self._weight])
 
-        u_pred = self._K[0, 0] * p_cam[0] / p_cam[2] + self._K[0, 2]
-        v_pred = self._K[1, 1] * p_cam[1] / p_cam[2] + self._K[1, 2]
+        u_pred = f * p_cam[0] / p_cam[2] + cx
+        v_pred = f * p_cam[1] / p_cam[2] + cy
         return np.array([(u_pred - self._u_obs) * self._weight,
                          (v_pred - self._v_obs) * self._weight])
 
@@ -251,6 +276,14 @@ def solve(frames, pairwise_features, van_observations, van_pose_init,
     ground_loss = pyceres.CauchyLoss(5.0)
     van_loss    = pyceres.HuberLoss(3.0)
 
+    # Optional shared focal length parameter
+    # Solver works in undistorted image space where
+    # f_undist = FOCAL_LENGTH * UNDISTORT_SCALE (see undistort.py build_K_new).
+    # After solving, convert back: FOCAL_LENGTH = f_undist / UNDISTORT_SCALE.
+    estimate_f    = config.ESTIMATE_FOCAL_LENGTH
+    f_undist_seed = config.FOCAL_LENGTH * config.UNDISTORT_SCALE
+    focal_params  = np.array([f_undist_seed], dtype=np.float64)
+
     # Ground scatter residuals
     for fi, pixel_i, fj, pixel_j in pairwise_features:
         functor = GroundScatterCost(
@@ -259,10 +292,16 @@ def solve(frames, pairwise_features, van_observations, van_pose_init,
             fi.K_undist,     fj.K_undist,
             fi.heading_deg,  fj.heading_deg,
             fi.camera_roll_deg, fj.camera_roll_deg,
+            z_ground=config.GROUND_Z_M,
         )
-        cost = _NumericDiff(functor, num_residuals=2, block_sizes=[6, 6])
-        problem.add_residual_block(cost, ground_loss,
-                                 [cam_params[fi], cam_params[fj]])
+        if estimate_f:
+            cost = _NumericDiff(functor, num_residuals=2, block_sizes=[6, 6, 1])
+            problem.add_residual_block(cost, ground_loss,
+                                     [cam_params[fi], cam_params[fj], focal_params])
+        else:
+            cost = _NumericDiff(functor, num_residuals=2, block_sizes=[6, 6])
+            problem.add_residual_block(cost, ground_loss,
+                                     [cam_params[fi], cam_params[fj]])
 
     # Van corner residuals
     for frame, corner_local, pixel_obs in van_observations:
@@ -272,9 +311,14 @@ def solve(frames, pairwise_features, van_observations, van_pose_init,
             frame.heading_deg, frame.camera_roll_deg,
             van_z=config.VAN_Z_M,
         )
-        cost = _NumericDiff(functor, num_residuals=2, block_sizes=[6, 3])
-        problem.add_residual_block(cost, van_loss,
-                                 [cam_params[frame], van_params])
+        if estimate_f:
+            cost = _NumericDiff(functor, num_residuals=2, block_sizes=[6, 3, 1])
+            problem.add_residual_block(cost, van_loss,
+                                     [cam_params[frame], van_params, focal_params])
+        else:
+            cost = _NumericDiff(functor, num_residuals=2, block_sizes=[6, 3])
+            problem.add_residual_block(cost, van_loss,
+                                     [cam_params[frame], van_params])
 
     # Camera bounds — pitch window centred on GeoCalib seed, clamped to floor/ceiling
     for f in frames:
@@ -304,6 +348,17 @@ def solve(frames, pairwise_features, van_observations, van_pose_init,
     problem.set_parameter_lower_bound(van_params, 2, h_lo)
     problem.set_parameter_upper_bound(van_params, 2, h_hi)
 
+    # Focal length bounds
+    if estimate_f:
+        f_lo = f_undist_seed * (1.0 - config.FOCAL_LENGTH_RANGE)
+        f_hi = f_undist_seed * (1.0 + config.FOCAL_LENGTH_RANGE)
+        problem.set_parameter_lower_bound(focal_params, 0, f_lo)
+        problem.set_parameter_upper_bound(focal_params, 0, f_hi)
+        logger.info(
+            "Focal length: seed=%.1fpx (undist)  bounds=[%.1f, %.1f]  "
+            "(raw FOCAL_LENGTH seed=%.1fpx)",
+            f_undist_seed, f_lo, f_hi, config.FOCAL_LENGTH)
+
     # Solver options
     options = pyceres.SolverOptions()
     options.linear_solver_type         = pyceres.LinearSolverType.SPARSE_NORMAL_CHOLESKY
@@ -320,4 +375,18 @@ def solve(frames, pairwise_features, van_observations, van_pose_init,
     report = summary.BriefReport()
     logger.info("Ceres solve complete: %s", report)
 
-    return cam_params, van_params, report
+    if estimate_f:
+        f_undist_solved = float(focal_params[0])
+        f_raw_solved    = f_undist_solved / config.UNDISTORT_SCALE
+        f_delta_pct     = 100.0 * (f_raw_solved - config.FOCAL_LENGTH) / config.FOCAL_LENGTH
+        logger.info(
+            "Focal length solved: %.2f px (undist)  →  %.2f px (raw)\n"
+            "  seed was %.2f px (raw)  delta %+.2f px / %+.1f%%\n"
+            "  → Update FOCAL_LENGTH = %.2f in config.py",
+            f_undist_solved, f_raw_solved,
+            config.FOCAL_LENGTH,
+            f_raw_solved - config.FOCAL_LENGTH, f_delta_pct,
+            f_raw_solved,
+        )
+
+    return cam_params, van_params, report, focal_params

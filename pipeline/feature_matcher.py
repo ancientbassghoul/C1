@@ -613,7 +613,7 @@ def refine_pitches(frames: list[Frame],
         for f in ready
         if f.gimbal_pitch_deg is not None
     }
-    cam_results, van_pose_solved, report = ceres_solve(
+    cam_results, van_pose_solved, report, focal_result = ceres_solve(
         ready, pairwise_features, van_observations, van_pose_init,
         pitch_seeds=pitch_seeds,
     )
@@ -622,6 +622,10 @@ def refine_pitches(frames: list[Frame],
         "Van pose solved: east=%.1f m  north=%.1f m  heading=%.1f°",
         van_pose_solved[0], van_pose_solved[1], van_pose_solved[2],
     )
+    if config.ESTIMATE_FOCAL_LENGTH:
+        f_raw = float(focal_result[0]) / config.UNDISTORT_SCALE
+        logger.info("Solved focal length: %.2f px raw  (update FOCAL_LENGTH = %.2f in config.py)",
+                    f_raw, f_raw)
 
     # ── Apply results to frames ───────────────────────────────────────────────
     for f in ready:
