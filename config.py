@@ -26,7 +26,7 @@ IMAGE_H = 720
 # Estimated fisheye focal length (pixels).  For a ~140° diagonal-FOV lens
 # with equidistant projection: f ≈ diag / (2 * FOV_rad) ≈ 660.
 # Adjust in ±50 px increments.
-FOCAL_LENGTH = 639.0
+FOCAL_LENGTH = 651.0
 
 # Principal point – almost always the image centre.
 CX = IMAGE_W / 2.0   # 640.0
@@ -184,17 +184,17 @@ MATCH_GRID_ROWS = 8
 #   ±5° covers typical magnetometer drift and HUD rounding errors.
 # Roll offset: correction on top of the bracket-detected roll.
 #   ±1° covers residual HUD-detection error at near-level flight.
-SOLVER_PITCH_OFFSET  =  20.0   # ± degrees around the GeoCalib seed
-SOLVER_PITCH_FLOOR   = -89.0   # absolute minimum pitch (near-nadir clamp)
-SOLVER_PITCH_CEILING =  30.0   # absolute maximum pitch (upward-tilt clamp)
-SOLVER_YAW_OFFSET_RANGE  =  20.0   # ± degrees (widened: OCR compass can be ~15° off)
-SOLVER_ROLL_OFFSET_RANGE =   5.0   # ± degrees (widened: GeoCalib roll can be off on oblique frames)
+SOLVER_PITCH_OFFSET  =  50.0   # ± degrees around the GeoCalib seed
+SOLVER_PITCH_FLOOR   = -90.0   # absolute minimum pitch (near-nadir clamp)
+SOLVER_PITCH_CEILING =  45.0   # absolute maximum pitch (upward-tilt clamp)
+SOLVER_YAW_OFFSET_RANGE  =  16.0   # ± degrees (widened: OCR compass can be ~15° off)
+SOLVER_ROLL_OFFSET_RANGE =   16.0   # ± degrees (widened: GeoCalib roll can be off on oblique frames)
 
 # Camera position correction bounds (metres).
 # GPS accuracy is typically ±2-5m; Blender measurements show up to ~9m error.
 # The solver is free to move each camera within this box around its GPS seed.
-SOLVER_POSITION_RANGE_H  =  10.0   # ± metres horizontal (East, North)
-SOLVER_POSITION_RANGE_V  =   3.0   # ± metres vertical (Up/altitude)
+SOLVER_POSITION_RANGE_H  =  9.5   # ± metres horizontal (East, North)
+SOLVER_POSITION_RANGE_V  =  1.65   # ± metres vertical (Up/altitude)
 
 # Maximum Ceres solver iterations.  Increase if the solve terminates early
 # without converging (check the summary BriefReport in the log).
