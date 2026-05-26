@@ -259,6 +259,13 @@ def run_pipeline(frames_dir: str, no_refine: bool = False, no_enhance: bool = Fa
         _stems = {f.stem: f for f in frames}
         _manual_pf = []
         for entry in _data.get("correspondences", []):
+            # Only ground-type single-point entries feed the cross-frame scatter.
+            # Van feature entries (wheel_axis, roof_edge, roof) are loaded
+            # separately by _load_van_features() in feature_matcher.py.
+            if entry.get("type", "ground") != "ground":
+                continue
+            if entry.get("is_pair", False):
+                continue
             pts = entry.get("points", {})
             stems = list(pts.keys())
             from itertools import combinations as _comb

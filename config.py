@@ -133,44 +133,14 @@ VAN_BLOB_MIN_AREA = 200
 # ─────────────────────────────────────────────────────────────────────────────
 # VAN GEOMETRY
 # ─────────────────────────────────────────────────────────────────────────────
-# Physical bounding box dimensions of the white transit van (metres).
-VAN_LENGTH_M = 4.959
-VAN_WIDTH_M  = 2.204
-VAN_HEIGHT_M = 1.895
-
-# Approximate terrain height at the van's location in the shared ENU frame.
-# Derived from terrain_offset of the nearest camera frame (frame 04709: +1.3 m).
-# Used as the fixed Z of the van base — tune if reprojection is vertically off.
-VAN_Z_M = 1.0
-
-# Frames whose van detections are used as 3-D corner reprojection constraints.
-# Each must have a valid GroundingDINO bbox.  Selected for angular diversity:
-#   12035 – near-nadir  (roof visible)
-#   04752 – front-left  oblique
-#   04681 – rear-left   oblique
-#   04709 – pure left-side view
-#   10474 – bridging angle between nadir and oblique
-VAN_FRAMES: list[str] = [
-    "2026-02-15_16-25-03_12035",
-    "2026-02-15_16-25-03_04752",
-    "2026-02-15_16-25-03_04681",
-    "2026-02-15_16-25-03_04709",
-    "2026-02-15_16-25-03_10474",
-]
-
-# Van heading prior (degrees, CW from North).
-# Derived from frame 04709: drone heading 152°, van perpendicular with left
-# face visible → right face outward normal = 152° → van heading = 62°.
-VAN_HEADING_PRIOR_DEG = 62.0
-
-# Solver is free to adjust van heading ± this many degrees from the prior.
-VAN_HEADING_RANGE_DEG = 45.0
-
-# Relative weight of each van corner reprojection residual vs a ground scatter
-# residual.  Higher = van corners dominate; lower = ground scatter dominates.
-# Van corners provide the crucial vertical constraint (known height), so they
-# should be weighted above ground scatter.
-VAN_CORNER_WEIGHT = 5.0
+# Physical dimensions used by the manual van-feature correspondences.
+# These are the only van geometry values consumed by the solver — the
+# bbox-based 3-D corner approach has been removed in favour of manually-picked
+# wheel centres, roof edge, and roof points.
+VAN_WIDTH_M    = 1.92   # lateral (left–right) wheel centre distance
+VAN_HEIGHT_M   = 1.94   # exterior roof height above ground
+VAN_WHEELBASE_M = 3.275  # front-to-rear wheel centre distance
+WHEEL_RADIUS_M  = 0.343   # wheel centre height above ground
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GEOCALIB

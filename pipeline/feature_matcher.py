@@ -9,16 +9,12 @@ Key design decisions
    post-match pixel filtering.  The van sits above the ground plane and
    would otherwise corrupt the ground-scatter geometry.
 
-3. Van corner constraints: for frames listed in config.VAN_FRAMES, the
-   GroundingDINO bbox is used to generate 3-D corner reprojection constraints
-   that provide a crucial vertical anchor (known van height) the ground
-   scatter alone cannot supply.
-
-4. Single joint solve (pyceres): all cameras + van pose are solved together
-   in one Ceres optimisation using pairwise ground scatter + van corner costs.
+3. Single joint solve (pyceres): all cameras + van heading are solved together
+   in one Ceres optimisation using pairwise ground scatter + manual van-feature
+   costs (wheel centres, roof edge, roof points).
    The sparse block structure is exploited by SPARSE_NORMAL_CHOLESKY.
 
-5. Manual overrides (config.GIMBAL_PITCH_OVERRIDES) are never modified.
+4. Manual overrides (config.GIMBAL_PITCH_OVERRIDES) are never modified.
 """
 
 from __future__ import annotations
@@ -31,9 +27,6 @@ import cv2
 import numpy as np
 
 from pipeline.orientation_solver import solve as ceres_solve
-from pipeline.van_corners import (
-    get_van_observations, estimate_van_position,
-)
 from pipeline.frame import Frame
 from pipeline.pose import build_rotation
 import config
@@ -409,6 +402,26 @@ def _global_match_filter(
 
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _load_van_features() -> list:
+    """
+    Load van plane features from the unified correspondences JSON.
+    Returns only non-ground entries (wheel_axis, roof_edge, roof, etc.).
+    Ground entries are handled separately as cross-frame scatter in raycast.py.
+    """
+    import json
+    from pathlib import Path
+    path = Path(config.MANUAL_CORRESPONDENCES_FILE)
+    if not path.exists():
+        return []
+    data = json.loads(path.read_text(encoding="utf-8"))
+    feats = [
+        f for f in data.get("correspondences", [])
+        if f.get("type", "ground") != "ground"
+    ]
+    logger.info("Loaded %d van plane feature(s) from %s", len(feats), path)
+    return feats
+
+
 def _save_auto_matches(pairwise_features: list) -> None:
     """
     Serialise filtered LightGlue pairwise_features to JSON in the same
@@ -473,12 +486,12 @@ def refine_pitches(frames: list[Frame],
                    manual_pairwise_features: list | None = None,
                    matcher_only: bool = False) -> None:
     """
-    Refine camera orientation (pitch, yaw offset, roll offset) jointly using
-    pyceres with pairwise ground-scatter and van corner reprojection costs.
+    Refine camera orientation (pitch, yaw offset, roll offset, position) jointly
+    using pyceres with pairwise ground-scatter and manual van-feature costs.
 
     van_bboxes : dict mapping frame.stem → (x1,y1,x2,y2) from GroundingDINO.
-                 Used both to mask keypoint matches and to build van corner
-                 reprojection constraints for frames in config.VAN_FRAMES.
+                 Used to mask keypoint matches only (bbox-based corner
+                 reprojection has been removed).
 
     Frames listed in config.GIMBAL_PITCH_OVERRIDES are never modified.
     """
@@ -563,48 +576,6 @@ def refine_pitches(frames: list[Frame],
             logger.info("--run-matcher-only: exiting after LightGlue + auto_matches.json.")
             return
 
-    # ── Van pose initialisation ───────────────────────────────────────────────
-    # Find the best van frame with a bbox to seed the van position
-    van_frames_with_bbox = [
-        f for f in ready
-        if f.stem in config.VAN_FRAMES and f.stem in vb
-    ]
-
-    van_east_init  = 0.0
-    van_north_init = 0.0
-
-    if van_frames_with_bbox:
-        seed_frame = van_frames_with_bbox[0]
-        van_east_init, van_north_init = estimate_van_position(
-            seed_frame, vb[seed_frame.stem], van_z=config.VAN_Z_M,
-        )
-        logger.info(
-            "Van pose seed: east=%.1f m  north=%.1f m  heading=%.1f°",
-            van_east_init, van_north_init, config.VAN_HEADING_PRIOR_DEG,
-        )
-    else:
-        logger.warning(
-            "No VAN_FRAMES with bbox found — van corner constraints disabled."
-        )
-
-    van_pose_init = [van_east_init, van_north_init, config.VAN_HEADING_PRIOR_DEG]
-
-    # ── Van corner observations ───────────────────────────────────────────────
-    van_observations: list[tuple] = []
-
-    for f in van_frames_with_bbox:
-        obs = get_van_observations(
-            f, vb[f.stem],
-            van_east_init, van_north_init,
-            config.VAN_HEADING_PRIOR_DEG,
-            van_z=config.VAN_Z_M,
-        )
-        van_observations.extend((f, corner_local, pixel_obs)
-                                 for corner_local, pixel_obs in obs)
-
-    logger.info("%d van corner observations across %d frame(s).",
-                len(van_observations), len(van_frames_with_bbox))
-
     # ── Joint Ceres solve ─────────────────────────────────────────────────────
     # Pass GeoCalib pitch estimates as seeds so Ceres uses a tight per-frame
     # window rather than the full physical pitch range.
@@ -613,15 +584,17 @@ def refine_pitches(frames: list[Frame],
         for f in ready
         if f.gimbal_pitch_deg is not None
     }
+
+    # Load van plane features (roof / wheel centre correspondences)
+    van_plane_features = _load_van_features()
+
     cam_results, van_pose_solved, report, focal_result = ceres_solve(
-        ready, pairwise_features, van_observations, van_pose_init,
+        ready, pairwise_features,
         pitch_seeds=pitch_seeds,
+        van_plane_features=van_plane_features,
     )
 
-    logger.info(
-        "Van pose solved: east=%.1f m  north=%.1f m  heading=%.1f°",
-        van_pose_solved[0], van_pose_solved[1], van_pose_solved[2],
-    )
+    logger.info("Van heading solved: %.1f°", van_pose_solved[2])
     if config.ESTIMATE_FOCAL_LENGTH:
         f_raw = float(focal_result[0]) / config.UNDISTORT_SCALE
         logger.info("Solved focal length: %.2f px raw  (update FOCAL_LENGTH = %.2f in config.py)",

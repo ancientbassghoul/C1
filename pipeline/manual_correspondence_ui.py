@@ -46,6 +46,16 @@ THUMB_H  = 360
 # Defaults
 # ─────────────────────────────────────────────────────────────────────────────
 _MARKER_R_DEFAULT = 13     # outer ring radius at startup
+
+# Van feature types: (label, config_z_attr, BGR_color)
+# (name, z_config_attr, BGR_color, is_pair, distance_config_attr, axis)
+_FEATURE_TYPES = [
+    ("ground",     "GROUND_Z_M",     (200, 200,   0), False, None,              None),
+    ("roof",       "VAN_HEIGHT_M",   ( 40, 200, 200), False, None,              None),
+    ("wheel_axis", "WHEEL_RADIUS_M", (200,  80, 200), True,  "VAN_WHEELBASE_M", "forward"),
+    ("roof_edge",  "VAN_HEIGHT_M",   (100, 200, 255), True,  "VAN_WIDTH_M",     "lateral"),
+]
+_F_NAME, _F_Z, _F_COL, _F_PAIR, _F_DIST, _F_AXIS = range(6)
 _MARKER_R_MAX     = 40
 _DOT_FRAC         = 0.35   # inner dot = this fraction of ring radius
 
@@ -114,6 +124,10 @@ class ManualCorrespondenceViewer:
         self._edit_idx    : int              = 0
         self._edit_backup : dict             = {}
 
+        # Feature type for next correspondence (T cycles)
+        self._type_idx   : int       = 0
+        self._saved_types: list[int] = []
+
         # Marker size (outer ring radius, in thumbnail pixels)
         self._r = _MARKER_R_DEFAULT
 
@@ -162,38 +176,76 @@ class ManualCorrespondenceViewer:
         """Draw all markers in screen space. self._r is in screen pixels."""
         r     = max(1, self._r)
         dot_r = max(1, int(r * _DOT_FRAC))
+
+        def _draw_one(sx, sy, col, label=""):
+            cv2.circle(display, (sx, sy), r,     col, 2,          cv2.LINE_AA)
+            cv2.circle(display, (sx, sy), dot_r, col, cv2.FILLED, cv2.LINE_AA)
+            if label:
+                cv2.putText(display, label, (sx + r + 3, sy + 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.48, col, 1, cv2.LINE_AA)
+
         for frame in self.frames:
             for i, corr in enumerate(self._saved):
                 if frame not in corr:
                     continue
-                sx, sy = self._img_to_screen(frame, *corr[frame])
-                if self._score_mode:
-                    sc  = self._scores.get(i)
-                    col = _score_to_bgr(sc) if sc is not None else _C_NO_SCORE
-                    cv2.circle(display, (sx, sy), r,     col, 2,          cv2.LINE_AA)
-                    cv2.circle(display, (sx, sy), dot_r, col, cv2.FILLED, cv2.LINE_AA)
-                    label = (f"{i}:{sc:.2f}" if sc is not None else f"{i}:?")
-                    cv2.putText(display, label, (sx + r + 3, sy + 5),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.48, col, 1, cv2.LINE_AA)
+                tidx    = self._saved_types[i] if i < len(self._saved_types) else 0
+                if not self._score_mode and tidx != self._type_idx:
+                    continue   # hide markers from other type modes
+                ft      = _FEATURE_TYPES[tidx]
+                is_pair = ft[_F_PAIR]
+                col     = ft[_F_COL] if not self._score_mode else None
+                if is_pair:
+                    pts = corr[frame]   # list of 2 (x,y)
+                    if len(pts) < 2:
+                        continue
+                    sxa, sya = self._img_to_screen(frame, *pts[0])
+                    sxb, syb = self._img_to_screen(frame, *pts[1])
+                    c = ft[_F_COL]
+                    cv2.line(display, (sxa, sya), (sxb, syb), c, 1, cv2.LINE_AA)
+                    _draw_one(sxa, sya, c, f"{i}A")
+                    _draw_one(sxb, syb, c, f"{i}B")
+                    if i == self._sel_corr:
+                        mag = (255, 0, 255)
+                        cv2.circle(display, (sxa, sya), r+5, mag, 2, cv2.LINE_AA)
+                        cv2.circle(display, (sxb, syb), r+5, mag, 2, cv2.LINE_AA)
                 else:
-                    cv2.circle(display, (sx, sy), r,     _C_SAVED, 2,          cv2.LINE_AA)
-                    cv2.circle(display, (sx, sy), dot_r, _C_SAVED, cv2.FILLED, cv2.LINE_AA)
-                    cv2.putText(display, str(i), (sx + r + 3, sy + 5),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.48, _C_SAVED, 1, cv2.LINE_AA)
-                # Selected — magenta outer ring drawn on top
-                if i == self._sel_corr:
-                    mag = (255, 0, 255)
-                    cv2.circle(display, (sx, sy), r + 5, mag, 2, cv2.LINE_AA)
-                    cv2.circle(display, (sx, sy), dot_r, mag, cv2.FILLED, cv2.LINE_AA)
+                    sx, sy = self._img_to_screen(frame, *corr[frame])
+                    if self._score_mode:
+                        sc  = self._scores.get(i)
+                        c   = _score_to_bgr(sc) if sc is not None else _C_NO_SCORE
+                        lbl = f"{i}:{sc:.2f}" if sc is not None else f"{i}:?"
+                    else:
+                        c   = ft[_F_COL]
+                        lbl = str(i)
+                    _draw_one(sx, sy, c, lbl)
+                    if i == self._sel_corr:
+                        mag = (255, 0, 255)
+                        cv2.circle(display, (sx, sy), r+5, mag, 2, cv2.LINE_AA)
+                        cv2.circle(display, (sx, sy), dot_r, mag, cv2.FILLED, cv2.LINE_AA)
+
             if frame in self._current and not self._score_mode:
-                sx, sy = self._img_to_screen(frame, *self._current[frame])
-                cv2.circle(display, (sx, sy), r,     _C_CURRENT, 2,          cv2.LINE_AA)
-                cv2.circle(display, (sx, sy), dot_r, _C_CURRENT, cv2.FILLED, cv2.LINE_AA)
-                arm = r + 6
-                cv2.line(display, (sx-arm, sy), (sx+arm, sy), _C_CURRENT, 1, cv2.LINE_AA)
-                cv2.line(display, (sx, sy-arm), (sx, sy+arm), _C_CURRENT, 1, cv2.LINE_AA)
-                cv2.putText(display, "new", (sx + r + 3, sy + 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.44, _C_CURRENT, 1, cv2.LINE_AA)
+                cur_tidx = (self._saved_types[self._edit_idx]
+                            if self._edit_mode else self._type_idx)
+                cur_ft   = _FEATURE_TYPES[cur_tidx]
+                cur_pts  = self._current[frame]
+                if cur_ft[_F_PAIR]:
+                    # Draw partial pair in progress
+                    labels = ["A", "B"]
+                    screens = [self._img_to_screen(frame, *p) for p in cur_pts]
+                    for k, (sx, sy) in enumerate(screens):
+                        _draw_one(sx, sy, _C_CURRENT, labels[k])
+                    if len(screens) == 2:
+                        cv2.line(display, screens[0], screens[1],
+                                 _C_CURRENT, 1, cv2.LINE_AA)
+                else:
+                    sx, sy = self._img_to_screen(frame, *cur_pts)
+                    cv2.circle(display, (sx, sy), r,     _C_CURRENT, 2,          cv2.LINE_AA)
+                    cv2.circle(display, (sx, sy), dot_r, _C_CURRENT, cv2.FILLED, cv2.LINE_AA)
+                    arm = r + 6
+                    cv2.line(display, (sx-arm, sy), (sx+arm, sy), _C_CURRENT, 1, cv2.LINE_AA)
+                    cv2.line(display, (sx, sy-arm), (sx, sy+arm), _C_CURRENT, 1, cv2.LINE_AA)
+                    cv2.putText(display, "new", (sx + r + 3, sy + 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.44, _C_CURRENT, 1, cv2.LINE_AA)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Marker size helpers
@@ -218,13 +270,24 @@ class ManualCorrespondenceViewer:
             data = json.loads(self._json_path.read_text())
             n = 0
             for entry in data.get("correspondences", []):
-                corr: dict[Frame, tuple[float, float]] = {}
+                tname  = entry.get("type", "ground")
+                tidx   = next((i for i, ft in enumerate(_FEATURE_TYPES)
+                               if ft[_F_NAME] == tname), 0)
+                is_pair = _FEATURE_TYPES[tidx][_F_PAIR]
+                corr: dict = {}
                 for stem, xy in entry.get("points", {}).items():
                     f = self._by_stem.get(stem)
-                    if f is not None:
+                    if f is None:
+                        continue
+                    if is_pair:
+                        # xy is [[xa,ya],[xb,yb]]
+                        corr[f] = [(float(p[0]), float(p[1])) for p in xy]
+                    else:
                         corr[f] = (float(xy[0]), float(xy[1]))
-                if len(corr) >= 2:
+                min_frames = 1 if is_pair else 2
+                if len(corr) >= min_frames:
                     self._saved.append(corr)
+                    self._saved_types.append(tidx)
                     n += 1
             logger.info("Loaded %d correspondence(s) from %s", n, self._json_path)
             self._status = f"Loaded {n} saved correspondence(s)."
@@ -233,12 +296,30 @@ class ManualCorrespondenceViewer:
 
     def _write(self) -> None:
         self._json_path.parent.mkdir(parents=True, exist_ok=True)
-        entries = [
-            {"id": i,
-             "points": {f.stem: [float(x), float(y)]
-                        for f, (x, y) in corr.items()}}
-            for i, corr in enumerate(self._saved)
-        ]
+        import config as _cw
+        entries = []
+        for i, corr in enumerate(self._saved):
+            tidx = self._saved_types[i] if i < len(self._saved_types) else 0
+            ft    = _FEATURE_TYPES[tidx]
+            tname = ft[_F_NAME]
+            z_val = getattr(_cw, ft[_F_Z], 0.0)
+            dist_val = getattr(_cw, ft[_F_DIST], None) if ft[_F_DIST] else None
+            entry = {"id": i, "type": tname,
+                     "z_plane": round(float(z_val), 4),
+                     "is_pair": ft[_F_PAIR]}
+            if dist_val is not None:
+                entry["distance_m"] = round(float(dist_val), 4)
+            if ft[_F_AXIS]:
+                entry["axis"] = ft[_F_AXIS]
+            if ft[_F_PAIR]:
+                pts_dict = {}
+                for f, pts in corr.items():
+                    pts_dict[f.stem] = [[float(p[0]), float(p[1])] for p in pts]
+            else:
+                pts_dict = {f.stem: [float(x), float(y)]
+                            for f, (x, y) in corr.items()}
+            entry["points"] = pts_dict
+            entries.append(entry)
         self._json_path.write_text(
             json.dumps({"correspondences": entries}, indent=2)
         )
@@ -449,11 +530,30 @@ class ManualCorrespondenceViewer:
                 self._status   = "Click near a marker to select it."
             return
 
-        self._current[frame] = (px, py)
+        ft = _FEATURE_TYPES[self._type_idx]
+        if ft[_F_PAIR]:
+            # Pair mode: accumulate up to 2 points per frame
+            pts = list(self._current.get(frame, []))
+            if len(pts) >= 2:
+                pts = [(px, py)]   # 3rd click resets this frame
+                self._status = (f"Frame {frame.stem[-8:]} reset.  "
+                                f"Point A set — click again for B.")
+            elif len(pts) == 1:
+                pts.append((px, py))
+                complete = sum(1 for p in self._current.values() if len(p)==2)
+                self._status = (f"Point B set — {complete} frame(s) complete.  "
+                                f"Click more frames or Enter to save.")
+            else:
+                pts.append((px, py))
+                self._status = (f"Point A set in {frame.stem[-8:]}.  "
+                                f"Click same frame again for Point B.")
+            self._current[frame] = pts
+        else:
+            self._current[frame] = (px, py)
+            n = len(self._current)
+            self._status = (f"Building correspondence: {n} frame(s) marked.  "
+                            f"Click more or press Enter/n to save.")
         self._dirty  = True
-        n = len(self._current)
-        self._status = (f"Building correspondence: {n} frame(s) marked.  "
-                        f"Click more or press Enter/n to save.")
         self._rebuild_canvas()
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -476,22 +576,36 @@ class ManualCorrespondenceViewer:
                         f"[ / ] to navigate.")
 
     def _action_finalise(self) -> None:
-        if len(self._current) < 2:
-            self._status = (f"Need \u2265 2 frames "
-                            f"(have {len(self._current)}).  Keep clicking.")
-            return
+        ft      = _FEATURE_TYPES[self._type_idx]
+        is_pair = ft[_F_PAIR]
+        if is_pair:
+            # For pair types, filter to frames with exactly 2 points
+            complete = {f: pts for f, pts in self._current.items()
+                        if len(pts) == 2}
+            if len(complete) < 1:
+                self._status = ("Need ≥ 1 complete frame (click A then B in "
+                                "same frame).  Partial frames are ignored.")
+                return
+            corr = complete
+        else:
+            if len(self._current) < 2:
+                self._status = (f"Need ≥ 2 frames "
+                                f"(have {len(self._current)}).  Keep clicking.")
+                return
+            corr = dict(self._current)
         if self._edit_mode:
-            self._saved[self._edit_idx] = dict(self._current)
+            self._saved[self._edit_idx] = corr
             self._current   = {}
             self._edit_mode = False
             self._dirty     = True
             self._status    = f"Correspondence #{self._edit_idx} updated.  Click any frame to start a new one."
         else:
-            self._saved.append(dict(self._current))
+            self._saved.append(corr)
+            self._saved_types.append(self._type_idx)
             n = len(self._saved)
             self._current = {}
             self._dirty   = True
-            self._status  = f"Correspondence #{n-1} saved ({len(self._saved[n-1])} frame(s)).  Click any frame for the next one."
+            self._status  = f"Correspondence #{n-1} saved ({len(corr)} frame(s)).  Click any frame for the next one."
         self._rebuild_canvas()
 
     def _action_edit_last(self) -> None:
@@ -506,8 +620,10 @@ class ManualCorrespondenceViewer:
             self._current     = dict(self._saved[self._edit_idx])
             self._edit_mode   = True
         else:
-            self._saved[self._edit_idx] = dict(self._current)
-            self._dirty = True
+            updated = dict(self._current)
+            if updated != self._saved[self._edit_idx]:
+                self._dirty = True
+            self._saved[self._edit_idx] = updated
             if self._edit_idx == 0:
                 self._status = "Already at oldest.  ] to go forward."
                 self._rebuild_canvas(); return
@@ -522,8 +638,10 @@ class ManualCorrespondenceViewer:
         # ]: move to next (newer) correspondence while in edit mode
         if not self._edit_mode:
             self._status = "Press e first to enter edit mode."; return
-        self._saved[self._edit_idx] = dict(self._current)
-        self._dirty = True
+        updated = dict(self._current)
+        if updated != self._saved[self._edit_idx]:
+            self._dirty = True
+        self._saved[self._edit_idx] = updated
         if self._edit_idx >= len(self._saved) - 1:
             self._current   = {}
             self._edit_mode = False
@@ -621,6 +739,16 @@ class ManualCorrespondenceViewer:
                 _warn_quit = False
                 self._reset_view()
 
+            elif key in (ord('T'), ord('t')) and not self._score_mode and not self._edit_mode:
+                _warn_quit = False
+                self._type_idx = (self._type_idx + 1) % len(_FEATURE_TYPES)
+                _ft   = _FEATURE_TYPES[self._type_idx]
+                import config as _ct
+                z_val = getattr(_ct, _ft[_F_Z], 0.0)
+                pair_str = "  [PAIR — click A then B]" if _ft[_F_PAIR] else ""
+                self._status = (f"Type → {_ft[_F_NAME].upper()}  "
+                                f"(z={z_val:.3f} m){pair_str}")
+
             elif key in (ord('q'), 27):
                 if self._dirty and not _warn_quit and not self._score_mode:
                     self._status = ("Unsaved changes!  Press s to save, "
@@ -629,7 +757,7 @@ class ManualCorrespondenceViewer:
                     self._rebuild_canvas()
                 else:
                     break
-            else:
+            elif key != 0xFF:  # real keypress — reset quit-warn; 0xFF = no key (waitKey timeout)
                 _warn_quit = False
 
         cv2.destroyAllWindows()

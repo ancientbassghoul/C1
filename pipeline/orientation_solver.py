@@ -2,18 +2,18 @@
 pipeline/orientation_solver.py – Camera orientation calibration using pyceres.
 
 Jointly optimises:
-  Per-camera  : pitch, yaw_offset, roll_offset        (3 × N parameters)
-  Van pose    : east, north, heading                  (3 parameters, Z fixed)
+  Per-camera  : pitch, yaw_offset, roll_offset, dx, dy, dz   (6 × N parameters)
+  Van heading : van_heading_deg                               (1 parameter)
 
 Two types of constraints:
   1. Ground scatter (pairwise): for each matched ground feature seen in two
      frames, the ray-ground intersections from both cameras must agree.
      Residual: [ΔEast, ΔNorth] of the two intersection points.
 
-  2. Van corner reprojection: for each visible van corner in a selected frame,
-     the 3-D corner (known local coordinates + solved van pose) must project
-     to the observed bounding-box pixel.
-     Residual: [Δu, Δv] in image space, scaled by VAN_CORNER_WEIGHT.
+  2. Van plane features (manual): wheel centres at known Z constrain wheelbase
+     distance and axis direction; roof marks constrain roof-plane scatter;
+     roof-edge pairs constrain lateral width.  Provided via the manual
+     correspondence JSON (type: wheel_axis, roof, roof_edge).
 
 pyceres cost functions are subclasses of pyceres.CostFunction that implement
 evaluate(parameters, residuals, jacobians).  Jacobians are computed via central
@@ -63,17 +63,6 @@ def _unproject(u, v, K_inv, yaw, pitch, roll, pos, z_ground):
         return None
     d_world = d_world / norm
     return _ray_ground(pos, d_world, z_ground)
-
-
-def _van_corner_world(corner_local, van_east, van_north, van_heading_deg, van_z):
-    H = math.radians(van_heading_deg)
-    s, c = math.sin(H), math.cos(H)
-    cx, cy, cz = corner_local
-    return np.array([
-        van_east  + cx * s - cy * c,
-        van_north + cx * c + cy * s,
-        van_z     + cz,
-    ])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -140,59 +129,138 @@ class GroundScatterCost:
         return np.array([Pi[0] - Pj[0], Pi[1] - Pj[1]])
 
 
-class VanCornerCost:
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Van feature constraints (plane scatter + wheel distance)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class PlaneScatterCost(GroundScatterCost):
     """
-    Van corner reprojection cost functor.
+    Pairwise scatter cost for points on an arbitrary horizontal plane Z=z_plane.
 
-    Call signature: (camera_params, van_params) -> np.ndarray shape (2,)
-    camera_params = [pitch, yaw_offset, roll_offset]
-    van_params    = [van_east, van_north, van_heading_deg]
-    Residuals     = VAN_CORNER_WEIGHT * [u_pred - u_obs, v_pred - v_obs]
+    Identical to GroundScatterCost — inherits everything, just passes a
+    different z_ground.  Used for van roof (z=VAN_HEIGHT_M) and wheel
+    centres (z=WHEEL_RADIUS_M).
     """
-    def __init__(self, pixel_obs, corner_local, K, pos_enu,
-                 heading_deg, roll_deg, van_z):
-        self._u_obs, self._v_obs = pixel_obs
-        self._corner_local = corner_local.copy()
-        self._K      = K.copy()
-        self._pos    = pos_enu.copy()
-        self._hdg    = heading_deg
-        self._roll   = roll_deg
-        self._van_z  = van_z
-        self._weight = config.VAN_CORNER_WEIGHT
+    # No override needed — GroundScatterCost already accepts z_ground.
 
-    def __call__(self, camera_params, van_params, focal_params=None):
-        yaw   = self._hdg  + camera_params[1]
-        pitch = camera_params[0]
-        roll  = self._roll + camera_params[2]
-        R_cam = build_rotation(yaw, pitch, roll)
-        pos   = self._pos + np.array([camera_params[3], camera_params[4], camera_params[5]])
 
-        f  = float(focal_params[0]) if focal_params is not None else self._K[0, 0]
-        cx = self._K[0, 2]
-        cy = self._K[1, 2]
+class WheelDistanceCost:
+    """
+    Metric distance constraint between two wheel centres in the same frame.
 
-        corner_world = _van_corner_world(
-            self._corner_local,
-            float(van_params[0]), float(van_params[1]), float(van_params[2]),
-            self._van_z,
-        )
-        p_cam = R_cam @ (corner_world - pos)
-        if p_cam[2] <= 1e-6:
-            return np.array([_MISS_PENALTY * self._weight,
-                             _MISS_PENALTY * self._weight])
+    Given two pixels in the same frame that are wheel centres at height
+    z=WHEEL_RADIUS_M, their back-projected world positions must be exactly
+    *distance_m* apart (track width or wheelbase).
 
-        u_pred = f * p_cam[0] / p_cam[2] + cx
-        v_pred = f * p_cam[1] / p_cam[2] + cy
-        return np.array([(u_pred - self._u_obs) * self._weight,
-                         (v_pred - self._v_obs) * self._weight])
+    Call signature: (cam_params,) -> np.ndarray shape (1,)
+    """
+    def __init__(self, pixel_a, pixel_b, pos, K,
+                 heading_deg, roll_deg, z_wheel, distance_m):
+        self._ua, self._va = pixel_a
+        self._ub, self._vb = pixel_b
+        self._pos          = pos.copy()
+        self._K_inv        = np.linalg.inv(K)
+        self._cx           = float(K[0, 2])
+        self._cy           = float(K[1, 2])
+        self._hdg          = heading_deg
+        self._roll         = roll_deg
+        self._z            = z_wheel
+        self._dist         = distance_m
+
+    def __call__(self, cam_params, focal_params=None):
+        pos = self._pos + np.array([cam_params[3], cam_params[4], cam_params[5]])
+        if focal_params is not None:
+            f      = float(focal_params[0])
+            K_inv  = np.array([[1/f, 0, -self._cx/f],
+                                [0, 1/f, -self._cy/f],
+                                [0,   0,           1]])
+        else:
+            K_inv = self._K_inv
+
+        Pa = _unproject(self._ua, self._va, K_inv,
+                        self._hdg + cam_params[1], cam_params[0],
+                        self._roll + cam_params[2], pos, self._z)
+        Pb = _unproject(self._ub, self._vb, K_inv,
+                        self._hdg + cam_params[1], cam_params[0],
+                        self._roll + cam_params[2], pos, self._z)
+        if Pa is None or Pb is None:
+            return np.array([_MISS_PENALTY])
+        dist = float(np.linalg.norm(Pa - Pb))
+        return np.array([dist - self._dist])
+
+
+class AxisPairCost:
+    """
+    Within-frame constraint for a pair of points on the van at known height.
+
+    Residuals (3):
+      [0]  distance_error = |P_b - P_a| - distance_m          (metres)
+      [1]  direction_x   = cross(diff_unit, axis_unit).x * dist (metres)
+      [2]  direction_y   = cross(diff_unit, axis_unit).y * dist (metres)
+
+    Call: (cam_params[6], van_params[3], [focal_params[1]]) -> (3,)
+    """
+    def __init__(self, pixel_a, pixel_b, pos, K,
+                 heading_deg, roll_deg, z_plane, distance_m, axis="forward"):
+        self._ua, self._va = pixel_a
+        self._ub, self._vb = pixel_b
+        self._pos   = pos.copy()
+        self._K_inv = np.linalg.inv(K)
+        self._cx    = float(K[0, 2])
+        self._cy    = float(K[1, 2])
+        self._hdg   = heading_deg
+        self._roll  = roll_deg
+        self._z     = z_plane
+        self._dist  = distance_m
+        self._axis  = axis   # "forward" or "lateral"
+
+    def __call__(self, cam_params, van_params, focal_params=None):
+        pos   = self._pos + cam_params[3:6]
+        K_inv = (_k_inv_from_f(float(focal_params[0]), self._cx, self._cy)
+                 if focal_params is not None else self._K_inv)
+
+        Pa = _unproject(self._ua, self._va, K_inv,
+                        self._hdg + cam_params[1], cam_params[0],
+                        self._roll + cam_params[2], pos, self._z)
+        Pb = _unproject(self._ub, self._vb, K_inv,
+                        self._hdg + cam_params[1], cam_params[0],
+                        self._roll + cam_params[2], pos, self._z)
+
+        if Pa is None or Pb is None:
+            return np.array([_MISS_PENALTY] * 3)
+
+        diff2d  = (Pb - Pa)[:2]
+        horiz   = float(np.linalg.norm(diff2d))
+        dist_res = horiz - self._dist
+
+        if horiz < 1e-6:
+            return np.array([dist_res, _MISS_PENALTY, _MISS_PENALTY])
+
+        diff_unit = diff2d / horiz
+
+        # Van heading in ENU: forward = (sin hdg, cos hdg)
+        van_hdg_rad = math.radians(float(van_params[2]))
+        if self._axis == "forward":
+            axis_unit = np.array([math.sin(van_hdg_rad), math.cos(van_hdg_rad)])
+        else:   # lateral — perpendicular to forward
+            axis_unit = np.array([math.cos(van_hdg_rad), -math.sin(van_hdg_rad)])
+
+        # 2D cross product (scalar): measures misalignment
+        cross = diff_unit[0]*axis_unit[1] - diff_unit[1]*axis_unit[0]
+        # Scale to metres so residuals are comparable
+        dir_res = cross * self._dist
+
+        return np.array([dist_res, dir_res, 0.0])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
 
-def solve(frames, pairwise_features, van_observations, van_pose_init,
-          pitch_seeds=None):
+def solve(frames, pairwise_features, pitch_seeds=None,
+          van_plane_features=None):
     """
     Build and solve the pyceres orientation problem.
 
@@ -200,8 +268,6 @@ def solve(frames, pairwise_features, van_observations, van_pose_init,
     ----
     frames            : list of Frame objects (all eligible frames).
     pairwise_features : list of (frame_i, pixel_i, frame_j, pixel_j).
-    van_observations  : list of (frame, corner_local_3d, pixel_obs).
-    van_pose_init     : [van_east, van_north, van_heading_deg].
     pitch_seeds       : optional dict Frame -> float (degrees).  When provided,
                         each camera's pitch search window is centred on the seed
                         (± SOLVER_PITCH_OFFSET) rather than the full physical
@@ -209,9 +275,10 @@ def solve(frames, pairwise_features, van_observations, van_pose_init,
 
     Returns
     -------
-    cam_results : dict  Frame -> np.ndarray([pitch, yaw_off, roll_off])
-    van_pose    : np.ndarray([van_east, van_north, van_heading_deg])
+    cam_results : dict  Frame -> np.ndarray([pitch, yaw_off, roll_off, dx, dy, dz])
+    van_pose    : np.ndarray([0, 0, van_heading_deg])  — heading solved from axis pairs
     report      : Ceres BriefReport string
+    focal_params: np.ndarray([focal_length]) (undistorted px)
     """
     try:
         import pyceres
@@ -260,8 +327,8 @@ def solve(frames, pairwise_features, van_observations, van_pose_init,
 
     # ── Problem setup ─────────────────────────────────────────────────────────
     logger.info(
-        "Building Ceres problem: %d frames, %d ground pairs, %d van observations.",
-        len(frames), len(pairwise_features), len(van_observations),
+        "Building Ceres problem: %d frames, %d ground pairs.",
+        len(frames), len(pairwise_features),
     )
 
     problem    = pyceres.Problem()
@@ -271,10 +338,11 @@ def solve(frames, pairwise_features, van_observations, van_pose_init,
     for f in frames:
         seed_pitch = pitch_seeds.get(f, 0.0) if pitch_seeds else 0.0
         cam_params[f] = np.array([seed_pitch, 0.0, 0.0, 0.0, 0.0, 0.0])
-    van_params = np.array(van_pose_init, dtype=np.float64)
+    # van_params: [van_east, van_north, van_heading_deg]
+    # east/north are unconstrained placeholders; heading is solved by AxisPairCost.
+    van_params = np.zeros(3, dtype=np.float64)
 
     ground_loss = pyceres.CauchyLoss(5.0)
-    van_loss    = pyceres.HuberLoss(3.0)
 
     # Optional shared focal length parameter
     # Solver works in undistorted image space where
@@ -303,22 +371,98 @@ def solve(frames, pairwise_features, van_observations, van_pose_init,
             problem.add_residual_block(cost, ground_loss,
                                      [cam_params[fi], cam_params[fj]])
 
-    # Van corner residuals
-    for frame, corner_local, pixel_obs in van_observations:
-        functor = VanCornerCost(
-            pixel_obs, corner_local,
-            frame.K_undist, frame.position_enu,
-            frame.heading_deg, frame.camera_roll_deg,
-            van_z=config.VAN_Z_M,
-        )
-        if estimate_f:
-            cost = _NumericDiff(functor, num_residuals=2, block_sizes=[6, 3, 1])
-            problem.add_residual_block(cost, van_loss,
-                                     [cam_params[frame], van_params, focal_params])
-        else:
-            cost = _NumericDiff(functor, num_residuals=2, block_sizes=[6, 3])
-            problem.add_residual_block(cost, van_loss,
-                                     [cam_params[frame], van_params])
+    # Van plane feature residuals (roof scatter + wheel distance)
+    plane_loss = pyceres.HuberLoss(2.0)
+    wheel_loss = pyceres.HuberLoss(0.10)
+    frame_by_stem = {f.stem: f for f in frames}
+    if van_plane_features:
+        for feat in van_plane_features:
+            feat_type  = feat.get("type", "ground")
+            z_plane    = float(feat.get("z_plane", config.GROUND_Z_M))
+            is_pair    = feat.get("is_pair", False)
+            distance_m = float(feat.get("distance_m", 1.0)) if is_pair else None
+            axis       = feat.get("axis", "forward")
+            points     = feat.get("points", {})
+
+            if is_pair:
+                # Each frame contributes [[xa,ya],[xb,yb]]
+                # Per-frame: AxisPairCost (distance + direction vs van heading)
+                # Cross-frame: PlaneScatterCost on A-points and B-points separately
+                pair_frames = []
+                for stem, pts in points.items():
+                    f = frame_by_stem.get(stem)
+                    if f is None or len(pts) < 2:
+                        continue
+                    pix_a = tuple(pts[0]);  pix_b = tuple(pts[1])
+                    pair_frames.append((f, pix_a, pix_b))
+                    functor = AxisPairCost(
+                        pix_a, pix_b, f.position_enu, f.K_undist,
+                        f.heading_deg, f.camera_roll_deg,
+                        z_plane, distance_m, axis,
+                    )
+                    if estimate_f:
+                        cost = _NumericDiff(functor, num_residuals=3,
+                                           block_sizes=[6, 3, 1])
+                        problem.add_residual_block(cost, plane_loss,
+                                                 [cam_params[f], van_params, focal_params])
+                    else:
+                        cost = _NumericDiff(functor, num_residuals=3,
+                                           block_sizes=[6, 3])
+                        problem.add_residual_block(cost, plane_loss,
+                                                 [cam_params[f], van_params])
+                # Cross-frame scatter: same physical endpoints seen in multiple frames
+                for i in range(len(pair_frames)):
+                    for j in range(i + 1, len(pair_frames)):
+                        fi, pa_i, pb_i = pair_frames[i]
+                        fj, pa_j, pb_j = pair_frames[j]
+                        for pix_i, pix_j in [(pa_i, pa_j), (pb_i, pb_j)]:
+                            functor = PlaneScatterCost(
+                                pix_i, pix_j,
+                                fi.position_enu, fj.position_enu,
+                                fi.K_undist, fj.K_undist,
+                                fi.heading_deg, fj.heading_deg,
+                                fi.camera_roll_deg, fj.camera_roll_deg,
+                                z_ground=z_plane,
+                            )
+                            if estimate_f:
+                                cost = _NumericDiff(functor, num_residuals=2,
+                                                   block_sizes=[6, 6, 1])
+                                problem.add_residual_block(cost, plane_loss,
+                                                         [cam_params[fi], cam_params[fj],
+                                                          focal_params])
+                            else:
+                                cost = _NumericDiff(functor, num_residuals=2,
+                                                   block_sizes=[6, 6])
+                                problem.add_residual_block(cost, plane_loss,
+                                                         [cam_params[fi], cam_params[fj]])
+            else:
+                # Single-point per frame — plain plane scatter
+                feat_frames = [(frame_by_stem[s], tuple(pt))
+                               for s, pt in points.items() if s in frame_by_stem]
+                for i in range(len(feat_frames)):
+                    for j in range(i + 1, len(feat_frames)):
+                        fi, pix_i = feat_frames[i]
+                        fj, pix_j = feat_frames[j]
+                        functor = PlaneScatterCost(
+                            pix_i, pix_j,
+                            fi.position_enu, fj.position_enu,
+                            fi.K_undist, fj.K_undist,
+                            fi.heading_deg, fj.heading_deg,
+                            fi.camera_roll_deg, fj.camera_roll_deg,
+                            z_ground=z_plane,
+                        )
+                        if estimate_f:
+                            cost = _NumericDiff(functor, num_residuals=2,
+                                               block_sizes=[6, 6, 1])
+                            problem.add_residual_block(cost, plane_loss,
+                                                     [cam_params[fi], cam_params[fj],
+                                                      focal_params])
+                        else:
+                            cost = _NumericDiff(functor, num_residuals=2,
+                                               block_sizes=[6, 6])
+                            problem.add_residual_block(cost, plane_loss,
+                                                     [cam_params[fi], cam_params[fj]])
+        logger.info("Added %d van plane feature constraint(s).", len(van_plane_features))
 
     # Camera bounds — pitch window centred on GeoCalib seed, clamped to floor/ceiling
     for f in frames:
@@ -341,12 +485,6 @@ def solve(frames, pairwise_features, van_observations, van_pose_init,
         problem.set_parameter_upper_bound(p, 5,  config.SOLVER_POSITION_RANGE_V)
         logger.debug("[%s] pitch window: [%.1f°, %.1f°]  seed=%.1f°",
                      f.stem[-12:], p_lo, p_hi, seed_pitch)
-
-    # Van heading bounds (east/north are free)
-    h_lo = config.VAN_HEADING_PRIOR_DEG - config.VAN_HEADING_RANGE_DEG
-    h_hi = config.VAN_HEADING_PRIOR_DEG + config.VAN_HEADING_RANGE_DEG
-    problem.set_parameter_lower_bound(van_params, 2, h_lo)
-    problem.set_parameter_upper_bound(van_params, 2, h_hi)
 
     # Focal length bounds
     if estimate_f:
