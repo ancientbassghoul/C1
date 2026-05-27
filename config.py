@@ -200,6 +200,27 @@ SOLVER_POSITION_RANGE_V  =  1.65   # ± metres vertical (Up/altitude)
 # without converging (check the summary BriefReport in the log).
 SOLVER_MAX_ITERATIONS = 200
 
+# ── Two-stage auto feature matching ──────────────────────────────────────────
+# Stage 1: manual-only solve (fast, reliable anchor).
+# Stage 2: manual + LightGlue matches that survive a reprojection filter.
+#
+# LIGHTGLUE_FILTER_THRESHOLD_PX  — max reprojection error (px) a LightGlue
+#   match may have under the stage-1 solution to be kept for stage 2.
+#   Tighter = fewer but cleaner matches.  Start at 20, tighten to 10 if
+#   stage-2 results still look bad.
+#
+# STAGE2_ROTATION_BOUND_DEG / STAGE2_POSITION_BOUND_M — how far stage-2 is
+#   allowed to move from the stage-1 solution.  These are tight by design:
+#   the filtered LightGlue features should only need small corrections.
+LIGHTGLUE_FILTER_THRESHOLD_PX = 20.0   # both frames calibrated
+LIGHTGLUE_MIXED_THRESHOLD_PX  = 60.0   # one frame calibrated, one new
+STAGE2_ROTATION_BOUND_DEG     =  3.0   # ± degrees around stage-1 value
+STAGE2_POSITION_BOUND_M       =  5.0   # ± metres around stage-1 value
+
+# Set to False to skip the manual-correspondence stage-1 anchor even when
+# MANUAL_CORRESPONDENCES_FILE exists.  Useful for testing pure auto matching.
+USE_MANUAL_ANCHOR = True
+
 # ── Focal length estimation ──────────────────────────────────────────────────
 # Set True to add focal length as a free parameter in the Ceres solve.
 # Requires good manual correspondences spanning frames at different altitudes.

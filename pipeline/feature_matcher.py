@@ -400,6 +400,164 @@ def _global_match_filter(
                 n_in, n_out, len(result), len(pair_matches))
     return result
 
+def _load_manual_pairs(frames: list) -> list[tuple]:
+    """
+    Load ground-type correspondences from MANUAL_CORRESPONDENCES_FILE and
+    return them as pairwise (fi, pix_i, fj, pix_j) tuples.
+    Used by the two-stage auto path to anchor stage-1 without requiring
+    raycast.py to pass them in explicitly.
+    """
+    import json
+    from pathlib import Path
+    from itertools import combinations as _comb
+
+    path = Path(config.MANUAL_CORRESPONDENCES_FILE)
+    if not path.exists():
+        return []
+
+    stem_to_frame = {f.stem: f for f in frames}
+    data  = json.loads(path.read_text(encoding="utf-8"))
+    pairs = []
+
+    for entry in data.get("correspondences", []):
+        if entry.get("type", "ground") != "ground":
+            continue
+        if entry.get("is_pair", False):
+            continue
+        pts   = entry.get("points", {})
+        stems = list(pts.keys())
+        for sa, sb in _comb(stems, 2):
+            fa = stem_to_frame.get(sa)
+            fb = stem_to_frame.get(sb)
+            if fa is None or fb is None:
+                continue
+            xa, ya = pts[sa]
+            xb, yb = pts[sb]
+            pairs.append((fa, (float(xa), float(ya)),
+                          fb, (float(xb), float(yb))))
+
+    logger.info("Loaded %d manual ground pairs from %s (stage-1 anchor).",
+                len(pairs), path)
+    return pairs
+
+
+def _filter_by_reprojection(
+    lightglue_pairs: list[tuple],
+    cam_results: dict,
+    calibrated_frames: set,
+    threshold_px: float,
+    mixed_threshold_px: float,
+) -> list[tuple]:
+    """
+    Keep only LightGlue pairs consistent with the stage-1 camera solution,
+    using different thresholds based on how well each frame is calibrated.
+
+    Pair classification:
+      both calibrated   → strict threshold_px  (both predictions reliable)
+      one calibrated    → mixed_threshold_px,  raycasting from the calibrated
+                          frame only (its prediction is reliable)
+      both uncalibrated → dropped              (neither prediction is reliable)
+    """
+
+    def _stage1_camera(f):
+        p        = cam_results[f]
+        pitch    = float(p[0])
+        yaw_off  = float(p[1])
+        roll_off = float(p[2])
+        dx, dy, dz = float(p[3]), float(p[4]), float(p[5])
+        yaw  = f.heading_deg     + yaw_off
+        roll = f.camera_roll_deg + roll_off
+        R    = build_rotation(yaw, pitch, roll)
+        pos  = f.position_enu + np.array([dx, dy, dz])
+        return R, pos, f.K_undist
+
+    def _raycast_z0(R, pos, K, u, v):
+        cx, cy = K[0, 2], K[1, 2]
+        focal  = K[0, 0]
+        ray_cam   = np.array([(u - cx) / focal, (v - cy) / focal, 1.0])
+        ray_world = R.T @ ray_cam
+        if abs(ray_world[2]) < 1e-6:
+            return None
+        t = -pos[2] / ray_world[2]
+        if t < 0:
+            return None
+        return pos + t * ray_world
+
+    def _project(R, pos, K, P):
+        p_cam = R @ (P - pos)
+        if p_cam[2] <= 1e-3:
+            return None
+        cx, cy = K[0, 2], K[1, 2]
+        focal  = K[0, 0]
+        return (focal * p_cam[0] / p_cam[2] + cx,
+                focal * p_cam[1] / p_cam[2] + cy)
+
+    kept = []
+    n_both_cal = n_mixed = n_both_uncal = 0
+
+    for fi, pix_i, fj, pix_j in lightglue_pairs:
+        if fi not in cam_results or fj not in cam_results:
+            continue
+
+        i_cal = fi in calibrated_frames
+        j_cal = fj in calibrated_frames
+
+        if not i_cal and not j_cal:
+            n_both_uncal += 1
+            continue                  # skip — neither prediction is reliable
+
+        if i_cal and j_cal:
+            n_both_cal += 1
+            thresh = threshold_px
+            # Standard: raycast from fi, check in fj
+            Ri, pos_i, Ki = _stage1_camera(fi)
+            Rj, pos_j, Kj = _stage1_camera(fj)
+            P = _raycast_z0(Ri, pos_i, Ki, pix_i[0], pix_i[1])
+            if P is None:
+                continue
+            pred = _project(Rj, pos_j, Kj, P)
+            if pred is None:
+                continue
+            err = np.hypot(pred[0] - pix_j[0], pred[1] - pix_j[1])
+        else:
+            n_mixed += 1
+            thresh = mixed_threshold_px
+            # Raycast from the calibrated frame only
+            if i_cal:
+                Rc, pos_c, Kc = _stage1_camera(fi)
+                pix_c = pix_i
+                Ru, pos_u, Ku = _stage1_camera(fj)
+                pix_u = pix_j
+            else:
+                Rc, pos_c, Kc = _stage1_camera(fj)
+                pix_c = pix_j
+                Ru, pos_u, Ku = _stage1_camera(fi)
+                pix_u = pix_i
+            P = _raycast_z0(Rc, pos_c, Kc, pix_c[0], pix_c[1])
+            if P is None:
+                continue
+            pred = _project(Ru, pos_u, Ku, P)
+            if pred is None:
+                continue
+            err = np.hypot(pred[0] - pix_u[0], pred[1] - pix_u[1])
+
+        if err <= thresh:
+            kept.append((fi, pix_i, fj, pix_j))
+
+    logger.info(
+        "Reprojection filter: "
+        "%d both-calibrated (thresh %.0fpx), "
+        "%d mixed (thresh %.0fpx), "
+        "%d both-uncalibrated (dropped). "
+        "Kept %d / %d total.",
+        n_both_cal, threshold_px,
+        n_mixed, mixed_threshold_px,
+        n_both_uncal,
+        len(kept), len(lightglue_pairs),
+    )
+    return kept
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_van_features() -> list:
@@ -576,29 +734,111 @@ def refine_pitches(frames: list[Frame],
             logger.info("--run-matcher-only: exiting after LightGlue + auto_matches.json.")
             return
 
-    # ── Joint Ceres solve ─────────────────────────────────────────────────────
-    # Pass GeoCalib pitch estimates as seeds so Ceres uses a tight per-frame
-    # window rather than the full physical pitch range.
+    # ── Shared setup ─────────────────────────────────────────────────────────
     pitch_seeds = {
         f: f.gimbal_pitch_deg
         for f in ready
         if f.gimbal_pitch_deg is not None
     }
-
-    # Load van plane features (roof / wheel centre correspondences)
     van_plane_features = _load_van_features()
 
-    cam_results, van_pose_solved, report, focal_result = ceres_solve(
-        ready, pairwise_features,
-        pitch_seeds=pitch_seeds,
-        van_plane_features=van_plane_features,
-    )
+    if manual_pairwise_features is not None:
+        # ── Manual-only path: single solve, normal bounds ─────────────────────
+        cam_results, van_pose_solved, report, focal_result = ceres_solve(
+            ready, pairwise_features,
+            pitch_seeds=pitch_seeds,
+            van_plane_features=van_plane_features,
+        )
+        logger.info("Van heading solved: %.1f°", van_pose_solved[2])
+        if config.ESTIMATE_FOCAL_LENGTH:
+            f_raw = float(focal_result[0]) / config.UNDISTORT_SCALE
+            logger.info(
+                "Solved focal length: %.2f px raw  "
+                "(update FOCAL_LENGTH = %.2f in config.py)", f_raw, f_raw)
 
-    logger.info("Van heading solved: %.1f°", van_pose_solved[2])
-    if config.ESTIMATE_FOCAL_LENGTH:
-        f_raw = float(focal_result[0]) / config.UNDISTORT_SCALE
-        logger.info("Solved focal length: %.2f px raw  (update FOCAL_LENGTH = %.2f in config.py)",
-                    f_raw, f_raw)
+    else:
+        # ── Two-stage auto path ───────────────────────────────────────────────
+        # Stage 1: manual correspondences only — reliable geometric anchor.
+        manual_pairs = _load_manual_pairs(ready) if config.USE_MANUAL_ANCHOR else []
+        if not manual_pairs:
+            logger.warning(
+                "No manual correspondences found for stage-1 anchor — "
+                "running single-stage solve with LightGlue only (may be unstable)."
+            )
+            cam_results, van_pose_solved, report, focal_result = ceres_solve(
+                ready, pairwise_features,
+                pitch_seeds=pitch_seeds,
+                van_plane_features=van_plane_features,
+            )
+        else:
+            logger.info(
+                "Stage 1: manual-only solve (%d pairs) for geometric anchor…",
+                len(manual_pairs),
+            )
+            cam_s1, van_s1, report_s1, focal_s1 = ceres_solve(
+                ready, manual_pairs,
+                pitch_seeds=pitch_seeds,
+                van_plane_features=van_plane_features,
+            )
+            logger.info("Stage 1 complete: %s", report_s1)
+            logger.info("Stage 1 van heading: %.1f°", van_s1[2])
+
+            # Which frames were actually constrained in stage-1?
+            calibrated_frames = {
+                f for f in ready
+                if any(f is fi or f is fj
+                       for fi, _, fj, _ in manual_pairs)
+            }
+            n_new = len(ready) - len(calibrated_frames)
+            logger.info(
+                "%d calibrated frames (manual anchor), %d new frames "
+                "(GeoCalib seeds only).",
+                len(calibrated_frames), n_new,
+            )
+
+            # Filter LightGlue matches using stage-1 geometry
+            lg_filtered = _filter_by_reprojection(
+                pairwise_features, cam_s1,
+                calibrated_frames=calibrated_frames,
+                threshold_px=config.LIGHTGLUE_FILTER_THRESHOLD_PX,
+                mixed_threshold_px=config.LIGHTGLUE_MIXED_THRESHOLD_PX,
+            )
+
+            if not lg_filtered:
+                logger.warning(
+                    "Reprojection filter removed ALL LightGlue matches — "
+                    "using stage-1 result directly."
+                )
+                cam_results      = cam_s1
+                van_pose_solved  = van_s1
+                report           = report_s1
+                focal_result     = focal_s1
+            else:
+                # Stage 2: manual + filtered LightGlue.
+                # Calibrated frames: tight delta bounds around stage-1.
+                # New frames: normal wide bounds (they need room to move).
+                combined = manual_pairs + lg_filtered
+                logger.info(
+                    "Stage 2: %d manual + %d filtered LightGlue = %d total pairs…",
+                    len(manual_pairs), len(lg_filtered), len(combined),
+                )
+                cam_results, van_pose_solved, report, focal_result = ceres_solve(
+                    ready, combined,
+                    pitch_seeds=pitch_seeds,
+                    van_plane_features=van_plane_features,
+                    cam_params_init=cam_s1,
+                    van_params_init=van_s1,
+                    calibrated_frames=calibrated_frames,
+                    delta_rotation_bound=config.STAGE2_ROTATION_BOUND_DEG,
+                    delta_position_bound=config.STAGE2_POSITION_BOUND_M,
+                )
+
+        logger.info("Van heading solved: %.1f°", van_pose_solved[2])
+        if config.ESTIMATE_FOCAL_LENGTH:
+            f_raw = float(focal_result[0]) / config.UNDISTORT_SCALE
+            logger.info(
+                "Solved focal length: %.2f px raw  "
+                "(update FOCAL_LENGTH = %.2f in config.py)", f_raw, f_raw)
 
     # ── Apply results to frames ───────────────────────────────────────────────
     for f in ready:
@@ -619,3 +859,4 @@ def refine_pitches(frames: list[Frame],
         f.camera_roll_deg   = f.camera_roll_deg + ro
         f.position_enu      = f.position_enu    + np.array([dx, dy, dz])
         f.R = build_rotation(f.heading_deg, pitch, f.camera_roll_deg)
+

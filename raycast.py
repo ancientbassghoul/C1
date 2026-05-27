@@ -168,6 +168,14 @@ def parse_args() -> argparse.Namespace:
              "Use to generate the match file for --show-scores without "
              "waiting for the full orientation solve.",
     )
+    p.add_argument(
+        "--camera-deltas", action="store_true", dest="camera_deltas",
+        help="After the full solve, print a table comparing solved camera "
+             "orientations to raw telemetry.  Uses bracket roll detection to "
+             "decompose the solved rotation into (yaw_implied, pitch_implied) "
+             "and reports the delta against the OCR compass heading.  "
+             "Skips the interactive UI.",
+    )
     return p.parse_args()
 
 
@@ -222,6 +230,14 @@ def run_pipeline(frames_dir: str, no_refine: bool = False, no_enhance: bool = Fa
         logger.info("═" * 60)
         logger.info("Step 4/6 – Estimating camera poses from telemetry")
         estimate_poses(frames, skip_bracket_roll=not config.HORIZON_INDICATOR_READING)
+        # Snapshot raw OCR headings NOW — refine_pitches will mutate heading_deg in place.
+        for f in frames:
+            f._ocr_heading_deg = f.heading_deg   # stash pre-solve value on frame
+        # Snapshot GPS-derived ENU position NOW — solver may move position_enu in place.
+        for f in frames:
+            f._gps_position_enu = (
+                f.position_enu.copy() if f.position_enu is not None else None
+            )
         # Override camera Z according to --height
         for f in frames:
             if f.position_enu is None: continue
@@ -259,9 +275,6 @@ def run_pipeline(frames_dir: str, no_refine: bool = False, no_enhance: bool = Fa
         _stems = {f.stem: f for f in frames}
         _manual_pf = []
         for entry in _data.get("correspondences", []):
-            # Only ground-type single-point entries feed the cross-frame scatter.
-            # Van feature entries (wheel_axis, roof_edge, roof) are loaded
-            # separately by _load_van_features() in feature_matcher.py.
             if entry.get("type", "ground") != "ground":
                 continue
             if entry.get("is_pair", False):
@@ -582,6 +595,11 @@ def main() -> None:
     frames = run_pipeline(args.frames_dir, no_refine=args.no_refine, no_enhance=not args.enhance, height_mode=args.height, feature_matcher_debug=args.feature_matcher_debug, preview_ground_masks=args.preview_ground_masks, preview_hsv_masks=args.preview_hsv_masks, cameras_init_from_config=args.cameras_init_from_config, manual_fm_json=args.manual_fm_json,
                         run_matcher_only=args.run_matcher_only)
 
+    # Camera deltas analysis — print table and exit
+    if args.camera_deltas:
+        camera_deltas_cmd(frames)
+        return
+
     # Matcher-only mode exits here — auto_matches.json already written inside run_pipeline
     if args.run_matcher_only:
         import config as _cfg_mo
@@ -616,6 +634,144 @@ def main() -> None:
 
     else:
         run_interactive(frames)
+
+
+def camera_deltas_cmd(frames: list) -> None:
+    """
+    Print two tables comparing solved camera state to raw telemetry.
+
+    POSITION TABLE (per frame)
+      ΔEast, ΔNorth – solved XY minus GPS-derived ENU XY (metres).
+                      Zero if the solver does not move horizontal positions.
+      Z_solved      – camera Z used by the solver (controlled by --height flag).
+      Z_tor         – alt_takeoff_ref_m: barometric height above launch point.
+                      Consistent across all frames; best for a shared world Z.
+      Z_agl         – alt_agl_m: radar/lidar height above terrain below.
+                      Varies with ground elevation.
+
+    ORIENTATION TABLE (per frame)
+      The forward vector fwd = R_solved.T[:, 2] is roll-invariant, so we read
+      yaw and pitch directly from it:
+          pitch_implied = asin(fwd.Z)
+          yaw_implied   = atan2(fwd.E, fwd.N)
+      Roll is locked to the bracket-detected value (most reliable reading).
+      build_rotation(yaw_implied, pitch_implied, roll_bracket) exactly
+      reconstructs R_solved by construction.
+      Δyaw compares yaw_implied to the OCR compass heading snapshotted before
+      the solve.
+    """
+    import math
+    import numpy as np
+    from pipeline.pose import detect_camera_roll
+
+    def _decompose(R_solved):
+        """Return (yaw_implied_deg, pitch_implied_deg) from R_solved.
+        The forward vector is roll-invariant, so roll plays no part here."""
+        fwd_world     = R_solved.T[:, 2]          # camera +Z in ENU world
+        pitch_implied = math.degrees(
+            math.asin(float(np.clip(fwd_world[2], -1.0, 1.0)))
+        )
+        yaw_implied   = math.degrees(
+            math.atan2(fwd_world[0], fwd_world[1])
+        ) % 360.0
+        return yaw_implied, pitch_implied
+
+    def _angle_diff(a, b):
+        """Signed difference a − b, wrapped to (−180, +180]."""
+        d = (a - b) % 360.0
+        return d - 360.0 if d > 180.0 else d
+
+    ready = [
+        f for f in frames
+        if f.R is not None and hasattr(f, '_ocr_heading_deg')
+    ]
+
+    # ── POSITION TABLE ────────────────────────────────────────────────────────
+    print()
+    print("Position delta — solved XY vs GPS telemetry  |  height cross-check")
+    pos_hdr = (
+        f"{'Frame':<22}  {'ΔEast(m)':>9}  {'ΔNorth(m)':>10}  "
+        f"{'Z_solved(m)':>11}  {'Z_tor(m)':>9}  {'Z_agl(m)':>9}"
+    )
+    pos_sep = "─" * len(pos_hdr)
+    print(pos_sep)
+    print(pos_hdr)
+    print(pos_sep)
+
+    for f in ready:
+        if f.position_enu is None:
+            continue
+
+        gps_pos = getattr(f, '_gps_position_enu', None)
+        if gps_pos is not None:
+            de_str = f"{f.position_enu[0] - gps_pos[0]:+.2f}"
+            dn_str = f"{f.position_enu[1] - gps_pos[1]:+.2f}"
+        else:
+            de_str = dn_str = "   N/A"
+
+        z_solved = f.position_enu[2]
+        z_tor    = f.alt_takeoff_ref_m if f.alt_takeoff_ref_m is not None else float("nan")
+        z_agl    = f.alt_agl_m         if f.alt_agl_m is not None else float("nan")
+
+        tor_str = f"{z_tor:8.1f}m" if not math.isnan(z_tor) else "     N/A"
+        agl_str = f"{z_agl:8.1f}m" if not math.isnan(z_agl) else "     N/A"
+
+        print(
+            f"{f.stem[-22:]:<22}  {de_str:>9}  {dn_str:>10}  "
+            f"{z_solved:>10.1f}m  {tor_str}  {agl_str}"
+        )
+
+    print(pos_sep)
+    print()
+    print("  ΔEast / ΔNorth : solved position minus GPS-telemetry ENU (0.00 if solver")
+    print("                   does not move horizontal positions)")
+    print("  Z_solved       : camera height actually used (controlled by --height flag)")
+    print("  Z_tor          : alt_takeoff_ref_m — barometric, shared datum, consistent")
+    print("  Z_agl          : alt_agl_m         — radar/lidar, varies with terrain")
+    print("  Z_tor − Z_agl  : terrain elevation relative to launch point")
+    print()
+
+    # ── ORIENTATION TABLE ─────────────────────────────────────────────────────
+    print("Orientation delta — solved yaw vs OCR compass heading")
+    ori_hdr = (
+        f"{'Frame':<22}  {'OCR hdg':>8}  {'yaw_impl':>9}  {'Δyaw':>7}  "
+        f"{'pitch_impl':>11}  {'pitch_solv':>11}  {'roll_brkt':>10}"
+    )
+    ori_sep = "─" * len(ori_hdr)
+    print(ori_sep)
+    print(ori_hdr)
+    print(ori_sep)
+
+    for f in ready:
+        roll_raw = detect_camera_roll(f.raw)
+        if roll_raw is not None:
+            roll_bracket = -roll_raw          # same sign convention as pose.py
+            roll_str     = f"{roll_bracket:+.1f}°"
+        else:
+            roll_bracket = 0.0
+            roll_str     = "N/A"
+
+        yaw_impl, pitch_impl = _decompose(f.R)
+        ocr_hdg   = f._ocr_heading_deg
+        delta     = _angle_diff(yaw_impl, ocr_hdg) if ocr_hdg is not None else float("nan")
+
+        ocr_str   = f"{ocr_hdg:7.1f}°" if ocr_hdg is not None else "    N/A"
+        delta_str = f"{delta:+6.1f}°"  if not math.isnan(delta) else "    N/A"
+
+        print(
+            f"{f.stem[-22:]:<22}  {ocr_str}  {yaw_impl:8.1f}°  {delta_str}  "
+            f"{pitch_impl:+10.1f}°  {f.gimbal_pitch_deg:+10.1f}°  {roll_str:>10}"
+        )
+
+    print(ori_sep)
+    print()
+    print("  Δyaw = yaw_implied − OCR_heading")
+    print("    positive → solved camera points further CW than compass reported")
+    print("    consistent Δyaw across frames → fixed compass bias")
+    print("    varying   Δyaw across frames → heading-dependent error (motor/EMI?)")
+    print("  yaw_impl / pitch_impl derived from forward vector (roll-invariant).")
+    print("  build_rotation(yaw_impl, pitch_impl, roll_brkt) exactly equals R_solved.")
+    print()
 
 
 if __name__ == "__main__":

@@ -260,18 +260,31 @@ class AxisPairCost:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def solve(frames, pairwise_features, pitch_seeds=None,
-          van_plane_features=None):
+          van_plane_features=None,
+          cam_params_init=None,
+          van_params_init=None,
+          calibrated_frames=None,
+          delta_rotation_bound=None,
+          delta_position_bound=None):
     """
     Build and solve the pyceres orientation problem.
 
     Args
     ----
-    frames            : list of Frame objects (all eligible frames).
-    pairwise_features : list of (frame_i, pixel_i, frame_j, pixel_j).
-    pitch_seeds       : optional dict Frame -> float (degrees).  When provided,
-                        each camera's pitch search window is centred on the seed
-                        (± SOLVER_PITCH_OFFSET) rather than the full physical
-                        range.  Supplied by GeoCalib estimates from pose.py.
+    frames              : list of Frame objects (all eligible frames).
+    pairwise_features   : list of (frame_i, pixel_i, frame_j, pixel_j).
+    pitch_seeds         : optional dict Frame -> float (degrees).  When provided,
+                          each camera's pitch search window is centred on the seed
+                          (± SOLVER_PITCH_OFFSET) rather than the full physical
+                          range.  Supplied by GeoCalib estimates from pose.py.
+    cam_params_init     : optional dict Frame -> np.ndarray([p, yo, ro, dx, dy, dz]).
+                          When provided, initialises cam_params from these values
+                          instead of from GeoCalib seeds.  Used for stage-2 solves
+                          so that LightGlue refinement starts from the stage-1 result.
+    delta_rotation_bound: if set, clamp each rotation offset ± this many degrees
+                          AROUND its initialised value (stage-2 tight bounds).
+    delta_position_bound: if set, clamp each position offset ± this many metres
+                          AROUND its initialised value (stage-2 tight bounds).
 
     Returns
     -------
@@ -332,17 +345,28 @@ def solve(frames, pairwise_features, pitch_seeds=None,
     )
 
     problem    = pyceres.Problem()
-    # Initialise camera parameters from GeoCalib seeds where available
+    # Initialise camera parameters.
     # Layout: [pitch, yaw_off, roll_off, dx, dy, dz]
+    # If cam_params_init is given (stage-2), start from those values.
+    # Otherwise start from GeoCalib pitch seeds with zero offsets.
     cam_params = {}
     for f in frames:
-        seed_pitch = pitch_seeds.get(f, 0.0) if pitch_seeds else 0.0
-        cam_params[f] = np.array([seed_pitch, 0.0, 0.0, 0.0, 0.0, 0.0])
+        if cam_params_init and f in cam_params_init:
+            cam_params[f] = cam_params_init[f].copy()
+        else:
+            seed_pitch = pitch_seeds.get(f, 0.0) if pitch_seeds else 0.0
+            cam_params[f] = np.array([seed_pitch, 0.0, 0.0, 0.0, 0.0, 0.0])
     # van_params: [van_east, van_north, van_heading_deg]
     # east/north are unconstrained placeholders; heading is solved by AxisPairCost.
-    van_params = np.zeros(3, dtype=np.float64)
+    van_params = (np.array(van_params_init, dtype=np.float64)
+                  if van_params_init is not None
+                  else np.zeros(3, dtype=np.float64))
 
     ground_loss = pyceres.CauchyLoss(5.0)
+
+    # Track which frames have at least one residual so we only set bounds on
+    # those — Ceres rejects set_parameter_*_bound on unknown parameter blocks.
+    frames_in_problem: set = set()
 
     # Optional shared focal length parameter
     # Solver works in undistorted image space where
@@ -370,6 +394,8 @@ def solve(frames, pairwise_features, pitch_seeds=None,
             cost = _NumericDiff(functor, num_residuals=2, block_sizes=[6, 6])
             problem.add_residual_block(cost, ground_loss,
                                      [cam_params[fi], cam_params[fj]])
+        frames_in_problem.add(fi)
+        frames_in_problem.add(fj)
 
     # Van plane feature residuals (roof scatter + wheel distance)
     plane_loss = pyceres.HuberLoss(2.0)
@@ -410,6 +436,7 @@ def solve(frames, pairwise_features, pitch_seeds=None,
                                            block_sizes=[6, 3])
                         problem.add_residual_block(cost, plane_loss,
                                                  [cam_params[f], van_params])
+                    frames_in_problem.add(f)
                 # Cross-frame scatter: same physical endpoints seen in multiple frames
                 for i in range(len(pair_frames)):
                     for j in range(i + 1, len(pair_frames)):
@@ -435,6 +462,8 @@ def solve(frames, pairwise_features, pitch_seeds=None,
                                                    block_sizes=[6, 6])
                                 problem.add_residual_block(cost, plane_loss,
                                                          [cam_params[fi], cam_params[fj]])
+                            frames_in_problem.add(fi)
+                            frames_in_problem.add(fj)
             else:
                 # Single-point per frame — plain plane scatter
                 feat_frames = [(frame_by_stem[s], tuple(pt))
@@ -462,29 +491,64 @@ def solve(frames, pairwise_features, pitch_seeds=None,
                                                block_sizes=[6, 6])
                             problem.add_residual_block(cost, plane_loss,
                                                      [cam_params[fi], cam_params[fj]])
+                        frames_in_problem.add(fi)
+                        frames_in_problem.add(fj)
         logger.info("Added %d van plane feature constraint(s).", len(van_plane_features))
 
-    # Camera bounds — pitch window centred on GeoCalib seed, clamped to floor/ceiling
+    n_unconstrained = len(set(frames) - frames_in_problem)
+    if n_unconstrained:
+        logger.warning(
+            "%d frame(s) have no residuals in this solve — their camera params "
+            "will remain at initial values (no bounds set).", n_unconstrained,
+        )
+
+    # Camera bounds — only for frames that appear in at least one residual block.
+    # Calibrated frames (had manual correspondences in stage-1) get tight delta
+    # bounds so LightGlue can only make small adjustments.
+    # New frames (GeoCalib seeds only) get the normal wide bounds so they can
+    # actually move to where the geometry pulls them.
     for f in frames:
+        if f not in frames_in_problem:
+            continue
         p          = cam_params[f]
-        seed_pitch = float(p[0])   # already set from GeoCalib
-        p_lo = max(seed_pitch - config.SOLVER_PITCH_OFFSET, config.SOLVER_PITCH_FLOOR)
-        p_hi = min(seed_pitch + config.SOLVER_PITCH_OFFSET, config.SOLVER_PITCH_CEILING)
-        problem.set_parameter_lower_bound(p, 0, p_lo)
-        problem.set_parameter_upper_bound(p, 0, p_hi)
-        problem.set_parameter_lower_bound(p, 1, -config.SOLVER_YAW_OFFSET_RANGE)
-        problem.set_parameter_upper_bound(p, 1,  config.SOLVER_YAW_OFFSET_RANGE)
-        problem.set_parameter_lower_bound(p, 2, -config.SOLVER_ROLL_OFFSET_RANGE)
-        problem.set_parameter_upper_bound(p, 2,  config.SOLVER_ROLL_OFFSET_RANGE)
-        # Position correction bounds (dx, dy horizontal; dz vertical)
-        problem.set_parameter_lower_bound(p, 3, -config.SOLVER_POSITION_RANGE_H)
-        problem.set_parameter_upper_bound(p, 3,  config.SOLVER_POSITION_RANGE_H)
-        problem.set_parameter_lower_bound(p, 4, -config.SOLVER_POSITION_RANGE_H)
-        problem.set_parameter_upper_bound(p, 4,  config.SOLVER_POSITION_RANGE_H)
-        problem.set_parameter_lower_bound(p, 5, -config.SOLVER_POSITION_RANGE_V)
-        problem.set_parameter_upper_bound(p, 5,  config.SOLVER_POSITION_RANGE_V)
-        logger.debug("[%s] pitch window: [%.1f°, %.1f°]  seed=%.1f°",
-                     f.stem[-12:], p_lo, p_hi, seed_pitch)
+        is_cal     = (calibrated_frames is None) or (f in calibrated_frames)
+
+        if is_cal and delta_rotation_bound is not None:
+            # Tight window AROUND the stage-1 value
+            dr = delta_rotation_bound
+            problem.set_parameter_lower_bound(p, 0, float(p[0]) - dr)
+            problem.set_parameter_upper_bound(p, 0, float(p[0]) + dr)
+            problem.set_parameter_lower_bound(p, 1, float(p[1]) - dr)
+            problem.set_parameter_upper_bound(p, 1, float(p[1]) + dr)
+            problem.set_parameter_lower_bound(p, 2, float(p[2]) - dr)
+            problem.set_parameter_upper_bound(p, 2, float(p[2]) + dr)
+        else:
+            # Normal wide bounds centred on GeoCalib seed (or stage-1 value
+            # for new frames initialised from cam_params_init)
+            seed_pitch = float(p[0])
+            p_lo = max(seed_pitch - config.SOLVER_PITCH_OFFSET, config.SOLVER_PITCH_FLOOR)
+            p_hi = min(seed_pitch + config.SOLVER_PITCH_OFFSET, config.SOLVER_PITCH_CEILING)
+            problem.set_parameter_lower_bound(p, 0, p_lo)
+            problem.set_parameter_upper_bound(p, 0, p_hi)
+            problem.set_parameter_lower_bound(p, 1, -config.SOLVER_YAW_OFFSET_RANGE)
+            problem.set_parameter_upper_bound(p, 1,  config.SOLVER_YAW_OFFSET_RANGE)
+            problem.set_parameter_lower_bound(p, 2, -config.SOLVER_ROLL_OFFSET_RANGE)
+            problem.set_parameter_upper_bound(p, 2,  config.SOLVER_ROLL_OFFSET_RANGE)
+            logger.debug("[%s] pitch window: [%.1f°, %.1f°]  seed=%.1f°",
+                         f.stem[-12:], p_lo, p_hi, seed_pitch)
+
+        if is_cal and delta_position_bound is not None:
+            dp = delta_position_bound
+            for idx in (3, 4, 5):
+                problem.set_parameter_lower_bound(p, idx, float(p[idx]) - dp)
+                problem.set_parameter_upper_bound(p, idx, float(p[idx]) + dp)
+        else:
+            problem.set_parameter_lower_bound(p, 3, -config.SOLVER_POSITION_RANGE_H)
+            problem.set_parameter_upper_bound(p, 3,  config.SOLVER_POSITION_RANGE_H)
+            problem.set_parameter_lower_bound(p, 4, -config.SOLVER_POSITION_RANGE_H)
+            problem.set_parameter_upper_bound(p, 4,  config.SOLVER_POSITION_RANGE_H)
+            problem.set_parameter_lower_bound(p, 5, -config.SOLVER_POSITION_RANGE_V)
+            problem.set_parameter_upper_bound(p, 5,  config.SOLVER_POSITION_RANGE_V)
 
     # Focal length bounds
     if estimate_f:
