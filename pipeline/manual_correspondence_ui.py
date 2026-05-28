@@ -11,11 +11,13 @@ Navigation
 Correspondence editing
 ──────────────────────
   Left-click          Place / move this frame's point for the current
-                      in-progress correspondence
+                      in-progress or being-edited correspondence
+  Right-click         Remove this frame's point from the current
+                      in-progress or being-edited correspondence
   Enter  /  n         Finalise current correspondence (needs ≥ 2 frames)
-  e                   Pull last saved correspondence back for editing
-  d                   Delete last saved correspondence
-  c                   Clear current in-progress correspondence
+  [  /  ]             Enter edit mode on last saved; navigate older / newer
+  d                   Delete last saved correspondence (whole)
+  c                   Clear / cancel current in-progress correspondence
   s                   Write to JSON immediately
   q  /  Esc           Quit (warns on unsaved changes; press twice to force)
 """
@@ -89,7 +91,7 @@ class ManualCorrespondenceViewer:
     """
 
     WINDOW = ("Manual Correspondences  "
-              "[click=pick | Enter/n=save | [=prev ] =next | d=del | c=clear | "
+              "[click=pick | RClick=del point | Enter/n=save | [=prev ]=next | d=del corr | c=clear | "
               "s=write | R=reset | q=quit]")
 
     def __init__(self, frames: list[Frame], json_path: Path,
@@ -120,9 +122,12 @@ class ManualCorrespondenceViewer:
         # When _edit_mode is True, _edit_idx points into self._saved and
         # self._current holds the working copy of that correspondence.
         # _edit_backup holds the original so 'c' can restore it.
-        self._edit_mode   : bool             = False
-        self._edit_idx    : int              = 0
-        self._edit_backup : dict             = {}
+        # _edit_last_frame is set when the user left-clicks a frame while in
+        # edit mode; 'd' uses it to decide single-frame vs whole-corr delete.
+        self._edit_mode      : bool             = False
+        self._edit_idx       : int              = 0
+        self._edit_backup    : dict             = {}
+        self._edit_last_frame                   = None   # Frame | None
 
         # Feature type for next correspondence (T cycles)
         self._type_idx   : int       = 0
@@ -530,7 +535,8 @@ class ManualCorrespondenceViewer:
                 self._status   = "Click near a marker to select it."
             return
 
-        ft = _FEATURE_TYPES[self._type_idx]
+        ft = _FEATURE_TYPES[self._type_idx if not self._edit_mode
+                            else self._saved_types[self._edit_idx]]
         if ft[_F_PAIR]:
             # Pair mode: accumulate up to 2 points per frame
             pts = list(self._current.get(frame, []))
@@ -548,11 +554,20 @@ class ManualCorrespondenceViewer:
                 self._status = (f"Point A set in {frame.stem[-8:]}.  "
                                 f"Click same frame again for Point B.")
             self._current[frame] = pts
+            if self._edit_mode:
+                self._edit_last_frame = frame
         else:
             self._current[frame] = (px, py)
-            n = len(self._current)
-            self._status = (f"Building correspondence: {n} frame(s) marked.  "
-                            f"Click more or press Enter/n to save.")
+            if self._edit_mode:
+                self._edit_last_frame = frame
+                total = len(self._saved)
+                self._status = (f"Editing #{self._edit_idx}/{total-1}: "
+                                f"{len(self._current)} frame(s).  "
+                                f"d=del this frame  Enter=save  c=cancel")
+            else:
+                n = len(self._current)
+                self._status = (f"Building correspondence: {n} frame(s) marked.  "
+                                f"Click more or press Enter/n to save.")
         self._dirty  = True
         self._rebuild_canvas()
 
@@ -595,8 +610,9 @@ class ManualCorrespondenceViewer:
             corr = dict(self._current)
         if self._edit_mode:
             self._saved[self._edit_idx] = corr
-            self._current   = {}
-            self._edit_mode = False
+            self._current         = {}
+            self._edit_mode       = False
+            self._edit_last_frame = None
             self._dirty     = True
             self._status    = f"Correspondence #{self._edit_idx} updated.  Click any frame to start a new one."
         else:
@@ -608,68 +624,151 @@ class ManualCorrespondenceViewer:
             self._status  = f"Correspondence #{n-1} saved ({len(corr)} frame(s)).  Click any frame for the next one."
         self._rebuild_canvas()
 
+    def _type_filtered_indices(self) -> list[int]:
+        """Absolute indices into _saved that match the current type selector."""
+        return [i for i, t in enumerate(self._saved_types)
+                if t == self._type_idx]
+
+    def _load_edit_idx(self, abs_idx: int) -> None:
+        """Enter / move edit mode to the given absolute index in _saved."""
+        self._edit_idx        = abs_idx
+        self._edit_backup     = dict(self._saved[abs_idx])
+        self._current         = dict(self._saved[abs_idx])
+        self._edit_last_frame = None
+        # Type stays as-is (caller already ensured it matches)
+
+    def _edit_status(self) -> str:
+        idxs  = self._type_filtered_indices()
+        pos   = idxs.index(self._edit_idx) + 1 if self._edit_idx in idxs else "?"
+        total = len(idxs)
+        tname = _FEATURE_TYPES[self._type_idx][_F_NAME].upper()
+        return (f"Editing {tname} {pos}/{total}  "
+                f"(abs #{self._edit_idx}, {len(self._current)} frame(s))  "
+                f"[=prev  ]=next  Enter=save  c=cancel")
+
     def _action_edit_last(self) -> None:
-        # e: enter edit mode, or move to previous (older) correspondence
+        # [: enter edit mode on last of this type, or step to previous of this type
         if not self._saved:
             self._status = "Nothing to edit."; return
+        idxs = self._type_filtered_indices()
+        if not idxs:
+            tname = _FEATURE_TYPES[self._type_idx][_F_NAME].upper()
+            self._status = f"No {tname} correspondences saved yet."; return
+
         if not self._edit_mode:
             if self._current:
                 self._status = "Finish or clear the current correspondence first (c)."; return
-            self._edit_idx    = len(self._saved) - 1
-            self._edit_backup = dict(self._saved[self._edit_idx])
-            self._current     = dict(self._saved[self._edit_idx])
-            self._edit_mode   = True
+            self._load_edit_idx(idxs[-1])
+            self._edit_mode = True
         else:
+            # Auto-save current edits before moving
             updated = dict(self._current)
             if updated != self._saved[self._edit_idx]:
                 self._dirty = True
             self._saved[self._edit_idx] = updated
-            if self._edit_idx == 0:
-                self._status = "Already at oldest.  ] to go forward."
+            # Find previous in filtered list
+            try:
+                pos = idxs.index(self._edit_idx)
+            except ValueError:
+                pos = len(idxs)   # current idx no longer in filter — jump to end
+            if pos == 0:
+                self._status = (f"Already at oldest {_FEATURE_TYPES[self._type_idx][_F_NAME].upper()}.  "
+                                f"] to go forward.")
                 self._rebuild_canvas(); return
-            self._edit_idx   -= 1
-            self._edit_backup = dict(self._saved[self._edit_idx])
-            self._current     = dict(self._saved[self._edit_idx])
-        total = len(self._saved)
-        self._status = f"Editing #{self._edit_idx}/{total-1} ({len(self._current)} frame(s))  [=prev  ]=next  Enter=save  c=cancel"
+            self._load_edit_idx(idxs[pos - 1])
+
+        self._status = self._edit_status()
         self._rebuild_canvas()
 
     def _action_edit_next(self) -> None:
-        # ]: move to next (newer) correspondence while in edit mode
+        # ]: move to next of this type while in edit mode
         if not self._edit_mode:
-            self._status = "Press e first to enter edit mode."; return
+            self._status = "Press [ first to enter edit mode."; return
+        idxs = self._type_filtered_indices()
+        # Auto-save current edits before moving
         updated = dict(self._current)
         if updated != self._saved[self._edit_idx]:
             self._dirty = True
         self._saved[self._edit_idx] = updated
-        if self._edit_idx >= len(self._saved) - 1:
-            self._current   = {}
-            self._edit_mode = False
-            self._status    = "Reached newest -- edit mode exited."
+        # Find next in filtered list
+        try:
+            pos = idxs.index(self._edit_idx)
+        except ValueError:
+            pos = -1   # current idx no longer in filter — jump to start
+        if pos >= len(idxs) - 1:
+            self._current         = {}
+            self._edit_mode       = False
+            self._edit_last_frame = None
+            tname = _FEATURE_TYPES[self._type_idx][_F_NAME].upper()
+            self._status = f"Reached newest {tname} — edit mode exited."
             self._rebuild_canvas(); return
-        self._edit_idx   += 1
-        self._edit_backup = dict(self._saved[self._edit_idx])
-        self._current     = dict(self._saved[self._edit_idx])
-        total = len(self._saved)
-        self._status = f"Editing #{self._edit_idx}/{total-1} ({len(self._current)} frame(s))  [=prev  ]=next  Enter=save  c=cancel"
+        self._load_edit_idx(idxs[pos + 1])
+        self._status = self._edit_status()
         self._rebuild_canvas()
 
     def _action_delete_last(self) -> None:
         if not self._saved:
             self._status = "Nothing to delete."; return
+
         if self._edit_mode:
-            self._edit_mode = False
-            self._current   = {}
-        self._saved.pop()
-        self._dirty  = True
-        self._status = f"Deleted.  {len(self._saved)} remaining."
+            idx = self._edit_idx
+            if self._edit_last_frame is not None:
+                # User left-clicked a frame while browsing → delete just that
+                # frame's mark from the correspondence, leave the rest intact.
+                frame = self._edit_last_frame
+                if frame in self._current:
+                    del self._current[frame]
+                    self._saved[idx] = dict(self._current)
+                self._edit_last_frame = None
+                self._dirty  = True
+                total = len(self._saved)
+                self._status = (f"Removed {frame.stem[-10:]} from #{idx}.  "
+                                f"{len(self._current)} frame(s) remaining.  "
+                                f"d=del entire  Enter=save  c=cancel")
+            else:
+                # No frame was moved → delete the entire correspondence.
+                # Before deleting, compute the filtered list to find a landing target.
+                idxs = self._type_filtered_indices()
+                pos  = idxs.index(idx) if idx in idxs else None
+
+                del self._saved[idx]
+                del self._saved_types[idx]
+                self._edit_last_frame = None
+                self._dirty = True
+
+                # Rebuild filtered list after deletion (indices ≥ idx shifted by -1)
+                idxs_after = self._type_filtered_indices()
+
+                if not idxs_after:
+                    # Nothing of this type left
+                    self._edit_mode = False
+                    self._current   = {}
+                    tname = _FEATURE_TYPES[self._type_idx][_F_NAME].upper()
+                    self._status = f"Deleted. No more {tname} correspondences."
+                else:
+                    # Try previous (same position - 1 in the pre-delete list maps
+                    # to position - 1 in the post-delete list since we deleted idx).
+                    # A simpler rule: land on the item just before the deleted slot
+                    # if one exists, otherwise the first remaining item.
+                    candidate = pos - 1 if (pos is not None and pos > 0) else 0
+                    candidate = min(candidate, len(idxs_after) - 1)
+                    self._load_edit_idx(idxs_after[candidate])
+                    self._status = f"Deleted #{idx}.  " + self._edit_status()
+        else:
+            # Outside edit mode: delete the last one (quick cleanup shortcut).
+            self._saved.pop()
+            self._saved_types.pop()
+            self._dirty  = True
+            self._status = f"Deleted last.  {len(self._saved)} remaining."
+
         self._rebuild_canvas()
 
     def _action_clear_current(self) -> None:
         if self._edit_mode:
             self._saved[self._edit_idx] = dict(self._edit_backup)
-            self._current   = {}
-            self._edit_mode = False
+            self._current         = {}
+            self._edit_mode       = False
+            self._edit_last_frame = None
             self._status    = f"Correspondence #{self._edit_idx} restored.  Click any frame to start a new one."
         else:
             self._current = {}

@@ -347,15 +347,32 @@ def solve(frames, pairwise_features, pitch_seeds=None,
     problem    = pyceres.Problem()
     # Initialise camera parameters.
     # Layout: [pitch, yaw_off, roll_off, dx, dy, dz]
-    # If cam_params_init is given (stage-2), start from those values.
-    # Otherwise start from GeoCalib pitch seeds with zero offsets.
+    # Stage-1 (cam_params_init is None): zero offsets for all, let Ceres find the
+    #   solution freely from GPS + GeoCalib — this is the fast path (≈5 iterations).
+    # Stage-2 (cam_params_init is provided): calibrated frames warm-start from the
+    #   stage-1 result; NEW frames (not in cam_params_init) seed at the empirical
+    #   biases derived from the camera-deltas analysis.
+    is_stage2 = cam_params_init is not None
     cam_params = {}
     for f in frames:
         if cam_params_init and f in cam_params_init:
             cam_params[f] = cam_params_init[f].copy()
         else:
-            seed_pitch = pitch_seeds.get(f, 0.0) if pitch_seeds else 0.0
-            cam_params[f] = np.array([seed_pitch, 0.0, 0.0, 0.0, 0.0, 0.0])
+            seed_pitch = (pitch_seeds.get(f, config.SOLVER_PITCH_SEED_NEW)
+                          if pitch_seeds else config.SOLVER_PITCH_SEED_NEW)
+            if is_stage2:
+                # New frame in stage-2: seed at empirical biases
+                cam_params[f] = np.array([
+                    seed_pitch,
+                    config.SOLVER_YAW_SEED_OFFSET,  # yaw_off: pre-biased from analysis
+                    0.0,                             # roll_off: bracket is seed; range keeps it fixed
+                    config.SOLVER_DX_SEED,           # dx: empirical East bias
+                    config.SOLVER_DY_SEED,           # dy: empirical North bias
+                    config.SOLVER_DZ_SEED,           # dz: empirical altitude bias vs Z_tor
+                ])
+            else:
+                # Stage-1: zero offsets — wide free bounds do the work
+                cam_params[f] = np.array([seed_pitch, 0.0, 0.0, 0.0, 0.0, 0.0])
     # van_params: [van_east, van_north, van_heading_deg]
     # east/north are unconstrained placeholders; heading is solved by AxisPairCost.
     van_params = (np.array(van_params_init, dtype=np.float64)
@@ -523,17 +540,32 @@ def solve(frames, pairwise_features, pitch_seeds=None,
             problem.set_parameter_lower_bound(p, 2, float(p[2]) - dr)
             problem.set_parameter_upper_bound(p, 2, float(p[2]) + dr)
         else:
-            # Normal wide bounds centred on GeoCalib seed (or stage-1 value
-            # for new frames initialised from cam_params_init)
+            # Wide bounds — applies to stage-1 frames AND stage-2 new frames.
+            # Pitch always centred on GeoCalib seed (same logic in both cases).
             seed_pitch = float(p[0])
             p_lo = max(seed_pitch - config.SOLVER_PITCH_OFFSET, config.SOLVER_PITCH_FLOOR)
             p_hi = min(seed_pitch + config.SOLVER_PITCH_OFFSET, config.SOLVER_PITCH_CEILING)
             problem.set_parameter_lower_bound(p, 0, p_lo)
             problem.set_parameter_upper_bound(p, 0, p_hi)
-            problem.set_parameter_lower_bound(p, 1, -config.SOLVER_YAW_OFFSET_RANGE)
-            problem.set_parameter_upper_bound(p, 1,  config.SOLVER_YAW_OFFSET_RANGE)
-            problem.set_parameter_lower_bound(p, 2, -config.SOLVER_ROLL_OFFSET_RANGE)
-            problem.set_parameter_upper_bound(p, 2,  config.SOLVER_ROLL_OFFSET_RANGE)
+
+            if is_stage2:
+                # Stage-2 new frame: bounds centred on empirical bias seeds.
+                # Roll is fixed (range → 0); pyceres needs lb < ub, so clamp to 1e-6.
+                yaw_seed = float(p[1])
+                problem.set_parameter_lower_bound(p, 1, yaw_seed - config.SOLVER_YAW_OFFSET_RANGE)
+                problem.set_parameter_upper_bound(p, 1, yaw_seed + config.SOLVER_YAW_OFFSET_RANGE)
+                roll_seed = float(p[2])
+                roll_r = max(float(config.SOLVER_ROLL_OFFSET_RANGE), 1e-6)
+                problem.set_parameter_lower_bound(p, 2, roll_seed - roll_r)
+                problem.set_parameter_upper_bound(p, 2, roll_seed + roll_r)
+            else:
+                # Stage-1: symmetric bounds around zero; roll is free so Ceres can
+                # reach the global minimum without fighting a frozen constraint.
+                problem.set_parameter_lower_bound(p, 1, -config.SOLVER_YAW_OFFSET_RANGE)
+                problem.set_parameter_upper_bound(p, 1,  config.SOLVER_YAW_OFFSET_RANGE)
+                problem.set_parameter_lower_bound(p, 2, -config.SOLVER_STAGE1_ROLL_RANGE)
+                problem.set_parameter_upper_bound(p, 2,  config.SOLVER_STAGE1_ROLL_RANGE)
+
             logger.debug("[%s] pitch window: [%.1f°, %.1f°]  seed=%.1f°",
                          f.stem[-12:], p_lo, p_hi, seed_pitch)
 
@@ -543,12 +575,25 @@ def solve(frames, pairwise_features, pitch_seeds=None,
                 problem.set_parameter_lower_bound(p, idx, float(p[idx]) - dp)
                 problem.set_parameter_upper_bound(p, idx, float(p[idx]) + dp)
         else:
-            problem.set_parameter_lower_bound(p, 3, -config.SOLVER_POSITION_RANGE_H)
-            problem.set_parameter_upper_bound(p, 3,  config.SOLVER_POSITION_RANGE_H)
-            problem.set_parameter_lower_bound(p, 4, -config.SOLVER_POSITION_RANGE_H)
-            problem.set_parameter_upper_bound(p, 4,  config.SOLVER_POSITION_RANGE_H)
-            problem.set_parameter_lower_bound(p, 5, -config.SOLVER_POSITION_RANGE_V)
-            problem.set_parameter_upper_bound(p, 5,  config.SOLVER_POSITION_RANGE_V)
+            if is_stage2:
+                # Stage-2 new frame: centred on bias seeds, separate E / N ranges
+                dx_seed = float(p[3])
+                dy_seed = float(p[4])
+                dz_seed = float(p[5])
+                problem.set_parameter_lower_bound(p, 3, dx_seed - config.SOLVER_POSITION_RANGE_H)
+                problem.set_parameter_upper_bound(p, 3, dx_seed + config.SOLVER_POSITION_RANGE_H)
+                problem.set_parameter_lower_bound(p, 4, dy_seed - config.SOLVER_POSITION_RANGE_N)
+                problem.set_parameter_upper_bound(p, 4, dy_seed + config.SOLVER_POSITION_RANGE_N)
+                problem.set_parameter_lower_bound(p, 5, dz_seed - config.SOLVER_POSITION_RANGE_V)
+                problem.set_parameter_upper_bound(p, 5, dz_seed + config.SOLVER_POSITION_RANGE_V)
+            else:
+                # Stage-1: symmetric bounds around zero (original behaviour)
+                problem.set_parameter_lower_bound(p, 3, -config.SOLVER_POSITION_RANGE_H)
+                problem.set_parameter_upper_bound(p, 3,  config.SOLVER_POSITION_RANGE_H)
+                problem.set_parameter_lower_bound(p, 4, -config.SOLVER_POSITION_RANGE_H)
+                problem.set_parameter_upper_bound(p, 4,  config.SOLVER_POSITION_RANGE_H)
+                problem.set_parameter_lower_bound(p, 5, -config.SOLVER_POSITION_RANGE_V)
+                problem.set_parameter_upper_bound(p, 5,  config.SOLVER_POSITION_RANGE_V)
 
     # Focal length bounds
     if estimate_f:

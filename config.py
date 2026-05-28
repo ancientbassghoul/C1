@@ -52,8 +52,9 @@ UNDISTORT_SCALE = 0.6
 
 # Set True to use the HUD horizon bracket indicator for roll detection.
 # Set False to use GeoCalib roll estimates for all frames instead.
-# Default is False — bracket detection is unreliable on heavily rolled frames.
-HORIZON_INDICATOR_READING = False
+# Bracket detection is the most reliable roll source; GeoCalib is the fallback
+# for frames where detection fails (e.g. bracket obscured or N/A).
+HORIZON_INDICATOR_READING = True
 
 # Earth radius used for the local flat-Earth (ENU) approximation.
 # Valid for areas < ~10 km; this scene is well within that.
@@ -180,21 +181,40 @@ MATCH_GRID_ROWS = 8
 #   [SOLVER_PITCH_FLOOR, SOLVER_PITCH_CEILING] so no frame can land in a
 #   physically impossible orientation regardless of the GeoCalib estimate.
 #
-# Yaw offset: correction on top of the OCR compass heading.
-#   ±5° covers typical magnetometer drift and HUD rounding errors.
-# Roll offset: correction on top of the bracket-detected roll.
-#   ±1° covers residual HUD-detection error at near-level flight.
+# All other parameters (yaw, roll, position) are now seeded at the empirical
+# bias derived from the camera-deltas analysis on the 7 calibrated frames,
+# and searched ± the offset range AROUND THAT SEED (not around zero).
+# This gives new frames a much better starting point and a tighter window.
+
 SOLVER_PITCH_OFFSET  =  50.0   # ± degrees around the GeoCalib seed
 SOLVER_PITCH_FLOOR   = -90.0   # absolute minimum pitch (near-nadir clamp)
 SOLVER_PITCH_CEILING =  45.0   # absolute maximum pitch (upward-tilt clamp)
-SOLVER_YAW_OFFSET_RANGE  =  16.0   # ± degrees (widened: OCR compass can be ~15° off)
-SOLVER_ROLL_OFFSET_RANGE =   16.0   # ± degrees (widened: GeoCalib roll can be off on oblique frames)
 
-# Camera position correction bounds (metres).
-# GPS accuracy is typically ±2-5m; Blender measurements show up to ~9m error.
-# The solver is free to move each camera within this box around its GPS seed.
-SOLVER_POSITION_RANGE_H  =  9.5   # ± metres horizontal (East, North)
-SOLVER_POSITION_RANGE_V  =  1.65   # ± metres vertical (Up/altitude)
+SOLVER_YAW_OFFSET_RANGE  =  15.0   # ± degrees around yaw seed (stage-2 new frames)
+SOLVER_ROLL_OFFSET_RANGE =   0.0   # 0 = roll fixed at bracket-detected value for new frames; increase to relax
+SOLVER_STAGE1_ROLL_RANGE =  16.0   # ± degrees in stage-1 — roll is free so the solver can reach the global minimum
+
+# Position search ranges around the seeded position (not around GPS).
+SOLVER_POSITION_RANGE_H  =  10.0   # ± metres East  around seed
+SOLVER_POSITION_RANGE_N  =   5.0   # ± metres North around seed
+SOLVER_POSITION_RANGE_V  =   2.0   # ± metres vertical around seed
+
+# ── Empirical seed biases ─────────────────────────────────────────────────────
+# Derived from camera-deltas analysis on 7 manually-calibrated frames.
+# The GPS and compass readings have consistent systematic offsets vs the solved
+# camera positions and orientations.  New frames are seeded at (telemetry +
+# these offsets) so Ceres starts close to the expected solution.
+#
+#   SOLVER_YAW_SEED_OFFSET : OCR compass reads ~+6° vs true camera heading
+#   SOLVER_DX_SEED         : GPS East is ~1.4 m west of true camera position
+#   SOLVER_DY_SEED         : GPS North is ~0.6 m north of true camera position
+#   SOLVER_DZ_SEED         : camera sits ~0.9 m below Z_tor (takeoff-ref alt)
+#   SOLVER_PITCH_SEED_NEW  : fallback pitch when GeoCalib cannot estimate
+SOLVER_YAW_SEED_OFFSET   =  -6.014   # degrees applied to yaw_off initial value
+SOLVER_DX_SEED           =   1.385   # metres East
+SOLVER_DY_SEED           =  -0.600   # metres North
+SOLVER_DZ_SEED           =  -0.857   # metres (relative to Z_tor)
+SOLVER_PITCH_SEED_NEW    =  -1.6     # degrees; replaces 0° fallback for new frames
 
 # Maximum Ceres solver iterations.  Increase if the solve terminates early
 # without converging (check the summary BriefReport in the log).
