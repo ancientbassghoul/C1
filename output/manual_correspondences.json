@@ -887,9 +887,9 @@
     {
       "id": 39,
       "type": "wheel_axis",
-      "z_plane": 0.35,
+      "z_plane": 0.343,
       "is_pair": true,
-      "distance_m": 3.182,
+      "distance_m": 3.275,
       "axis": "forward",
       "points": {
         "2026-02-15_16-25-03_04681": [
@@ -967,9 +967,9 @@
     {
       "id": 40,
       "type": "roof_edge",
-      "z_plane": 1.895,
+      "z_plane": 1.94,
       "is_pair": true,
-      "distance_m": 2.204,
+      "distance_m": 1.92,
       "axis": "lateral",
       "points": {
         "2026-02-15_16-25-03_12035": [
@@ -1047,7 +1047,7 @@
     {
       "id": 41,
       "type": "roof",
-      "z_plane": 1.895,
+      "z_plane": 1.94,
       "is_pair": false,
       "points": {
         "2026-02-15_16-25-03_04752": [
@@ -1083,7 +1083,7 @@
     {
       "id": 42,
       "type": "roof",
-      "z_plane": 1.895,
+      "z_plane": 1.94,
       "is_pair": false,
       "points": {
         "2026-02-15_16-25-03_04709": [
@@ -1119,7 +1119,7 @@
     {
       "id": 43,
       "type": "roof",
-      "z_plane": 1.895,
+      "z_plane": 1.94,
       "is_pair": false,
       "points": {
         "2026-02-15_16-25-03_04752": [
@@ -1151,7 +1151,7 @@
     {
       "id": 44,
       "type": "roof",
-      "z_plane": 1.895,
+      "z_plane": 1.94,
       "is_pair": false,
       "points": {
         "2026-02-15_16-25-03_04681": [
@@ -1187,7 +1187,7 @@
     {
       "id": 45,
       "type": "roof",
-      "z_plane": 1.895,
+      "z_plane": 1.94,
       "is_pair": false,
       "points": {
         "2026-02-15_16-25-03_12035": [
@@ -1223,7 +1223,7 @@
     {
       "id": 46,
       "type": "roof",
-      "z_plane": 1.895,
+      "z_plane": 1.94,
       "is_pair": false,
       "points": {
         "2026-02-15_16-25-03_12035": [

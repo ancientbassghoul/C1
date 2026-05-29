@@ -400,6 +400,13 @@ def _global_match_filter(
                 n_in, n_out, len(result), len(pair_matches))
     return result
 
+def load_manual_pairs(frames: list) -> list[tuple]:
+    """Public wrapper — loads ground-type manual correspondences from JSON.
+    Pass this as manual_pairwise_features= to refine_pitches() to skip
+    LightGlue and solve from manual correspondences only."""
+    return _load_manual_pairs(frames)
+
+
 def _load_manual_pairs(frames: list) -> list[tuple]:
     """
     Load ground-type correspondences from MANUAL_CORRESPONDENCES_FILE and

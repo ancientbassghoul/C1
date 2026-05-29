@@ -165,22 +165,16 @@ def detect_camera_roll(raw_img: np.ndarray) -> Optional[float]:
     overlays rendered by the flight controller directly onto the video stream,
     unaffected by lens distortion.
 
-    Algorithm
-    ─────────
-    1. Crop a generous window around the image centre (±200 px) — large enough
-       to capture brackets at any roll angle including 90°.
-    2. Threshold at ≥235 to isolate pure-white HUD pixels (scene content
-       is never this bright, so no colour correction is needed).
-    3. Blank the inner ±35 px (the crosshair "+" itself).
-    4. Find connected components (blobs) and filter by area to get bracket-
-       sized blobs only.
-    5. Among all candidate blob pairs, pick the pair that is most nearly
-       opposite each other about the image centre AND most equidistant from it.
-       This is the geometric signature of the two bracket symbols.
-    6. The roll angle is the angle of the line connecting the two blob centroids,
-       normalised to (−90°, +90°].
+    Strategy (cascade — stops at first success)
+    ────────────────────────────────────────────
+    1. Two-blob:  find the most opposite, equidistant blob pair → most reliable.
+    2. Left-blob: one clean blob left of centre → angle from blob to centre.
+    3. Right-blob: one clean blob right of centre → angle from centre to blob.
 
-    Returns roll in degrees (positive = roll right) or None on failure.
+    All three methods produce the same answer when blobs are perfectly symmetric,
+    so there is no discontinuity between them.
+
+    Returns roll in degrees (positive = roll right) or None if all three fail.
     """
     h, w = raw_img.shape[:2]
     cx, cy = w // 2, h // 2
@@ -222,73 +216,97 @@ def detect_camera_roll(raw_img: np.ndarray) -> Optional[float]:
             if dist > inner:       # must be outside the blanked crosshair zone
                 candidates.append((c, dist, area))
 
-    if len(candidates) < 2:
-        logger.debug("Roll detection: fewer than 2 bracket blobs found – skip.")
-        return None
+    # ── Strategy 1: two-blob (most reliable) ─────────────────────────────────
+    if len(candidates) >= 2:
+        best_score = -1.0
+        best_pair  = None
 
-    # Find the pair that is most opposite and equidistant about the centre.
-    # Score = (−cos θ) × distance_symmetry, maximised for the ideal bracket pair.
-    #   −cos θ → 1 when the two blobs are exactly opposite (θ = 180°)
-    #   distance_symmetry → 1 when both are equidistant from centre
-    best_score = -1.0
-    best_pair  = None
+        for i in range(len(candidates)):
+            c1, d1, _ = candidates[i]
+            for j in range(i + 1, len(candidates)):
+                c2, d2, _ = candidates[j]
 
-    for i in range(len(candidates)):
-        c1, d1, _ = candidates[i]
-        for j in range(i + 1, len(candidates)):
-            c2, d2, _ = candidates[j]
+                v1 = c1 - centre
+                v2 = c2 - centre
+                n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
+                if n1 < 1e-3 or n2 < 1e-3:
+                    continue
 
-            v1 = c1 - centre
-            v2 = c2 - centre
-            n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
-            if n1 < 1e-3 or n2 < 1e-3:
-                continue
+                cos_theta     = float(np.dot(v1, v2) / (n1 * n2))
+                dist_symmetry = 1.0 - abs(d1 - d2) / max(d1, d2)
+                score         = (-cos_theta) * dist_symmetry
 
-            cos_theta      = float(np.dot(v1, v2) / (n1 * n2))
-            dist_symmetry  = 1.0 - abs(d1 - d2) / max(d1, d2)
-            score          = (-cos_theta) * dist_symmetry
+                if score > best_score:
+                    best_score = score
+                    best_pair  = (c1, c2)
 
-            if score > best_score:
-                best_score = score
-                best_pair  = (c1, c2)
+        if best_pair is not None and best_score >= 0.5:
+            c1, c2 = best_pair
+            left, right = (c1, c2) if c1[0] < c2[0] else (c2, c1)
+            angle = math.degrees(math.atan2(
+                float(right[1] - left[1]),
+                float(right[0] - left[0]),
+            ))
+            logger.debug(
+                "Roll (two-blob): %.1f°  left=[%.0f,%.0f] right=[%.0f,%.0f]  score=%.2f",
+                angle, left[0], left[1], right[0], right[1], best_score,
+            )
+            return float(angle)
 
-    # Require the two blobs to be at least roughly opposite (score > 0.5)
-    if best_pair is None or best_score < 0.5:
         logger.debug(
-            "Roll detection: no sufficiently opposite blob pair found "
-            "(best score=%.2f) – skip.", best_score,
+            "Roll two-blob failed (best score=%.2f) — trying single-blob fallback.",
+            best_score,
         )
-        return None
 
-    c1, c2 = best_pair
+    # ── Strategy 2: left blob + crosshair centre ──────────────────────────────
+    left_blobs = [(c, d, a) for c, d, a in candidates if c[0] < centre[0]]
+    if left_blobs:
+        c, dist, _ = max(left_blobs, key=lambda x: x[2])   # largest blob
+        angle = math.degrees(math.atan2(
+            float(centre[1] - c[1]),
+            float(centre[0] - c[0]),
+        ))
+        logger.debug(
+            "Roll (left-blob fallback): %.1f°  blob=[%.0f,%.0f]  dist=%.1f",
+            angle, c[0], c[1], dist,
+        )
+        return float(angle)
 
-    # Always compute vector from LEFT blob to RIGHT blob (by X coordinate).
-    # This gives a deterministic sign: positive = right blob is lower = roll right,
-    # negative = right blob is higher = roll left.
-    left, right = (c1, c2) if c1[0] < c2[0] else (c2, c1)
-    angle = math.degrees(math.atan2(
-        float(right[1] - left[1]),   # dy: positive = right is lower in image
-        float(right[0] - left[0]),   # dx: always positive (left→right)
-    ))
+    # ── Strategy 3: right blob + crosshair centre ─────────────────────────────
+    right_blobs = [(c, d, a) for c, d, a in candidates if c[0] >= centre[0]]
+    if right_blobs:
+        c, dist, _ = max(right_blobs, key=lambda x: x[2])  # largest blob
+        angle = math.degrees(math.atan2(
+            float(c[1] - centre[1]),
+            float(c[0] - centre[0]),
+        ))
+        logger.debug(
+            "Roll (right-blob fallback): %.1f°  blob=[%.0f,%.0f]  dist=%.1f",
+            angle, c[0], c[1], dist,
+        )
+        return float(angle)
 
-    logger.debug(
-        "Roll detected: %.1f°  left=[%.0f,%.0f] right=[%.0f,%.0f]  score=%.2f",
-        angle, left[0], left[1], right[0], right[1], best_score,
-    )
-    return float(angle)
+    logger.debug("Roll detection: no usable blobs found — all strategies failed.")
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
 
-def estimate_poses(frames: list[Frame], skip_bracket_roll: bool = False) -> None:
+def estimate_poses(frames: list[Frame], skip_bracket_roll: bool | None = None) -> None:
     """
     Compute position_enu, R, and gimbal_pitch_deg for every frame in-place.
+
+    skip_bracket_roll: if None (default), reads config.HORIZON_INDICATOR_READING
+      to decide. Pass True/False explicitly to override the config (e.g. from a
+      CLI flag).
 
     Frames without valid GPS/heading/altitude telemetry are skipped with a
     warning (they will not be usable for ray-casting).
     """
+    if skip_bracket_roll is None:
+        skip_bracket_roll = not config.HORIZON_INDICATOR_READING
     # ── Choose ENU origin ─────────────────────────────────────────────────
     origin_frame = next(
         (f for f in frames if f.lat is not None and f.lon is not None), None,
@@ -331,13 +349,20 @@ def estimate_poses(frames: list[Frame], skip_bracket_roll: bool = False) -> None
             logger.info("[%s] Roll from manual override: %.1f°", frame.stem, roll)
         elif not skip_bracket_roll and (detected_roll := detect_camera_roll(frame.raw)) is not None:
             roll = detected_roll
-            frame.camera_roll_deg = -roll   # bracket: image-space convention, needs negation
+            frame.camera_roll_deg = -roll
             logger.info("[%s] Roll from horizon indicator: %.1f°", frame.stem, roll)
         elif frame in geocalib:
             _, roll = geocalib[frame]
-            frame.camera_roll_deg = roll   # GeoCalib: already in camera convention, no negation
-            logger.info("[%s] Roll from GeoCalib%s: %.1f°", frame.stem,
-                        " (bracket skipped)" if skip_bracket_roll else "", roll)
+            frame.camera_roll_deg = roll
+            if skip_bracket_roll:
+                logger.info("[%s] Roll from GeoCalib: %.1f°", frame.stem, roll)
+            else:
+                logger.warning(
+                    "[%s] *** BRACKET DETECTION FAILED ON ALL STRATEGIES — "
+                    "FALLING BACK TO GEOCALIB (roll=%.1f°) — "
+                    "CHECK HUD FOR OBSTRUCTION ***",
+                    frame.stem, roll,
+                )
         else:
             roll = config.CAMERA_ROLL_DEG
             frame.camera_roll_deg = -roll

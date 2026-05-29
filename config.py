@@ -26,7 +26,7 @@ IMAGE_H = 720
 # Estimated fisheye focal length (pixels).  For a ~140° diagonal-FOV lens
 # with equidistant projection: f ≈ diag / (2 * FOV_rad) ≈ 660.
 # Adjust in ±50 px increments.
-FOCAL_LENGTH = 651.0
+FOCAL_LENGTH = 651.92
 
 # Principal point – almost always the image centre.
 CX = IMAGE_W / 2.0   # 640.0
