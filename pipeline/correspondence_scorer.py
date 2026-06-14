@@ -1,59 +1,63 @@
 """
 pipeline/correspondence_scorer.py – Quality scoring for manual correspondences.
 
-Two complementary scores per correspondence
-────────────────────────────────────────────
-APPEARANCE (0–1)
-    For each pair of frames in a correspondence, extract the SuperPoint
-    descriptor of the nearest detected keypoint to the manually-picked
-    location, then compute cosine similarity between the two descriptors.
-    Average over all frame pairs → overall appearance score.
+Replaces SuperPoint descriptor matching with CLIP visual-embedding cosine
+similarity.  For each correspondence, a square crop centred on each
+manually-picked point is embedded with the CLIP vision encoder.  Cosine
+similarity between all frame-pair embeddings is averaged to produce the
+per-correspondence appearance score.
 
-    High score = patches look like the same feature to SuperPoint.
-    Low score  = patches look different, possibly a blunder — or just a
-                 large viewpoint change (oblique drone → expected).
+The CLIP model is loaded once, used, then torn down (del + empty_cache) so
+that subsequent pipeline steps can load MASt3R without OOM.
 
-    When no SuperPoint keypoint falls within SCORE_SNAP_RADIUS pixels of
-    a manually-picked point the score for that pair is marked None (shown
-    as grey in the viewer).
-
-Scores are written back into the same JSON that the manual picker uses,
-under a "scores" key on each correspondence entry, so they persist between
-runs and are immediately visible in the viewer without re-scoring.
-
-Public API
-──────────
+Public API (unchanged — --show-scores viewer uses this directly):
     score_correspondences(frames, json_path) -> dict[int, float | None]
-        Compute / refresh scores for all correspondences in json_path.
-        Returns {correspondence_id: score}.
 """
 
 from __future__ import annotations
 
+import gc
 import json
 import logging
 from itertools import combinations
 from pathlib import Path
 from typing import Optional
 
+import cv2
 import numpy as np
+from PIL import Image
 
 from pipeline.frame import Frame
 import config
 
 logger = logging.getLogger(__name__)
 
-# Max pixel distance from a manually-picked point to the nearest SuperPoint
-# keypoint for the descriptor to be considered valid.
-SCORE_SNAP_RADIUS = 25.0
+CROP_HALF_SIZE = 48   # half-width of the patch crop in pixels
 
 
 def _cosine(a: np.ndarray, b: np.ndarray) -> float:
     """Cosine similarity ∈ [-1, 1] clamped to [0, 1]."""
-    na, nb = np.linalg.norm(a), np.linalg.norm(b)
+    na, nb = float(np.linalg.norm(a)), float(np.linalg.norm(b))
     if na < 1e-9 or nb < 1e-9:
         return 0.0
     return float(np.clip(np.dot(a, b) / (na * nb), 0.0, 1.0))
+
+
+def _crop_patch(img_bgr: np.ndarray, cx: float, cy: float, half: int) -> Optional[Image.Image]:
+    """Crop a (2*half) × (2*half) patch centred on (cx, cy) from a BGR image.
+
+    Returns None if the patch would be entirely outside the image.
+    """
+    h, w = img_bgr.shape[:2]
+    x1 = max(0, int(round(cx)) - half)
+    y1 = max(0, int(round(cy)) - half)
+    x2 = min(w, int(round(cx)) + half)
+    y2 = min(h, int(round(cy)) + half)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    patch_bgr = img_bgr[y1:y2, x1:x2]
+    patch_rgb = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2RGB)
+    return Image.fromarray(patch_rgb)
 
 
 def score_correspondences(
@@ -61,11 +65,11 @@ def score_correspondences(
     json_path : Path,
 ) -> dict[int, Optional[float]]:
     """
-    Compute appearance scores for all correspondences in *json_path* and
-    write the results back into the file.
+    Compute CLIP-based appearance scores for all correspondences in *json_path*
+    and write the results back into the file.
 
-    Returns {id: score} where score is None when descriptors could not be
-    extracted (no SuperPoint keypoint near the picked location in ≥1 frame).
+    Returns {id: score} where score is None when no patch could be extracted
+    for at least one frame in a pair.
     """
     json_path = Path(json_path)
     if not json_path.exists():
@@ -80,99 +84,101 @@ def score_correspondences(
 
     by_stem = {f.stem: f for f in frames}
 
-    # ── Extract SuperPoint keypoints + descriptors for every relevant frame ───
-    import pipeline.feature_matcher as fm
+    # ── Load CLIP ─────────────────────────────────────────────────────────────
     import torch
-    from lightglue.utils import rbd
+    from transformers import CLIPModel, CLIPProcessor
 
-    fm._load_models()
-    device      = fm._device
-    device_type = device.type
+    logger.info("Loading CLIP model for correspondence scoring …")
+    clip_model = CLIPModel.from_pretrained(
+        config.CLIP_MODEL,
+        cache_dir=config.MODEL_CACHE_DIR,
+    )
+    clip_proc  = CLIPProcessor.from_pretrained(
+        config.CLIP_MODEL,
+        cache_dir=config.MODEL_CACHE_DIR,
+    )
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    clip_model = clip_model.to(device).eval()
 
-    # Gather which frames actually appear in the correspondences
-    needed_stems: set[str] = set()
-    for entry in correspondences:
-        needed_stems.update(entry.get("points", {}).keys())
-
-    needed_frames = [f for f in frames if f.stem in needed_stems]
-    logger.info("Scoring: running SuperPoint on %d frame(s)…", len(needed_frames))
-
-    # frame → (kps (N,2) float32, descs (N,256) float32)
-    frame_features: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-
-    for f in needed_frames:
-        if f.undistorted is None:
-            continue
-        t = fm._to_tensor(f.undistorted, device)
-        with torch.autocast(device_type=device_type,
-                            enabled=(device_type == "cuda")):
-            with torch.no_grad():
-                feats = fm._extractor.extract(t)
-        feats_rb = rbd(feats)
-        kps   = feats_rb["keypoints"].cpu().numpy()    # (N, 2)
-        descs = feats_rb["descriptors"].cpu().numpy()  # (N, D)
-        frame_features[f.stem] = (kps, descs)
-        logger.debug("  %s: %d keypoints", f.stem[-12:], len(kps))
+    def _embed(pil_img: Image.Image) -> np.ndarray:
+        inputs = clip_proc(images=pil_img, return_tensors="pt").to(device)
+        with torch.no_grad():
+            feat = clip_model.get_image_features(**inputs)
+            feat = feat / feat.norm(dim=-1, keepdim=True)
+        return feat.squeeze(0).cpu().numpy()
 
     # ── Score each correspondence ─────────────────────────────────────────────
     scores: dict[int, Optional[float]] = {}
 
     for entry in correspondences:
         corr_id = int(entry["id"])
-        points  = entry.get("points", {})   # {stem: [x, y]}
+        points  = entry.get("points", {})   # {stem: [x, y]} or {stem: [[x,y],[x,y]]}
 
-        # Resolve descriptors at each picked location
-        descs_per_frame: dict[str, Optional[np.ndarray]] = {}
-        for stem, (px, py) in points.items():
-            if stem not in frame_features:
-                descs_per_frame[stem] = None
+        # For pair-type entries (wheel_axis, roof_edge), use the first point only
+        embeds_per_frame: dict[str, Optional[np.ndarray]] = {}
+        for stem, pts_val in points.items():
+            f = by_stem.get(stem)
+            if f is None or f.undistorted is None:
+                embeds_per_frame[stem] = None
                 continue
-            kps, descs = frame_features[stem]
-            if len(kps) == 0:
-                descs_per_frame[stem] = None
-                continue
-            dists   = np.linalg.norm(kps - [px, py], axis=1)
-            nearest = int(np.argmin(dists))
-            if dists[nearest] > SCORE_SNAP_RADIUS:
-                descs_per_frame[stem] = None
-                logger.debug(
-                    "  corr %d / %s: no keypoint within %.0fpx "
-                    "(nearest=%.1fpx)",
-                    corr_id, stem[-8:], SCORE_SNAP_RADIUS, dists[nearest]
-                )
+
+            # Support both single [x,y] and pair [[x,y],[x,y]]
+            if isinstance(pts_val[0], (list, tuple)):
+                px, py = float(pts_val[0][0]), float(pts_val[0][1])
             else:
-                descs_per_frame[stem] = descs[nearest]
+                px, py = float(pts_val[0]), float(pts_val[1])
 
-        # Pairwise cosine similarity across all frame pairs
-        stems   = list(points.keys())
-        sims    : list[float] = []
-        pair_info: list[dict] = []
+            patch = _crop_patch(f.undistorted, px, py, CROP_HALF_SIZE)
+            if patch is None:
+                embeds_per_frame[stem] = None
+                logger.debug("  corr %d / %s: patch out of bounds at (%.0f, %.0f)",
+                             corr_id, stem[-8:], px, py)
+            else:
+                embeds_per_frame[stem] = _embed(patch)
+
+        # Pairwise cosine similarities
+        stems     = list(points.keys())
+        sims:      list[float] = []
+        pair_info: list[dict]  = []
 
         for sa, sb in combinations(stems, 2):
-            da, db = descs_per_frame.get(sa), descs_per_frame.get(sb)
-            if da is None or db is None:
+            ea = embeds_per_frame.get(sa)
+            eb = embeds_per_frame.get(sb)
+            if ea is None or eb is None:
                 pair_info.append({"frames": [sa, sb], "similarity": None})
                 continue
-            sim = _cosine(da, db)
+            sim = _cosine(ea, eb)
             sims.append(sim)
             pair_info.append({"frames": [sa, sb], "similarity": round(sim, 4)})
 
         overall = float(np.mean(sims)) if sims else None
         scores[corr_id] = overall
 
-        level = "good" if overall and overall > 0.6 else ("ok" if overall and overall > 0.35 else "poor")
-        logger.info("  Correspondence %2d: appearance=%-5s  score=%s  (%d pairs)",
-                    corr_id,
-                    level,
-                    f"{overall:.3f}" if overall is not None else "N/A",
-                    len(sims))
+        level = ("good" if overall and overall > 0.6
+                 else "ok"   if overall and overall > 0.35
+                 else "poor")
+        logger.info(
+            "  Correspondence %2d: appearance=%-5s  score=%s  (%d pairs)",
+            corr_id,
+            level,
+            f"{overall:.3f}" if overall is not None else "N/A",
+            len(sims),
+        )
 
         entry["scores"] = {
-            "appearance" : round(overall, 4) if overall is not None else None,
-            "pairs"      : pair_info,
+            "appearance": round(overall, 4) if overall is not None else None,
+            "pairs":      pair_info,
         }
 
     # Write scores back into the JSON
     json_path.write_text(json.dumps(data, indent=2))
     logger.info("Scores written to %s", json_path)
+
+    # ── Tear down CLIP to free VRAM ───────────────────────────────────────────
+    del clip_model, clip_proc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    logger.info("CLIP model released.")
+
     return scores

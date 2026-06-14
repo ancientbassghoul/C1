@@ -2,7 +2,7 @@ import argparse, sys, os, json, math
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 def collect_data(frames_dir, out_dir, calculate_orientation=False, manual_only=False,
-                 enhance=False, height_mode='tor', feature_matcher_debug=False):
+                 height_mode='tor'):
     import config
     import cv2
     from pipeline.frame     import load_frames
@@ -30,14 +30,13 @@ def collect_data(frames_dir, out_dir, calculate_orientation=False, manual_only=F
         )
 
     if calculate_orientation or manual_only:
-        from pipeline.detect_van    import VanDetector
-        from pipeline.feature_matcher import refine_pitches, load_manual_pairs, \
-                                             set_enhance, set_debug
-        set_enhance(enhance)
-        set_debug(feature_matcher_debug)
+        from pipeline.detect_anchor  import detect_anchor
+        from pipeline.feature_matcher import refine_pitches
+
         # Apply chosen height to position_enu before optimizer runs
         for f in frames:
-            if f.position_enu is None: continue
+            if f.position_enu is None:
+                continue
             alt_ref = f.alt_takeoff_ref_m or 0.0
             alt_agl = f.alt_agl_m         or 0.0
             if height_mode == 'avg':
@@ -47,17 +46,15 @@ def collect_data(frames_dir, out_dir, calculate_orientation=False, manual_only=F
             else:
                 f.position_enu[2] = alt_agl
 
-        if manual_only:
-            # Skip LightGlue — solve from manual correspondences JSON only.
-            manual_pairs = load_manual_pairs(frames)
-            print(f'Running manual-only orientation solver ({len(manual_pairs)} ground pairs)...')
-            refine_pitches(frames, manual_pairwise_features=manual_pairs)
-        else:
-            detector   = VanDetector()
-            detections = detector.detect_all(frames)
-            van_bboxes = {f.stem: bbox for f, bbox in detections.items()}
-            print('Running orientation solver (LightGlue + manual)...')
-            refine_pitches(frames, van_bboxes=van_bboxes)
+        print('Running Qwen VL + CLIP anchor detection …')
+        anchor_result = detect_anchor(frames)
+
+        print('Running MASt3R-SfM + Ceres orientation solver …')
+        refine_pitches(
+            frames,
+            anchor_result=anchor_result,
+            use_manual_features=manual_only,
+        )
 
     origin = next(((f.lat, f.lon) for f in frames if f.lat is not None), None)
     rows = []
@@ -525,18 +522,13 @@ if __name__ == '__main__':
     parser.add_argument('--frames_dir', required=True)
     parser.add_argument('--calculate-orientation', action='store_true',
                         dest='calculate_orientation',
-                        help='Run full orientation solver (LightGlue + manual correspondences) before export.')
+                        help='Run MASt3R-SfM + Ceres orientation solver before export.')
     parser.add_argument('--manual-only', action='store_true',
                         dest='manual_only',
-                        help='Run orientation solver using manual correspondences JSON only (no LightGlue). '
-                             'Faster and deterministic; requires a populated manual_correspondences.json.')
+                        help='Run orientation solver using manual correspondences JSON as '
+                             'additional high-weight residuals alongside MASt3R observations.')
     parser.add_argument('--height', choices=['agl','avg','tor'], default='tor',
                         help='Camera Z: tor=takeoff_ref (default), agl=AGL only, avg=average both.')
-    parser.add_argument('--enhance', action='store_true',
-                        help='Enable CLAHE+unsharp preprocessing before LightGlue (off by default).')
-    parser.add_argument('--feature-matcher-debug', action='store_true',
-                        dest='feature_matcher_debug',
-                        help='Save annotated match images to {out_dir}/debug/ for every matched frame pair.')
     parser.add_argument('--out_dir',    required=True,
                         help='Directory to save undistorted images and blender_scene.py')
     args = parser.parse_args()
@@ -544,8 +536,7 @@ if __name__ == '__main__':
     data, van_bbox = collect_data(args.frames_dir, args.out_dir,
                         calculate_orientation=args.calculate_orientation,
                         manual_only=args.manual_only,
-                        enhance=args.enhance, height_mode=args.height,
-                        feature_matcher_debug=args.feature_matcher_debug)
+                        height_mode=args.height)
 
     print(f"{len(data)} frame(s):")
     for d in data:

@@ -52,30 +52,16 @@ UNDISTORT_SCALE = 0.6
 
 # Set True to use the HUD horizon bracket indicator for roll detection.
 # Set False to use GeoCalib roll estimates for all frames instead.
-# Bracket detection is the most reliable roll source; GeoCalib is the fallback
-# for frames where detection fails (e.g. bracket obscured or N/A).
 HORIZON_INDICATOR_READING = True
 
 # Earth radius used for the local flat-Earth (ENU) approximation.
-# Valid for areas < ~10 km; this scene is well within that.
 EARTH_RADIUS_M = 6_371_000.0
 
 # ── Gimbal pitch overrides ────────────────────────────────────────────────────
-# The orientation solver (feature_matcher.py) refines pitch automatically.
-# Use these overrides only for frames where the solver cannot converge —
-# e.g. a frame with no usable ground features and no overlap with other frames.
-# Key = filename stem (no extension).
-#
-# Example:
-#   GIMBAL_PITCH_OVERRIDES = {
-#       "2026-02-15_16-35-56_06892": -15.0,
-#       "2026-02-15_16-25-03_04569": -8.0,
-#   }
+# Use only for frames where the solver cannot converge.
 GIMBAL_PITCH_OVERRIDES: dict[str, float] = {}
 
 # ── Camera roll overrides ─────────────────────────────────────────────────────
-# Roll is detected automatically from HUD bracket indicators.
-# Override per frame if detection gives wrong results.
 CAMERA_ROLL_DEG = 0.0
 CAMERA_ROLL_OVERRIDES: dict[str, float] = {}
 
@@ -86,7 +72,6 @@ OCR_LANGUAGES = ["en"]
 OCR_GPU       = True    # Set True if a CUDA GPU is available.
 
 # Pixel crop windows for each telemetry field [row_start, row_end, col_start, col_end].
-# These match the HUD layout visible in the provided sample frames.
 OCR_CROP_LAT_LON = (55,  135, 0,   290)   # "LAT: xx.xxx / LON: xx.xxx" (top-left)
 OCR_CROP_HEADING = (5,   70,  510, 790)   # Large heading number (top-centre)
 OCR_CROP_ALT     = (640, 718, 840, 1160)  # "XX.X  M  XX.X  M" (bottom-right)
@@ -97,21 +82,16 @@ OCR_CROP_ALT     = (640, 718, 840, 1160)  # "XX.X  M  XX.X  M" (bottom-right)
 OUTPUT_DIR = "./output"
 
 # Fixed ground plane height in the shared ENU coordinate frame (metres).
-# The terrain is flat; this single value is used for all ray-ground
-# intersections in both the reprojection viewer and the Ceres solver.
-# Set to 0.0 — the ENU origin sits on the ground at the takeoff point.
 GROUND_Z_M = 0.0
 
 # Path where the manual correspondence picker saves / loads its JSON file.
 MANUAL_CORRESPONDENCES_FILE = "./output/manual_correspondences.json"
 
-# Path where the automatic LightGlue matches are saved after each pipeline run.
-# Saved by default so --show-scores can inspect them alongside manual picks.
+# Path where MASt3R automatic matches are saved after --run-matcher-only.
 AUTO_MATCHES_FILE = "./output/auto_matches.json"
 
-# Weight of each manually-picked correspondence relative to a LightGlue match
-# in the Ceres solver.  10 means one hand-picked point counts as 10 automatic
-# matches.  Raise if the solver ignores manual picks; lower if they over-dominate.
+# Weight of each manually-picked correspondence relative to a MASt3R match
+# in the Ceres solver.
 MANUAL_CORRESPONDENCE_WEIGHT = 10.0
 
 # Radius of the reprojection marker drawn on frames (pixels, in undistorted space).
@@ -121,228 +101,32 @@ MARKER_COLOR_DST = (0, 60,  220)  # Blue   – reprojected point
 MARKER_THICKNESS = 3
 
 # ─────────────────────────────────────────────────────────────────────────────
-# VAN DETECTION
-# ─────────────────────────────────────────────────────────────────────────────
-# Confidence threshold for GroundingDINO van detection (0–1).
-# Detections below this score are discarded and the white-blob fallback is used.
-YOLO_CONF_THRESH = 0.15
-
-# Minimum white-blob area (pixels²) for the fallback blob detector.
-# Increase if small bright patches (glare, HUD elements) cause false positives.
-VAN_BLOB_MIN_AREA = 200
-
-# ─────────────────────────────────────────────────────────────────────────────
 # VAN GEOMETRY
 # ─────────────────────────────────────────────────────────────────────────────
-# Physical dimensions used by the manual van-feature correspondences.
-# These are the only van geometry values consumed by the solver — the
-# bbox-based 3-D corner approach has been removed in favour of manually-picked
-# wheel centres, roof edge, and roof points.
-VAN_WIDTH_M    = 1.92   # lateral (left–right) wheel centre distance
-VAN_HEIGHT_M   = 1.94   # exterior roof height above ground
-VAN_WHEELBASE_M = 3.275  # front-to-rear wheel centre distance
+# Physical dimensions consumed by the manual van-feature correspondences
+# (AxisPairCost, roof_plane residuals in the Ceres solver).
+VAN_WIDTH_M     = 1.92    # lateral (left–right) wheel centre distance
+VAN_HEIGHT_M    = 1.94    # exterior roof height above ground
+VAN_WHEELBASE_M = 3.275   # front-to-rear wheel centre distance
 WHEEL_RADIUS_M  = 0.343   # wheel centre height above ground
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GEOCALIB
 # ─────────────────────────────────────────────────────────────────────────────
 # GeoCalib estimates gimbal pitch from a single undistorted frame using
-# learned line/vanishing-point detection.  Used as the initial pitch seed
-# for each camera before the Ceres orientation solver refines it.
-# Set False to use 0° seed for all frames (faster startup, worse convergence).
+# learned line/vanishing-point detection.  Used as pitch seed before
+# MASt3R-SfM camera poses are available.
 GEOCALIB_ENABLED = True
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FEATURE MATCHING
+# HUD MASKING
 # ─────────────────────────────────────────────────────────────────────────────
-# Spatial grid for match subsampling.  After LightGlue matching and RANSAC,
-# the ground region is divided into MATCH_GRID_COLS × MATCH_GRID_ROWS cells
-# and at most one match is kept per cell.  This ensures spatial diversity and
-# limits matches to at most MATCH_GRID_COLS × MATCH_GRID_ROWS per frame pair.
+# After undistortion, these regions are painted solid black [0,0,0].
+# MASt3R's transformer assigns zero confidence to zero-entropy black regions,
+# excluding HUD pixels from feature matching automatically.
 #
-# Spatial deduplication threshold for the global multi-frame-aware filter
-# (pixels, undistorted image space).  Two match endpoints closer than this
-# are considered the same physical point.  Increase to be more aggressive
-# about removing near-duplicates; decrease to keep spatially similar matches.
-MATCH_SPATIAL_DEDUP_THRESH = 15.0
-
-# Grid subsampling is no longer used — replaced by _global_match_filter().
-# These values are kept for reference but have no effect.
-MATCH_GRID_COLS = 10
-MATCH_GRID_ROWS = 8
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ORIENTATION SOLVER
-# ─────────────────────────────────────────────────────────────────────────────
-# Per-camera bounds for the pyceres joint optimisation.
-#
-# Pitch window: Ceres searches ± SOLVER_PITCH_OFFSET degrees around the
-#   GeoCalib seed for each frame.  The result is further clamped to
-#   [SOLVER_PITCH_FLOOR, SOLVER_PITCH_CEILING] so no frame can land in a
-#   physically impossible orientation regardless of the GeoCalib estimate.
-#
-# All other parameters (yaw, roll, position) are now seeded at the empirical
-# bias derived from the camera-deltas analysis on the 7 calibrated frames,
-# and searched ± the offset range AROUND THAT SEED (not around zero).
-# This gives new frames a much better starting point and a tighter window.
-
-SOLVER_PITCH_OFFSET  =  50.0   # ± degrees around the GeoCalib seed
-SOLVER_PITCH_FLOOR   = -90.0   # absolute minimum pitch (near-nadir clamp)
-SOLVER_PITCH_CEILING =  45.0   # absolute maximum pitch (upward-tilt clamp)
-
-SOLVER_YAW_OFFSET_RANGE  =  15.0   # ± degrees around yaw seed (stage-2 new frames)
-SOLVER_ROLL_OFFSET_RANGE =   0.0   # 0 = roll fixed at bracket-detected value for new frames; increase to relax
-SOLVER_STAGE1_ROLL_RANGE =  16.0   # ± degrees in stage-1 — roll is free so the solver can reach the global minimum
-
-# Position search ranges around the seeded position (not around GPS).
-SOLVER_POSITION_RANGE_H  =  10.0   # ± metres East  around seed
-SOLVER_POSITION_RANGE_N  =   5.0   # ± metres North around seed
-SOLVER_POSITION_RANGE_V  =   2.0   # ± metres vertical around seed
-
-# ── Empirical seed biases ─────────────────────────────────────────────────────
-# Derived from camera-deltas analysis on 7 manually-calibrated frames.
-# The GPS and compass readings have consistent systematic offsets vs the solved
-# camera positions and orientations.  New frames are seeded at (telemetry +
-# these offsets) so Ceres starts close to the expected solution.
-#
-#   SOLVER_YAW_SEED_OFFSET : OCR compass reads ~+6° vs true camera heading
-#   SOLVER_DX_SEED         : GPS East is ~1.4 m west of true camera position
-#   SOLVER_DY_SEED         : GPS North is ~0.6 m north of true camera position
-#   SOLVER_DZ_SEED         : camera sits ~0.9 m below Z_tor (takeoff-ref alt)
-#   SOLVER_PITCH_SEED_NEW  : fallback pitch when GeoCalib cannot estimate
-SOLVER_YAW_SEED_OFFSET   =  -6.014   # degrees applied to yaw_off initial value
-SOLVER_DX_SEED           =   1.385   # metres East
-SOLVER_DY_SEED           =  -0.600   # metres North
-SOLVER_DZ_SEED           =  -0.857   # metres (relative to Z_tor)
-SOLVER_PITCH_SEED_NEW    =  -1.6     # degrees; replaces 0° fallback for new frames
-
-# Maximum Ceres solver iterations.  Increase if the solve terminates early
-# without converging (check the summary BriefReport in the log).
-SOLVER_MAX_ITERATIONS = 200
-
-# ── Two-stage auto feature matching ──────────────────────────────────────────
-# Stage 1: manual-only solve (fast, reliable anchor).
-# Stage 2: manual + LightGlue matches that survive a reprojection filter.
-#
-# LIGHTGLUE_FILTER_THRESHOLD_PX  — max reprojection error (px) a LightGlue
-#   match may have under the stage-1 solution to be kept for stage 2.
-#   Tighter = fewer but cleaner matches.  Start at 20, tighten to 10 if
-#   stage-2 results still look bad.
-#
-# STAGE2_ROTATION_BOUND_DEG / STAGE2_POSITION_BOUND_M — how far stage-2 is
-#   allowed to move from the stage-1 solution.  These are tight by design:
-#   the filtered LightGlue features should only need small corrections.
-LIGHTGLUE_FILTER_THRESHOLD_PX = 20.0   # both frames calibrated
-LIGHTGLUE_MIXED_THRESHOLD_PX  = 60.0   # one frame calibrated, one new
-STAGE2_ROTATION_BOUND_DEG     =  3.0   # ± degrees around stage-1 value
-STAGE2_POSITION_BOUND_M       =  5.0   # ± metres around stage-1 value
-
-# Set to False to skip the manual-correspondence stage-1 anchor even when
-# MANUAL_CORRESPONDENCES_FILE exists.  Useful for testing pure auto matching.
-USE_MANUAL_ANCHOR = True
-
-# ── Focal length estimation ──────────────────────────────────────────────────
-# Set True to add focal length as a free parameter in the Ceres solve.
-# Requires good manual correspondences spanning frames at different altitudes.
-# When True, the solved value is logged — update FOCAL_LENGTH in config.py
-# manually after a successful solve, then re-run with this set back to False.
-ESTIMATE_FOCAL_LENGTH = False
-
-# Search range as a fraction of FOCAL_LENGTH (e.g. 0.22 → ±22%).
-# [660 × 0.78, 660 × 1.22] = [515, 805] for the default 660px seed.
-FOCAL_LENGTH_RANGE = 0.22
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CAMERA POSE OVERRIDES
-# ─────────────────────────────────────────────────────────────────────────────
-# Manually calibrated camera poses (e.g. from Blender adjustment).
-# Used when --cameras-init-from-config is passed to raycast.py or
-# export_blender.py.  Key = last 5 digits of the frame filename stem.
-# Values:  x, y, z     – ENU position in metres
-#          heading      – compass bearing in degrees (0=N, 90=E, clockwise)
-#          pitch        – degrees, negative = looking down
-#          roll         – degrees, positive = roll right
-#
-# Leave empty ({}) to use GPS + GeoCalib for all frames.
-CAMERA_POSE_OVERRIDES: dict[str, dict] = {
-    '04681': {'x':    0.000, 'y':    0.000, 'z':    4.100,
-              'heading':  145.40, 'pitch':    1.98, 'roll':    7.87},
-    '04709': {'x':    8.225, 'y':   -9.110, 'z':    4.700,
-              'heading':  152.00, 'pitch':   -0.05, 'roll':   16.41},
-    '04752': {'x':   20.634, 'y':  -18.583, 'z':    6.717,
-              'heading':  207.00, 'pitch':   -4.17, 'roll':   16.93},
-    '07849': {'x':   23.477, 'y':   24.828, 'z':   13.600,
-              'heading':  181.00, 'pitch':   -2.67, 'roll':    1.34},
-    '10474': {'x':   22.043, 'y':   18.952, 'z':   14.500,
-              'heading':  176.00, 'pitch':    1.50, 'roll':   -0.53},
-    '10671': {'x':   25.897, 'y':   12.343, 'z':   14.800,
-              'heading':  236.00, 'pitch':   -1.93, 'roll':    0.34},
-    '12035': {'x':   28.989, 'y':  -18.239, 'z':   21.300,
-              'heading':  226.40, 'pitch':  -30.79, 'roll':   -3.03},
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# HSV GROUND MASK  (experimental — see --preview-hsv-masks)
-# ─────────────────────────────────────────────────────────────────────────────
-# Alternative to GroundingDINO+SAM for exclusion masking.
-# Uses HSV colour thresholding to identify sky and vegetation.
-# All values in OpenCV HSV space: H 0-180, S 0-255, V 0-255.
-#
-# Each range is ((H_lo, S_lo, V_lo), (H_hi, S_hi, V_hi)).
-# Multiple ranges are OR-combined.  Add more entries to cover edge cases
-# (e.g. orange sunset sky, dark shadowed vegetation).
-#
-# Tune with --preview-hsv-masks — iterates in seconds, no model inference.
-
-# Sky — blue sky + white/hazy sky separately
-HSV_SKY_RANGES = [
-    (( 95,   0, 130), (135, 110, 255)),   # blue sky
-    ((  0,   0, 175), (180,  45, 255)),   # white / hazy / overcast sky
-]
-
-# Vegetation — green fields, trees, shrubs
-HSV_VEG_RANGES = [
-    # (( 30,  45,  25), ( 90, 255, 220)),   # green vegetation
-    # ((32, 173, 61), (30, 179, 145)),
-    ((25, 50, 25), (52, 255, 200)),
-]
-
-# Morphological cleanup kernel size (pixels) applied after HSV thresholding.
-# Larger = smoother masks but blurs edges.
-HSV_MORPH_KERNEL = 7
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ROLL DETECTION
-# ─────────────────────────────────────────────────────────────────────────────
-# Area bounds (pixels²) for white connected-component blobs to be considered
-# a HUD bracket symbol.  Too small = noise;  too large = HUD banner or glare.
-ROLL_BRACKET_MIN_AREA = 80
-ROLL_BRACKET_MAX_AREA = 2500
-
-# ─────────────────────────────────────────────────────────────────────────────
-# GROUND MASK  (GroundedSAM)
-# ─────────────────────────────────────────────────────────────────────────────
-# Root of your Grounded-Segment-Anything clone.  All model paths are derived
-# from this single directory — no other paths need to be set.
-#
-# Expected layout (standard repo clone):
-#   <GROUNDED_SAM_DIR>/
-#     sam_vit_h_4b8939.pth               ← SAM ViT-H weights
-#     groundingdino_swint_ogc.pth        ← GroundingDINO weights
-#     GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py
-GROUNDED_SAM_DIR = r"D:\EXTEND\Grounded-Segment-Anything"
-
-# ── HUD regions (raw-frame pixel coordinates) ────────────────────────────────
-# Each entry is (y1, y2, x1, x2) in the original 1280×720 RAW frame.
-# These rectangles are undistorted geometrically at runtime — no ML involved.
-# The four corners of each box are pushed through cv2.fisheye.undistortPoints
-# (same camera model as undistort.py) and filled as a convex polygon.
-#
-# Defined from frame 07849 (representative HUD layout for this flight).
-# Do NOT include the centre horizon brackets or crosshair — those overlap
-# real-world content and are better left unmasked.
-#
-# Format: (y1, y2, x1, x2)  — top-row, bottom-row, left-col, right-col
+# Each entry is (y1, y2, x1, x2) in the UNDISTORTED frame coordinate space.
+# Format: (top-row, bottom-row, left-col, right-col)
 HUD_REGIONS = [
     # Top-left: status icons (record dot, power, motor RPM, camera icon)
     (  0,  72,   0,  200),
@@ -364,21 +148,92 @@ HUD_REGIONS = [
     (633, 720,1170, 1280),
 ]
 
-# ── Positive ground prompt ───────────────────────────────────────────────────
-# GroundingDINO + SAM detects pixels that ARE ground.
-# Intersected with the exclusion mask — a pixel must be positively identified
-# as ground AND not identified as an exclusion to survive.
-# If nothing is detected (e.g. near-nadir frame), falls back to exclusion-only.
-# GROUND_INCLUDE_PROMPT         = "soil . dirt . ground . track . mud . path . bare earth"
-GROUND_INCLUDE_PROMPT         = "soil . dirt . ground . track . mud . path . bare earth"
-GROUND_INCLUDE_BOX_THRESHOLD  = 0.336
-GROUND_INCLUDE_TEXT_THRESHOLD = 0.336
+# ─────────────────────────────────────────────────────────────────────────────
+# MODEL PATHS & CACHING
+# ─────────────────────────────────────────────────────────────────────────────
+# All models download here — never to the pod's /root/.cache (wiped on pod stop).
+# models/ is in .gitignore.
+MODEL_CACHE_DIR = "./models"
 
-# ── Exclusion prompt ──────────────────────────────────────────────────────────
-# GroundingDINO + SAM detects pixels that are NOT ground.
-# Includes HUD text / graphics so we don't need hardcoded OCR pixel rectangles
-# (which break after undistortion shifts the HUD elements).
-# GROUND_EXCLUDE_PROMPT         = "sky . clouds . vegetation . grass . tree . shrub . van . vehicle"
-GROUND_EXCLUDE_PROMPT         = "sky . clouds . tree . van . vehicle. shrub"
-GROUND_EXCLUDE_BOX_THRESHOLD  = 0.35
-GROUND_EXCLUDE_TEXT_THRESHOLD = 0.35
+# ─────────────────────────────────────────────────────────────────────────────
+# ANCHOR DETECTION  (Qwen VL + CLIP)
+# ─────────────────────────────────────────────────────────────────────────────
+QWEN_MODEL = "Qwen/Qwen2.5-VL-7B-Instruct"
+CLIP_MODEL  = "openai/clip-vit-large-patch14"
+
+# CLIP cosine similarity thresholds for anchor weighting.
+# w >= CLIP_ANCHOR_THRESHOLD  → rigid anchor frame (used as control point in Sim(3)).
+# w <  CLIP_ANCHOR_MIN_WEIGHT → frame's AnchorRayCost skipped entirely.
+CLIP_ANCHOR_THRESHOLD  = 0.85
+CLIP_ANCHOR_MIN_WEIGHT = 0.50
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAST3R-SFM
+# ─────────────────────────────────────────────────────────────────────────────
+MAST3R_MODEL          = "naver/MASt3R_ViTLarge_BaseDecoder_512_capdepth"
+MAST3R_CONF_THRESHOLD = 0.5    # per-pixel confidence; points below this are dropped
+MAST3R_MAX_POINTS     = 5000   # max 3D points passed to Ceres (subsampled if more)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ORIENTATION SOLVER
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-camera bounds for the pyceres joint optimisation.
+# Seeds come from MASt3R-SfM camera poses (not GPS/GeoCalib).
+# Bounds are applied around the MASt3R-seeded values.
+
+SOLVER_PITCH_OFFSET  =  50.0   # ± degrees around the MASt3R/GeoCalib seed
+SOLVER_PITCH_FLOOR   = -90.0   # absolute minimum pitch
+SOLVER_PITCH_CEILING =  45.0   # absolute maximum pitch
+
+SOLVER_YAW_OFFSET_RANGE  =  15.0   # ± degrees around seeded yaw
+SOLVER_ROLL_OFFSET_RANGE =   5.0   # ± degrees around seeded roll
+
+# Position search range around MASt3R-seeded position.
+SOLVER_POSITION_RANGE_H  =  10.0   # ± metres East
+SOLVER_POSITION_RANGE_N  =   5.0   # ± metres North
+SOLVER_POSITION_RANGE_V  =   2.0   # ± metres vertical
+
+# Maximum Ceres solver iterations.
+SOLVER_MAX_ITERATIONS = 200
+
+# ── Focal length estimation ──────────────────────────────────────────────────
+# Set True to add focal length as a free parameter in the Ceres solve.
+ESTIMATE_FOCAL_LENGTH = False
+FOCAL_LENGTH_RANGE    = 0.22   # ±22% of FOCAL_LENGTH
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ROLL DETECTION
+# ─────────────────────────────────────────────────────────────────────────────
+# Area bounds (pixels²) for white connected-component blobs to be considered
+# a HUD bracket symbol.
+ROLL_BRACKET_MIN_AREA = 80
+ROLL_BRACKET_MAX_AREA = 2500
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CAMERA POSE OVERRIDES
+# ─────────────────────────────────────────────────────────────────────────────
+# Manually calibrated camera poses (e.g. from Blender adjustment).
+# Used when --cameras-init-from-config is passed to raycast.py or
+# export_blender.py.  Key = last 5 digits of the frame filename stem.
+# Values:  x, y, z     – ENU position in metres
+#          heading      – compass bearing in degrees (0=N, 90=E, clockwise)
+#          pitch        – degrees, negative = looking down
+#          roll         – degrees, positive = roll right
+#
+# Leave empty ({}) to use MASt3R-SfM camera poses for all frames.
+CAMERA_POSE_OVERRIDES: dict[str, dict] = {
+    '04681': {'x':    0.000, 'y':    0.000, 'z':    4.100,
+              'heading':  145.40, 'pitch':    1.98, 'roll':    7.87},
+    '04709': {'x':    8.225, 'y':   -9.110, 'z':    4.700,
+              'heading':  152.00, 'pitch':   -0.05, 'roll':   16.41},
+    '04752': {'x':   20.634, 'y':  -18.583, 'z':    6.717,
+              'heading':  207.00, 'pitch':   -4.17, 'roll':   16.93},
+    '07849': {'x':   23.477, 'y':   24.828, 'z':   13.600,
+              'heading':  181.00, 'pitch':   -2.67, 'roll':    1.34},
+    '10474': {'x':   22.043, 'y':   18.952, 'z':   14.500,
+              'heading':  176.00, 'pitch':    1.50, 'roll':   -0.53},
+    '10671': {'x':   25.897, 'y':   12.343, 'z':   14.800,
+              'heading':  236.00, 'pitch':   -1.93, 'roll':    0.34},
+    '12035': {'x':   28.989, 'y':  -18.239, 'z':   21.300,
+              'heading':  226.40, 'pitch':  -30.79, 'roll':   -3.03},
+}

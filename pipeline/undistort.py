@@ -165,5 +165,18 @@ def undistort_all(frames: list[Frame]) -> tuple[np.ndarray, np.ndarray, np.ndarr
     for i, frame in enumerate(frames):
         logger.info("  Undistorting %d/%d: %s", i + 1, len(frames), frame.stem)
         undistort_frame(frame, K, D, K_new)
+        _apply_hud_mask(frame)
 
     return K, D, K_new
+
+
+def _apply_hud_mask(frame: Frame) -> None:
+    """Paint HUD overlay regions solid black on frame.undistorted (in-place).
+
+    MASt3R's transformer assigns zero confidence to zero-entropy pixels,
+    automatically excluding HUD text/graphics from feature matching.
+    """
+    if frame.undistorted is None:
+        return
+    for (y1, y2, x1, x2) in config.HUD_REGIONS:
+        frame.undistorted[y1:y2, x1:x2] = 0

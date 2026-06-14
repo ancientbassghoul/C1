@@ -20,4 +20,7 @@ Thumbs.db
 
 blender_scene.py
 
+# Model weights cache — never commit weights to the repo
+models/
+
 *.png

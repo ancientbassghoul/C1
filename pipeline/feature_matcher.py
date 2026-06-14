@@ -1,626 +1,37 @@
 """
-pipeline/feature_matcher.py – Ground feature matching for camera orientation calibration.
+pipeline/feature_matcher.py – MASt3R-SfM orchestration + Ceres full-BA.
 
-Key design decisions
-────────────────────
-1. AGL filter: frames below MIN_AGL_M are skipped — perspective too extreme.
+Replaces LightGlue / SuperPoint / GroundedSAM with:
+  1. MASt3R-SfM complete-graph run  → camera poses + dense 3D point cloud
+  2. Qwen VL + CLIP anchor detection → CLIP-weighted anchor rays
+  3. Single Ceres full-BA            → jointly refines cameras + 3D points
+  4. Umeyama Sim(3)                  → maps MASt3R frame to GPS/ENU
 
-2. Van masking: detected van bbox is excluded from keypoint matches via
-   post-match pixel filtering.  The van sits above the ground plane and
-   would otherwise corrupt the ground-scatter geometry.
-
-3. Single joint solve (pyceres): all cameras + van heading are solved together
-   in one Ceres optimisation using pairwise ground scatter + manual van-feature
-   costs (wheel centres, roof edge, roof points).
-   The sparse block structure is exploited by SPARSE_NORMAL_CHOLESKY.
-
-4. Manual overrides (config.GIMBAL_PITCH_OVERRIDES) are never modified.
+Manual correspondences (--manual-fm-json) are loaded and added as
+higher-weight reprojection residuals alongside MASt3R observations.
 """
 
 from __future__ import annotations
 
+import json
 import logging
-import os
-from itertools import combinations
+from pathlib import Path
 
-import cv2
 import numpy as np
 
-from pipeline.orientation_solver import solve as ceres_solve
 from pipeline.frame import Frame
 from pipeline.pose import build_rotation
 import config
 
 logger = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Parameters
-# ─────────────────────────────────────────────────────────────────────────────
-MIN_BASELINE_M       = 3.0
-MIN_GROUND_MATCHES   = 6
-RANSAC_THRESHOLD     = 4.0
-INITIAL_PITCH_DEG    = 0.0
-
-# Frames below this AGL are skipped — perspective is too extreme.
-MIN_AGL_M            = 3.5
-
-
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Enhancement toggle
-# ─────────────────────────────────────────────────────────────────────────────
-_ENHANCE = True
-
-def set_enhance(on: bool) -> None:
-    global _ENHANCE
-    _ENHANCE = on
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Debug visualisation toggle
-# ─────────────────────────────────────────────────────────────────────────────
-_DEBUG = False
-
-def set_debug(on: bool) -> None:
-    global _DEBUG
-    _DEBUG = on
-
-
-def _save_debug_matches(
-    frame_a:    'Frame',
-    frame_b:    'Frame',
-    pts_a:      np.ndarray,
-    pts_b:      np.ndarray,
-    ground_a:   tuple[int, int],
-    ground_b:   tuple[int, int],
-    van_bbox_a: tuple | None,
-    van_bbox_b: tuple | None,
-) -> None:
-    """
-    Save a side-by-side debug image for one matched frame pair.
-
-    Left panel  – frame_a:  ground region (green band), van bbox (red),
-                             matched keypoints (yellow dots).
-    Right panel – frame_b:  same annotations.
-    Cyan lines connect corresponding matched pairs across the two panels.
-
-    Saved to {OUTPUT_DIR}/debug/match_{stem_a}__{stem_b}.png.
-    """
-    import pathlib
-
-    out_dir = pathlib.Path(config.OUTPUT_DIR) / 'debug'
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    img_a = frame_a.undistorted.copy()
-    img_b = frame_b.undistorted.copy()
-    ha, wa = img_a.shape[:2]
-    hb, wb = img_b.shape[:2]
-
-    # ── Ground region band (semi-transparent green) ───────────────────────────
-    for img, (g0, g1) in [(img_a, ground_a), (img_b, ground_b)]:
-        overlay = img.copy()
-        h = img.shape[0]
-        cv2.rectangle(overlay, (0, g0), (img.shape[1], g1), (0, 180, 0), -1)
-        cv2.addWeighted(overlay, 0.15, img, 0.85, 0, img)
-        cv2.line(img, (0, g0), (img.shape[1], g0), (0, 200, 0), 1)
-        cv2.line(img, (0, g1), (img.shape[1], g1), (0, 200, 0), 1)
-
-    # ── Van bboxes (red rectangle) ────────────────────────────────────────────
-    for img, bbox in [(img_a, van_bbox_a), (img_b, van_bbox_b)]:
-        if bbox is not None:
-            x1, y1, x2, y2 = (int(v) for v in bbox)
-            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 220), 2)
-            cv2.putText(img, 'van', (x1, max(0, y1 - 6)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 220), 1, cv2.LINE_AA)
-
-    # ── Matched keypoints (yellow dots) ──────────────────────────────────────
-    for img, pts in [(img_a, pts_a), (img_b, pts_b)]:
-        for x, y in pts:
-            cv2.circle(img, (int(x), int(y)), 4, (0, 220, 220), -1, cv2.LINE_AA)
-
-    # ── Side-by-side canvas ───────────────────────────────────────────────────
-    h_out = max(ha, hb)
-    canvas = np.zeros((h_out, wa + wb, 3), dtype=np.uint8)
-    canvas[:ha, :wa]      = img_a
-    canvas[:hb, wa:wa+wb] = img_b
-
-    # ── Connecting lines (cyan, subsampled for readability) ───────────────────
-    step = max(1, len(pts_a) // 40)
-    for (xa, ya), (xb, yb) in zip(pts_a[::step], pts_b[::step]):
-        p1 = (int(xa),      int(ya))
-        p2 = (int(xb) + wa, int(yb))
-        cv2.line(canvas, p1, p2, (255, 200, 0), 1, cv2.LINE_AA)
-
-    # ── Labels ────────────────────────────────────────────────────────────────
-    for x, label in [(8, frame_a.stem[-20:]), (wa + 8, frame_b.stem[-20:])]:
-        cv2.rectangle(canvas, (x - 2, 0), (x + len(label) * 9, 20), (0, 0, 0), -1)
-        cv2.putText(canvas, label, (x, 14),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
-
-    n = len(pts_a)
-    summary = f'{n} matches'
-    cv2.putText(canvas, summary, (wa // 2 - 40, h_out - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 220), 1, cv2.LINE_AA)
-
-    fname = f'match_{frame_a.stem[-16:]}__{frame_b.stem[-16:]}.png'
-    out_path = out_dir / fname
-    cv2.imwrite(str(out_path), canvas)
-    logger.debug('Debug match image saved: %s', out_path)
-
-def _enhance_np(img_bgr: np.ndarray) -> np.ndarray:
-    """CLAHE + unsharp mask for better SuperPoint keypoint detection."""
-    gray  = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    eq    = clahe.apply(gray)
-    blur  = cv2.GaussianBlur(eq, (0, 0), sigmaX=2.0)
-    return cv2.addWeighted(eq, 1.8, blur, -0.8, 0)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Spatial grid subsampling
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# LightGlue lazy init
-# ─────────────────────────────────────────────────────────────────────────────
-_extractor = None
-_matcher   = None
-_device    = None
-
-def _load_models():
-    global _extractor, _matcher, _device
-    if _extractor is not None:
-        return
-    try:
-        import torch
-        from lightglue import LightGlue, SuperPoint
-    except ImportError:
-        raise ImportError(
-            "\nLightGlue not installed. Run:\n"
-            "  venv\\Scripts\\pip install git+https://github.com/cvg/LightGlue.git\n"
-        )
-    import torch
-    _device    = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    _extractor = SuperPoint(max_num_keypoints=1024).eval().to(_device)
-    _matcher   = LightGlue(features='superpoint').eval().to(_device)
-    logger.info("LightGlue loaded on %s", _device)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Image helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def _to_tensor(img_bgr: np.ndarray, device):
-    import torch
-    if _ENHANCE:
-        gray = _enhance_np(img_bgr)
-        rgb  = np.stack([gray, gray, gray], axis=2)
-    else:
-        rgb = img_bgr[:, :, ::-1].copy()
-    return torch.from_numpy(rgb).permute(2, 0, 1).float().to(_device) / 255.0
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# LightGlue matching
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _match(frame_a: Frame, frame_b: Frame,
-           van_bbox_a: tuple | None = None,
-           van_bbox_b: tuple | None = None) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Match ground features using SuperPoint + LightGlue.
-
-    Keypoints inside the van bounding boxes are filtered out after matching
-    via pixel-coordinate masking.  The ground region is restricted to the
-    lower 55% of the content area to avoid matching sky features.
-    """
-    import torch
-    from lightglue.utils import rbd
-
-    _load_models()
-
-    img_t_a = _to_tensor(frame_a.undistorted, _device)
-    img_t_b = _to_tensor(frame_b.undistorted, _device)
-
-    # Use autocast only on CUDA; it has no effect (and may error) on CPU.
-    device_type = _device.type
-    with torch.autocast(device_type=device_type, enabled=(device_type == 'cuda')):
-        feats_a = _extractor.extract(img_t_a)
-        feats_b = _extractor.extract(img_t_b)
-        result  = _matcher({'image0': feats_a, 'image1': feats_b})
-
-    feats_a, feats_b, result = [rbd(x) for x in [feats_a, feats_b, result]]
-    matches = result['matches']
-    if len(matches) == 0:
-        return np.empty((0, 2)), np.empty((0, 2))
-
-    kp_a = feats_a['keypoints'][matches[:, 0]].cpu().numpy()
-    kp_b = feats_b['keypoints'][matches[:, 1]].cpu().numpy()
-
-    # Ground mask filter (pixel-level, from GroundedSAM)
-    gm_a = frame_a.ground_mask
-    gm_b = frame_b.ground_mask
-    ha, wa = gm_a.shape
-    hb, wb = gm_b.shape
-    xa = np.clip(kp_a[:, 0].astype(int), 0, wa - 1)
-    ya = np.clip(kp_a[:, 1].astype(int), 0, ha - 1)
-    xb = np.clip(kp_b[:, 0].astype(int), 0, wb - 1)
-    yb = np.clip(kp_b[:, 1].astype(int), 0, hb - 1)
-    mask = gm_a[ya, xa] & gm_b[yb, xb]
-    from pipeline.ground_mask import mask_to_row_bounds
-    ga0, ga1 = mask_to_row_bounds(gm_a)
-    gb0, gb1 = mask_to_row_bounds(gm_b)
-
-    # Exclude van regions
-    if van_bbox_a is not None:
-        x1, y1, x2, y2 = van_bbox_a
-        mask &= ~((kp_a[:, 0] >= x1) & (kp_a[:, 0] <= x2) &
-                  (kp_a[:, 1] >= y1) & (kp_a[:, 1] <= y2))
-    if van_bbox_b is not None:
-        x1, y1, x2, y2 = van_bbox_b
-        mask &= ~((kp_b[:, 0] >= x1) & (kp_b[:, 0] <= x2) &
-                  (kp_b[:, 1] >= y1) & (kp_b[:, 1] <= y2))
-
-    pts_a = kp_a[mask].astype(np.float32)
-    pts_b = kp_b[mask].astype(np.float32)
-
-    if len(pts_a) < MIN_GROUND_MATCHES:
-        return np.empty((0, 2)), np.empty((0, 2))
-
-    if len(pts_a) >= 8:
-        _, rmask = cv2.findHomography(pts_a, pts_b, cv2.RANSAC, RANSAC_THRESHOLD)
-        if rmask is not None:
-            pts_a = pts_a[rmask.ravel().astype(bool)]
-            pts_b = pts_b[rmask.ravel().astype(bool)]
-
-    if len(pts_a) < MIN_GROUND_MATCHES:
-        return np.empty((0, 2)), np.empty((0, 2))
-
-    if _DEBUG:
-        _save_debug_matches(
-            frame_a, frame_b, pts_a, pts_b,
-            (ga0, ga1), (gb0, gb1),
-            van_bbox_a, van_bbox_b,
-        )
-
-    return pts_a, pts_b
-
-
-
-
-
-
-
-def _global_match_filter(
-    pair_matches: dict,
-    spatial_thresh: float,
-) -> dict:
-    """
-    Filter matches globally across all frame pairs using multi-frame coverage.
-
-    Algorithm
-    ---------
-    1. REACH -- for every match endpoint (a pixel in some frame), count how
-       many distinct OTHER frames have a matched pixel within spatial_thresh
-       pixels in that same frame.  A pixel seen in pairs (A,B) and (A,C)
-       has reach 2 in frame A.
-
-    2. SCORE -- each match (pA, pB) scores reach_A + reach_B.
-       A score of 4 means both endpoints each connect to 2+ other frames,
-       i.e. the physical point is visible in 3+ frames.
-
-    3. GREEDY SELECTION -- process matches in descending score order.
-       Keep a match if its pixels are not BOTH within spatial_thresh of
-       already-kept matches in their respective frames.
-       High-score matches claim their neighbourhood first, so weak nearby
-       duplicates are discarded.
-    """
-    from collections import defaultdict
-    from scipy.spatial import cKDTree
-
-    if not pair_matches:
-        return {}
-
-    # Step 1: per-frame observation lists
-    frame_obs: dict = defaultdict(list)
-    for pair_key, (pts_a, pts_b) in pair_matches.items():
-        fa, fb = pair_key
-        for i in range(len(pts_a)):
-            frame_obs[fa].append((pts_a[i], pair_key, i))
-            frame_obs[fb].append((pts_b[i], pair_key, i))
-
-    # Step 2: reach per observation
-    reach: dict = {}
-
-    for frame, obs in frame_obs.items():
-        if len(obs) < 2:
-            for (pixel, pair_key, local_idx) in obs:
-                reach[(pair_key, local_idx, frame)] = 1
-            continue
-
-        pixels = np.array([o[0] for o in obs])
-        tree   = cKDTree(pixels)
-
-        for j, (pixel, pair_key, local_idx) in enumerate(obs):
-            fa_k, fb_k = pair_key
-            partner = fb_k if fa_k is frame else fa_k
-            nearby = tree.query_ball_point(pixel, spatial_thresh)
-            other_frames: set = set()
-            for k in nearby:
-                _, pk, _ = obs[k]
-                fa_n, fb_n = pk
-                other_frames.add(fb_n if fa_n is frame else fa_n)
-            other_frames.discard(partner)
-            reach[(pair_key, local_idx, frame)] = 1 + len(other_frames)
-
-    # Step 3: score and sort
-    scored: list = []
-    for pair_key, (pts_a, pts_b) in pair_matches.items():
-        fa, fb = pair_key
-        for i in range(len(pts_a)):
-            ra = reach.get((pair_key, i, fa), 1)
-            rb = reach.get((pair_key, i, fb), 1)
-            scored.append((ra + rb, pair_key, i))
-
-    scored.sort(key=lambda x: -x[0])
-
-    # Step 4: greedy spatial deduplication
-    kept_pts: dict = defaultdict(list)
-    kept_idx: dict = defaultdict(set)
-
-    for score, pair_key, i in scored:
-        fa, fb = pair_key
-        pts_a_all, pts_b_all = pair_matches[pair_key]
-        pa, pb = pts_a_all[i], pts_b_all[i]
-
-        def _near(frame, pixel):
-            pts_list = kept_pts[frame]
-            if not pts_list:
-                return False
-            d, _ = cKDTree(np.array(pts_list)).query(pixel)
-            return bool(d < spatial_thresh)
-
-        if not (_near(fa, pa) and _near(fb, pb)):
-            kept_pts[fa].append(pa)
-            kept_pts[fb].append(pb)
-            kept_idx[pair_key].add(i)
-
-    # Step 5: assemble output
-    result: dict = {}
-    for pair_key, (pts_a, pts_b) in pair_matches.items():
-        idxs = sorted(kept_idx.get(pair_key, set()))
-        if idxs:
-            result[pair_key] = (pts_a[idxs], pts_b[idxs])
-
-    n_in  = sum(len(v[0]) for v in pair_matches.values())
-    n_out = sum(len(v[0]) for v in result.values())
-    logger.info("Global filter: %d -> %d matches across %d/%d pairs.",
-                n_in, n_out, len(result), len(pair_matches))
-    return result
-
-def load_manual_pairs(frames: list) -> list[tuple]:
-    """Public wrapper — loads ground-type manual correspondences from JSON.
-    Pass this as manual_pairwise_features= to refine_pitches() to skip
-    LightGlue and solve from manual correspondences only."""
-    return _load_manual_pairs(frames)
-
-
-def _load_manual_pairs(frames: list) -> list[tuple]:
-    """
-    Load ground-type correspondences from MANUAL_CORRESPONDENCES_FILE and
-    return them as pairwise (fi, pix_i, fj, pix_j) tuples.
-    Used by the two-stage auto path to anchor stage-1 without requiring
-    raycast.py to pass them in explicitly.
-    """
-    import json
-    from pathlib import Path
-    from itertools import combinations as _comb
-
-    path = Path(config.MANUAL_CORRESPONDENCES_FILE)
-    if not path.exists():
-        return []
-
-    stem_to_frame = {f.stem: f for f in frames}
-    data  = json.loads(path.read_text(encoding="utf-8"))
-    pairs = []
-
-    for entry in data.get("correspondences", []):
-        if entry.get("type", "ground") != "ground":
-            continue
-        if entry.get("is_pair", False):
-            continue
-        pts   = entry.get("points", {})
-        stems = list(pts.keys())
-        for sa, sb in _comb(stems, 2):
-            fa = stem_to_frame.get(sa)
-            fb = stem_to_frame.get(sb)
-            if fa is None or fb is None:
-                continue
-            xa, ya = pts[sa]
-            xb, yb = pts[sb]
-            pairs.append((fa, (float(xa), float(ya)),
-                          fb, (float(xb), float(yb))))
-
-    logger.info("Loaded %d manual ground pairs from %s (stage-1 anchor).",
-                len(pairs), path)
-    return pairs
-
-
-def _filter_by_reprojection(
-    lightglue_pairs: list[tuple],
-    cam_results: dict,
-    calibrated_frames: set,
-    threshold_px: float,
-    mixed_threshold_px: float,
-) -> list[tuple]:
-    """
-    Keep only LightGlue pairs consistent with the stage-1 camera solution,
-    using different thresholds based on how well each frame is calibrated.
-
-    Pair classification:
-      both calibrated   → strict threshold_px  (both predictions reliable)
-      one calibrated    → mixed_threshold_px,  raycasting from the calibrated
-                          frame only (its prediction is reliable)
-      both uncalibrated → dropped              (neither prediction is reliable)
-    """
-
-    def _stage1_camera(f):
-        p        = cam_results[f]
-        pitch    = float(p[0])
-        yaw_off  = float(p[1])
-        roll_off = float(p[2])
-        dx, dy, dz = float(p[3]), float(p[4]), float(p[5])
-        yaw  = f.heading_deg     + yaw_off
-        roll = f.camera_roll_deg + roll_off
-        R    = build_rotation(yaw, pitch, roll)
-        pos  = f.position_enu + np.array([dx, dy, dz])
-        return R, pos, f.K_undist
-
-    def _raycast_z0(R, pos, K, u, v):
-        cx, cy = K[0, 2], K[1, 2]
-        focal  = K[0, 0]
-        ray_cam   = np.array([(u - cx) / focal, (v - cy) / focal, 1.0])
-        ray_world = R.T @ ray_cam
-        if abs(ray_world[2]) < 1e-6:
-            return None
-        t = -pos[2] / ray_world[2]
-        if t < 0:
-            return None
-        return pos + t * ray_world
-
-    def _project(R, pos, K, P):
-        p_cam = R @ (P - pos)
-        if p_cam[2] <= 1e-3:
-            return None
-        cx, cy = K[0, 2], K[1, 2]
-        focal  = K[0, 0]
-        return (focal * p_cam[0] / p_cam[2] + cx,
-                focal * p_cam[1] / p_cam[2] + cy)
-
-    kept = []
-    n_both_cal = n_mixed = n_both_uncal = 0
-
-    for fi, pix_i, fj, pix_j in lightglue_pairs:
-        if fi not in cam_results or fj not in cam_results:
-            continue
-
-        i_cal = fi in calibrated_frames
-        j_cal = fj in calibrated_frames
-
-        if not i_cal and not j_cal:
-            n_both_uncal += 1
-            continue                  # skip — neither prediction is reliable
-
-        if i_cal and j_cal:
-            n_both_cal += 1
-            thresh = threshold_px
-            # Standard: raycast from fi, check in fj
-            Ri, pos_i, Ki = _stage1_camera(fi)
-            Rj, pos_j, Kj = _stage1_camera(fj)
-            P = _raycast_z0(Ri, pos_i, Ki, pix_i[0], pix_i[1])
-            if P is None:
-                continue
-            pred = _project(Rj, pos_j, Kj, P)
-            if pred is None:
-                continue
-            err = np.hypot(pred[0] - pix_j[0], pred[1] - pix_j[1])
-        else:
-            n_mixed += 1
-            thresh = mixed_threshold_px
-            # Raycast from the calibrated frame only
-            if i_cal:
-                Rc, pos_c, Kc = _stage1_camera(fi)
-                pix_c = pix_i
-                Ru, pos_u, Ku = _stage1_camera(fj)
-                pix_u = pix_j
-            else:
-                Rc, pos_c, Kc = _stage1_camera(fj)
-                pix_c = pix_j
-                Ru, pos_u, Ku = _stage1_camera(fi)
-                pix_u = pix_i
-            P = _raycast_z0(Rc, pos_c, Kc, pix_c[0], pix_c[1])
-            if P is None:
-                continue
-            pred = _project(Ru, pos_u, Ku, P)
-            if pred is None:
-                continue
-            err = np.hypot(pred[0] - pix_u[0], pred[1] - pix_u[1])
-
-        if err <= thresh:
-            kept.append((fi, pix_i, fj, pix_j))
-
-    logger.info(
-        "Reprojection filter: "
-        "%d both-calibrated (thresh %.0fpx), "
-        "%d mixed (thresh %.0fpx), "
-        "%d both-uncalibrated (dropped). "
-        "Kept %d / %d total.",
-        n_both_cal, threshold_px,
-        n_mixed, mixed_threshold_px,
-        n_both_uncal,
-        len(kept), len(lightglue_pairs),
-    )
-    return kept
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _load_van_features() -> list:
-    """
-    Load van plane features from the unified correspondences JSON.
-    Returns only non-ground entries (wheel_axis, roof_edge, roof, etc.).
-    Ground entries are handled separately as cross-frame scatter in raycast.py.
-    """
-    import json
-    from pathlib import Path
-    path = Path(config.MANUAL_CORRESPONDENCES_FILE)
-    if not path.exists():
-        return []
-    data = json.loads(path.read_text(encoding="utf-8"))
-    feats = [
-        f for f in data.get("correspondences", [])
-        if f.get("type", "ground") != "ground"
-    ]
-    logger.info("Loaded %d van plane feature(s) from %s", len(feats), path)
-    return feats
-
-
-def _save_auto_matches(pairwise_features: list) -> None:
-    """
-    Serialise filtered LightGlue pairwise_features to JSON in the same
-    format as manual_correspondences.json so --show-scores can inspect them.
-    Saved to AUTO_MATCHES_FILE in config.py after every pipeline run.
-    """
-    import json
-    from pathlib import Path
-
-    entries = []
-    for i, (fi, (xi, yi), fj, (xj, yj)) in enumerate(pairwise_features):
-        entries.append({
-            "id"    : i,
-            "source": "lightglue",
-            "points": {
-                fi.stem: [round(xi, 2), round(yi, 2)],
-                fj.stem: [round(xj, 2), round(yj, 2)],
-            },
-        })
-
-    out_path = Path(config.AUTO_MATCHES_FILE)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps({"correspondences": entries}, indent=2))
-    logger.info("Auto matches saved to %s (%d pairs)", out_path, len(entries))
-
-# Public API
+# Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _apply_pose_overrides(frames: list[Frame]) -> int:
-    """
-    Apply config.CAMERA_POSE_OVERRIDES to matching frames in-place.
-    Matches by the last 5 characters of frame.stem (the frame number).
-    Returns the number of frames updated.
-    """
+    """Apply config.CAMERA_POSE_OVERRIDES to matching frames in-place."""
     overrides = config.CAMERA_POSE_OVERRIDES
     if not overrides:
         return 0
@@ -645,225 +56,228 @@ def _apply_pose_overrides(frames: list[Frame]) -> int:
     return updated
 
 
-def refine_pitches(frames: list[Frame],
-                   van_bboxes: dict | None = None,
-                   cameras_init_from_config: bool = False,
-                   manual_pairwise_features: list | None = None,
-                   matcher_only: bool = False) -> None:
+def _load_manual_features(frames: list[Frame]) -> list[dict]:
     """
-    Refine camera orientation (pitch, yaw offset, roll offset, position) jointly
-    using pyceres with pairwise ground-scatter and manual van-feature costs.
+    Load all correspondences from MANUAL_CORRESPONDENCES_FILE.
 
-    van_bboxes : dict mapping frame.stem → (x1,y1,x2,y2) from GroundingDINO.
-                 Used to mask keypoint matches only (bbox-based corner
-                 reprojection has been removed).
-
-    Frames listed in config.GIMBAL_PITCH_OVERRIDES are never modified.
+    Returns a list of feature dicts in the format expected by
+    orientation_solver.ceres_solve(manual_features=...).
     """
-    vb = van_bboxes or {}
+    path = Path(config.MANUAL_CORRESPONDENCES_FILE)
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("Could not load manual correspondences: %s", exc)
+        return []
 
-    # ── Apply manual pose overrides from config (if requested) ────────────────
+    stem_set = {f.stem for f in frames}
+    features = []
+    for entry in data.get("correspondences", []):
+        pts = entry.get("points", {})
+        filtered_pts = {s: p for s, p in pts.items() if s in stem_set}
+        if len(filtered_pts) < 1:
+            continue
+        feat = dict(entry)
+        feat["points"] = filtered_pts
+        features.append(feat)
+
+    logger.info("Loaded %d manual feature(s) from %s", len(features), path)
+    return features
+
+
+def _build_anchor_rays(anchor_result) -> list[tuple]:
+    """
+    Convert AnchorResult into a list of (frame_stem, pixel_uv, clip_weight)
+    tuples for orientation_solver.ceres_solve().
+    """
+    if anchor_result is None:
+        return []
+
+    rays = []
+    for stem, centroid in anchor_result.centroids.items():
+        w = anchor_result.weights.get(stem, 0.0)
+        u, v = centroid
+        rays.append((stem, np.array([float(u), float(v)]), float(w)))
+
+    logger.info(
+        "Anchor rays: %d frames  (label='%s'  %.0f%% above threshold %.2f)",
+        len(rays), anchor_result.label,
+        100.0 * sum(1 for *_, w in rays if w >= config.CLIP_ANCHOR_THRESHOLD) / max(1, len(rays)),
+        config.CLIP_ANCHOR_THRESHOLD,
+    )
+    return rays
+
+
+def _init_p_anchor(
+    mast3r_result,
+    anchor_result,
+    cam_poses_init: dict[str, np.ndarray],
+) -> np.ndarray:
+    """
+    Initialize P_anchor by projecting MASt3R 3D points into frames and
+    finding the centroid of points that land inside the anchor bbox in ≥2 frames.
+
+    Falls back to the origin if no suitable points are found.
+    """
+    if (anchor_result is None
+            or not anchor_result.bboxes
+            or len(mast3r_result.points_3d) == 0):
+        logger.warning("Cannot initialize P_anchor — returning world origin.")
+        return np.zeros(3, dtype=np.float64)
+
+    from scipy.spatial.transform import Rotation as _R
+
+    def _aa_to_R(r3):
+        angle = float(np.linalg.norm(r3))
+        if angle < 1e-12:
+            return np.eye(3)
+        return _R.from_rotvec(r3).as_matrix()
+
+    pts = mast3r_result.points_3d   # (N, 3)
+    votes = np.zeros(len(pts), dtype=int)
+
+    for stem, bbox in anchor_result.bboxes.items():
+        W2C = cam_poses_init.get(stem)
+        if W2C is None:
+            continue
+        # We stored W2C as 4×4; extract R and t from it, or use cam6 format
+        # (orientation_solver uses axis-angle; cam_poses_init are 4×4 matrices)
+        R34 = W2C[:3, :3]
+        t3  = W2C[:3, 3]
+
+        # Project all 3D points into this frame
+        p_cam = (R34 @ pts.T + t3[:, None]).T   # (N, 3)
+        in_front = p_cam[:, 2] > 1e-3
+
+        # Need a K matrix — use a simple default from config
+        fx = config.FOCAL_LENGTH * config.UNDISTORT_SCALE
+        fy = fx
+        cx = config.CX
+        cy = config.CY
+
+        u_proj = fx * p_cam[:, 0] / np.maximum(p_cam[:, 2], 1e-6) + cx
+        v_proj = fy * p_cam[:, 1] / np.maximum(p_cam[:, 2], 1e-6) + cy
+
+        y1, x1, y2, x2 = bbox
+        in_bbox = (
+            in_front
+            & (u_proj >= x1) & (u_proj <= x2)
+            & (v_proj >= y1) & (v_proj <= y2)
+        )
+        votes[in_bbox] += 1
+
+    candidate_mask = votes >= 2
+    if candidate_mask.sum() == 0:
+        logger.warning(
+            "P_anchor init: no 3D points visible in ≥2 anchor bboxes. "
+            "Using mean of single-frame candidates."
+        )
+        candidate_mask = votes >= 1
+        if candidate_mask.sum() == 0:
+            return np.zeros(3, dtype=np.float64)
+
+    p_anchor = pts[candidate_mask].mean(axis=0)
+    logger.info(
+        "P_anchor initialized from centroid of %d candidate 3D points: %s",
+        candidate_mask.sum(), np.round(p_anchor, 2),
+    )
+    return p_anchor
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Public API
+# ─────────────────────────────────────────────────────────────────────────────
+
+def refine_pitches(
+    frames: list[Frame],
+    anchor_result=None,
+    cameras_init_from_config: bool = False,
+    use_manual_features: bool = False,
+    matcher_only: bool = False,
+) -> None:
+    """
+    Refine camera poses using MASt3R-SfM + Ceres full bundle adjustment.
+
+    Steps
+    -----
+    1. (Optional) Apply config.CAMERA_POSE_OVERRIDES.
+    2. Run MASt3R-SfM complete-graph on all eligible frames.
+    3. Build CLIP-weighted anchor rays from anchor_result.
+    4. Initialize P_anchor from MASt3R point cloud projected into anchor bboxes.
+    5. (Optional) Load manual correspondences as additional Ceres residuals.
+    6. Single Ceres full-BA solve (MASt3RReprojCost + AnchorRayCost + manual).
+    7. Umeyama Sim(3): map solved MASt3R frame → GPS/ENU.
+
+    Parameters
+    ----------
+    frames              : all loaded frames.
+    anchor_result       : AnchorResult from detect_anchor() (Qwen + CLIP).
+                          If None, anchor rays are omitted.
+    cameras_init_from_config : apply CAMERA_POSE_OVERRIDES before solving.
+    use_manual_features : load and inject MANUAL_CORRESPONDENCES_FILE.
+    matcher_only        : run MASt3R only, save auto_matches.json, then return.
+    """
+    # ── Apply manual pose overrides ───────────────────────────────────────────
     if cameras_init_from_config:
-        n_overridden = _apply_pose_overrides(frames)
-        logger.info("Applied config pose overrides to %d frame(s).", n_overridden)
+        n = _apply_pose_overrides(frames)
+        logger.info("Applied config pose overrides to %d frame(s).", n)
 
     # ── Eligible frames ───────────────────────────────────────────────────────
     ready = [
         f for f in frames
-        if f.undistorted   is not None
-        and f.position_enu is not None
-        and f.K_undist     is not None
-        and f.heading_deg  is not None
-        and f.stem not in config.GIMBAL_PITCH_OVERRIDES
+        if f.undistorted is not None
+        and f.K_undist   is not None
     ]
-
     if len(ready) < 2:
-        logger.warning("refine_pitches: fewer than 2 eligible frames.")
+        logger.warning("refine_pitches: fewer than 2 undistorted frames — aborting.")
         return
 
-    if manual_pairwise_features is not None:
-        # Bypass GroundedSAM + LightGlue entirely
-        pairwise_features = manual_pairwise_features
-        logger.info("Using %d manual ground feature pairs (LightGlue skipped).",
-                    len(pairwise_features))
-        if not pairwise_features:
-            logger.warning("No manual features provided — skipping refinement.")
-            return
-    else:
-        # ── Ground masks (GroundedSAM) ──────────────────────────────
-        from pipeline.ground_mask import get_ground_masks
-        logger.info("Computing GroundedSAM ground masks for %d frame(s)...", len(ready))
-        ground_masks = get_ground_masks(ready)
-        for f, m in ground_masks.items():
-            f.ground_mask = m
-        logger.info("Ground masks ready.")
+    # ── Step 1: MASt3R-SfM ───────────────────────────────────────────────────
+    from pipeline.mast3r_matcher import run_complete_graph, save_auto_matches
 
-        # ── Feature matching — pass 1: raw per-pair matches ───────────
-        raw_pair_matches: dict = {}
-        for fa, fb in combinations(ready, 2):
-            if np.linalg.norm(fb.position_enu - fa.position_enu) < MIN_BASELINE_M:
-                continue
-            pts_a, pts_b = _match(fa, fb,
-                                   van_bbox_a=vb.get(fa.stem),
-                                   van_bbox_b=vb.get(fb.stem))
-            if len(pts_a) >= MIN_GROUND_MATCHES:
-                raw_pair_matches[(fa, fb)] = (pts_a, pts_b)
-                logger.info("  %s ↔ %s : %d raw matches",
-                            fa.stem[-12:], fb.stem[-12:], len(pts_a))
-        for f in ready:
-            f.ground_mask = None
-        if not raw_pair_matches:
-            logger.warning("No ground matches found — skipping refinement.")
-            return
+    logger.info("Running MASt3R-SfM on %d frames …", len(ready))
+    mast3r_result = run_complete_graph(ready)
 
-        # ── Feature matching — pass 2: global filter ─────────────────
-        filtered = _global_match_filter(raw_pair_matches,
-                                        config.MATCH_SPATIAL_DEDUP_THRESH)
-        if not filtered:
-            logger.warning("Global filter removed all matches — skipping refinement.")
-            return
-        pairwise_features: list[tuple] = []
-        for (fa, fb), (pts_a, pts_b) in filtered.items():
-            logger.info("  %s ↔ %s : %d matches (after global filter)",
-                        fa.stem[-12:], fb.stem[-12:], len(pts_a))
-            for (ua, va), (ub, vb_) in zip(pts_a, pts_b):
-                pairwise_features.append(
-                    (fa, (float(ua), float(va)),
-                     fb, (float(ub), float(vb_)))
-                )
-        logger.info("%d total ground feature pairs across %d frames.",
-                    len(pairwise_features), len(ready))
+    if len(mast3r_result.camera_poses) == 0:
+        logger.error("MASt3R returned no camera poses — aborting refinement.")
+        return
 
-        # ── Save auto matches to JSON (always on — enables --show-scores inspection) ──
-        _save_auto_matches(pairwise_features)
+    if matcher_only:
+        save_auto_matches(mast3r_result, config.AUTO_MATCHES_FILE)
+        logger.info("--run-matcher-only: saved auto_matches.json, stopping before Ceres.")
+        return
 
-        if matcher_only:
-            logger.info("--run-matcher-only: exiting after LightGlue + auto_matches.json.")
-            return
+    # ── Step 2: Anchor rays ───────────────────────────────────────────────────
+    anchor_rays = _build_anchor_rays(anchor_result)
 
-    # ── Shared setup ─────────────────────────────────────────────────────────
-    pitch_seeds = {
-        f: f.gimbal_pitch_deg
-        for f in ready
-        if f.gimbal_pitch_deg is not None
-    }
-    van_plane_features = _load_van_features()
+    # ── Step 3: Initialize P_anchor ──────────────────────────────────────────
+    p_anchor_init = _init_p_anchor(
+        mast3r_result, anchor_result, mast3r_result.camera_poses
+    )
 
-    if manual_pairwise_features is not None:
-        # ── Manual-only path: single solve, normal bounds ─────────────────────
-        cam_results, van_pose_solved, report, focal_result = ceres_solve(
-            ready, pairwise_features,
-            pitch_seeds=pitch_seeds,
-            van_plane_features=van_plane_features,
-        )
-        logger.info("Van heading solved: %.1f°", van_pose_solved[2])
-        if config.ESTIMATE_FOCAL_LENGTH:
-            f_raw = float(focal_result[0]) / config.UNDISTORT_SCALE
-            logger.info(
-                "Solved focal length: %.2f px raw  "
-                "(update FOCAL_LENGTH = %.2f in config.py)", f_raw, f_raw)
+    # ── Step 4: Manual features ───────────────────────────────────────────────
+    manual_features = _load_manual_features(ready) if use_manual_features else None
 
-    else:
-        # ── Two-stage auto path ───────────────────────────────────────────────
-        # Stage 1: manual correspondences only — reliable geometric anchor.
-        manual_pairs = _load_manual_pairs(ready) if config.USE_MANUAL_ANCHOR else []
-        if not manual_pairs:
-            logger.warning(
-                "No manual correspondences found for stage-1 anchor — "
-                "running single-stage solve with LightGlue only (may be unstable)."
-            )
-            cam_results, van_pose_solved, report, focal_result = ceres_solve(
-                ready, pairwise_features,
-                pitch_seeds=pitch_seeds,
-                van_plane_features=van_plane_features,
-            )
-        else:
-            logger.info(
-                "Stage 1: manual-only solve (%d pairs) for geometric anchor…",
-                len(manual_pairs),
-            )
-            cam_s1, van_s1, report_s1, focal_s1 = ceres_solve(
-                ready, manual_pairs,
-                pitch_seeds=pitch_seeds,
-                van_plane_features=van_plane_features,
-            )
-            logger.info("Stage 1 complete: %s", report_s1)
-            logger.info("Stage 1 van heading: %.1f°", van_s1[2])
+    # ── Step 5: Ceres full-BA ─────────────────────────────────────────────────
+    from pipeline.orientation_solver import ceres_solve, align_to_telemetry_sim3
 
-            # Which frames were actually constrained in stage-1?
-            calibrated_frames = {
-                f for f in ready
-                if any(f is fi or f is fj
-                       for fi, _, fj, _ in manual_pairs)
-            }
-            n_new = len(ready) - len(calibrated_frames)
-            logger.info(
-                "%d calibrated frames (manual anchor), %d new frames "
-                "(GeoCalib seeds only).",
-                len(calibrated_frames), n_new,
-            )
+    logger.info("Starting Ceres full-BA …")
+    cam_params_solved, points_3d_solved, p_anchor_solved, report = ceres_solve(
+        ready,
+        mast3r_observations=mast3r_result.observations,
+        anchor_rays=anchor_rays,
+        cam_poses_init=mast3r_result.camera_poses,
+        points_3d_init=mast3r_result.points_3d,
+        p_anchor_init=p_anchor_init,
+        manual_features=manual_features,
+    )
+    logger.info("Ceres BA: %s", report)
+    logger.info("P_anchor solved: %s", np.round(p_anchor_solved, 3))
 
-            # Filter LightGlue matches using stage-1 geometry
-            lg_filtered = _filter_by_reprojection(
-                pairwise_features, cam_s1,
-                calibrated_frames=calibrated_frames,
-                threshold_px=config.LIGHTGLUE_FILTER_THRESHOLD_PX,
-                mixed_threshold_px=config.LIGHTGLUE_MIXED_THRESHOLD_PX,
-            )
+    # ── Step 6: Sim(3) alignment to GPS/ENU ──────────────────────────────────
+    logger.info("Aligning solved poses to GPS/ENU via Umeyama Sim(3) …")
+    align_to_telemetry_sim3(ready, cam_params_solved, anchor_result=anchor_result)
 
-            if not lg_filtered:
-                logger.warning(
-                    "Reprojection filter removed ALL LightGlue matches — "
-                    "using stage-1 result directly."
-                )
-                cam_results      = cam_s1
-                van_pose_solved  = van_s1
-                report           = report_s1
-                focal_result     = focal_s1
-            else:
-                # Stage 2: manual + filtered LightGlue.
-                # Calibrated frames: tight delta bounds around stage-1.
-                # New frames: normal wide bounds (they need room to move).
-                combined = manual_pairs + lg_filtered
-                logger.info(
-                    "Stage 2: %d manual + %d filtered LightGlue = %d total pairs…",
-                    len(manual_pairs), len(lg_filtered), len(combined),
-                )
-                cam_results, van_pose_solved, report, focal_result = ceres_solve(
-                    ready, combined,
-                    pitch_seeds=pitch_seeds,
-                    van_plane_features=van_plane_features,
-                    cam_params_init=cam_s1,
-                    van_params_init=van_s1,
-                    calibrated_frames=calibrated_frames,
-                    delta_rotation_bound=config.STAGE2_ROTATION_BOUND_DEG,
-                    delta_position_bound=config.STAGE2_POSITION_BOUND_M,
-                )
-
-        logger.info("Van heading solved: %.1f°", van_pose_solved[2])
-        if config.ESTIMATE_FOCAL_LENGTH:
-            f_raw = float(focal_result[0]) / config.UNDISTORT_SCALE
-            logger.info(
-                "Solved focal length: %.2f px raw  "
-                "(update FOCAL_LENGTH = %.2f in config.py)", f_raw, f_raw)
-
-    # ── Apply results to frames ───────────────────────────────────────────────
-    for f in ready:
-        params = cam_results[f]
-        pitch = float(params[0])
-        yo    = float(params[1])
-        ro    = float(params[2])
-        dx    = float(params[3])
-        dy    = float(params[4])
-        dz    = float(params[5])
-        logger.info(
-            "  [%s] pitch → %.1f°  yaw_off → %+.2f°  roll_off → %+.2f°  "
-            "pos_off → (%+.2f, %+.2f, %+.2f) m",
-            f.stem[-12:], pitch, yo, ro, dx, dy, dz,
-        )
-        f.gimbal_pitch_deg  = pitch
-        f.heading_deg       = f.heading_deg     + yo
-        f.camera_roll_deg   = f.camera_roll_deg + ro
-        f.position_enu      = f.position_enu    + np.array([dx, dy, dz])
-        f.R = build_rotation(f.heading_deg, pitch, f.camera_roll_deg)
-
+    logger.info("refine_pitches complete.")
