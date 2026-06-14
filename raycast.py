@@ -121,12 +121,6 @@ def parse_args() -> argparse.Namespace:
              "residuals into the Ceres solver alongside MASt3R observations.",
     )
     p.add_argument(
-        "--use-saved-qwen", action="store_true", dest="use_saved_qwen",
-        help="Load Qwen/CLIP anchor results from the cache file "
-             "(output/anchor_cache.json) instead of re-running Qwen.  "
-             "If the cache does not exist, Qwen runs and saves it as usual.",
-    )
-    p.add_argument(
         "--run-matcher-only", action="store_true", dest="run_matcher_only",
         help="Run steps 1–6 (load → OCR → undistort → pose → anchor → MASt3R) "
              "then exit after saving auto_matches.json.  Skips the Ceres solve.",
@@ -164,7 +158,6 @@ def run_pipeline(
     cameras_init_from_config: bool = False,
     use_manual_features: bool = False,
     run_matcher_only: bool = False,
-    use_saved_qwen: bool = False,
 ) -> list:
     """
     Full pipeline: load → OCR → undistort → pose → detect_anchor → MASt3R+Ceres.
@@ -212,17 +205,12 @@ def run_pipeline(
 
     logger.info("═" * 60)
     logger.info("Step 5/6 – Anchor detection (Qwen VL + CLIP)")
-    from pipeline.detect_anchor import detect_anchor, load_anchor_result
-    import os as _os
-    if use_saved_qwen and _os.path.isfile(config.ANCHOR_CACHE_FILE):
-        logger.info("--use-saved-qwen: loading anchor cache from %s", config.ANCHOR_CACHE_FILE)
-        anchor_result = load_anchor_result(config.ANCHOR_CACHE_FILE)
-    else:
-        if use_saved_qwen:
-            logger.warning(
-                "--use-saved-qwen: no cache at %s — running Qwen", config.ANCHOR_CACHE_FILE
-            )
-        anchor_result = detect_anchor(frames)
+    from pipeline.detect_anchor import detect_anchor
+    anchor_result = detect_anchor(frames)
+
+    logger.info("Step 5b – Suppressing bracket + crosshair overlays in undistorted frames")
+    from pipeline.undistort import suppress_center_overlays
+    suppress_center_overlays(frames)
 
     if no_refine:
         logger.info("Step 6/6 – Refinement SKIPPED (--no-refine)")
@@ -255,29 +243,27 @@ def run_pipeline(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def preview_undistort(frames: list) -> None:
-    """Display each undistorted frame; press any key to advance, q to quit."""
-    print("\nUndistortion preview.  Press any key → next frame | q → quit\n")
+    """Save undistorted frames to output/debug/undistort/ (headless-safe)."""
+    out_dir = Path(config.OUTPUT_DIR) / "debug" / "undistort"
+    out_dir.mkdir(parents=True, exist_ok=True)
     for frame in frames:
         if frame.undistorted is None:
             continue
-        label = f"[undistorted] {frame.stem}"
-        cv2.namedWindow(label, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(label, 1280, 720)
-        cv2.imshow(label, frame.undistorted)
-        key = cv2.waitKey(0) & 0xFF
-        cv2.destroyAllWindows()
-        if key == ord("q"):
-            break
+        out_path = out_dir / f"{frame.stem}_undistorted.png"
+        cv2.imwrite(str(out_path), frame.undistorted)
+        logger.info("  Saved: %s", out_path)
+    print(f"\nUndistorted frames saved to: {out_dir}\n")
 
 
 def preview_hud_masks_cmd(frames_dir: str) -> None:
     """
-    Load + undistort frames (HUD masking applied in undistort_all), then save
-    side-by-side debug images showing before/after HUD masking.
+    Load frames and save side-by-side debug images showing before/after HUD masking.
+    Left = undistorted raw (no mask).  Right = mask-then-undistort (correct order).
     """
     import numpy as np
     from pipeline.frame     import load_frames
-    from pipeline.undistort import undistort_all, undistort_frame, build_K, build_D, build_K_new
+    from pipeline.undistort import undistort_image, undistort_frame, _apply_hud_mask_raw, build_K, build_D, build_K_new
+    import copy
 
     logger.info("Loading frames from %s", frames_dir)
     frames = load_frames(frames_dir)
@@ -287,29 +273,30 @@ def preview_hud_masks_cmd(frames_dir: str) -> None:
 
     K, D, K_new = build_K(), build_D(), build_K_new(build_K())
 
-    from pipeline.undistort import undistort_image
     for f in frames:
         if f.raw is None:
             continue
-        # Build without HUD mask for comparison
+        # Left: undistorted with no masking (for comparison)
         raw_undist = undistort_image(f.raw, K, D, K_new)
-        # Apply HUD mask to get the actual masked image
-        undistort_frame(f, K, D, K_new)
-        from pipeline.undistort import _apply_hud_mask
-        _apply_hud_mask(f)
-        masked = f.undistorted
+
+        # Right: mask raw first, then undistort (correct pipeline order)
+        f_copy = copy.copy(f)
+        f_copy.raw = f.raw.copy()
+        _apply_hud_mask_raw(f_copy)
+        undistort_frame(f_copy, K, D, K_new)
+        masked = f_copy.undistorted
 
         canvas = np.hstack([raw_undist, masked])
-        cv2.putText(canvas, "Before HUD mask", (10, 24),
+        cv2.putText(canvas, "Before HUD mask (raw undistorted)", (10, 24),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        cv2.putText(canvas, "After HUD mask",  (raw_undist.shape[1] + 10, 24),
+        cv2.putText(canvas, "After: mask-raw then undistort",  (raw_undist.shape[1] + 10, 24),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
         out_path = out_dir / f"{f.stem}_hud.png"
         cv2.imwrite(str(out_path), canvas)
         logger.info("  Saved: %s", out_path)
 
     print(f"\nHUD mask previews saved to: {out_dir}\n")
-    print("Left = undistorted frame.  Right = HUD regions zeroed (black).")
+    print("Left = undistorted frame (no mask).  Right = mask applied to raw before undistort.")
     print("Adjust HUD_REGIONS in config.py and re-run.\n")
 
 
@@ -542,7 +529,6 @@ def main() -> None:
         cameras_init_from_config=args.cameras_init_from_config,
         use_manual_features=_use_manual,
         run_matcher_only=args.run_matcher_only,
-        use_saved_qwen=args.use_saved_qwen,
     )
 
     # Camera deltas analysis

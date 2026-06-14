@@ -152,6 +152,11 @@ def undistort_all(frames: list[Frame]) -> tuple[np.ndarray, np.ndarray, np.ndarr
     """
     Undistort every frame in *frames* using a single shared K / D / K_new.
 
+    HUD masking is applied to frame.raw BEFORE undistortion so that
+    cv2.remap's bilinear interpolation never samples HUD pixels into
+    scene content.  OCR and bracket-roll detection must already have run
+    on frame.raw before this function is called.
+
     Returns (K, D, K_new) so callers can reuse them for point operations.
     """
     K     = build_K()
@@ -164,19 +169,76 @@ def undistort_all(frames: list[Frame]) -> tuple[np.ndarray, np.ndarray, np.ndarr
     )
     for i, frame in enumerate(frames):
         logger.info("  Undistorting %d/%d: %s", i + 1, len(frames), frame.stem)
+        _apply_hud_mask_raw(frame)       # mask raw FIRST
         undistort_frame(frame, K, D, K_new)
-        _apply_hud_mask(frame)
 
     return K, D, K_new
 
 
-def _apply_hud_mask(frame: Frame) -> None:
-    """Paint HUD overlay regions solid black on frame.undistorted (in-place).
+def _apply_hud_mask_raw(frame: Frame) -> None:
+    """Paint HUD overlay regions solid black on frame.raw (in-place).
 
-    MASt3R's transformer assigns zero confidence to zero-entropy pixels,
-    automatically excluding HUD text/graphics from feature matching.
+    HUD_REGIONS are defined in raw/distorted pixel coordinates.  Masking
+    before undistortion ensures the remap interpolation never blends HUD
+    content into adjacent scene pixels.
     """
-    if frame.undistorted is None:
+    if frame.raw is None:
         return
     for (y1, y2, x1, x2) in config.HUD_REGIONS:
-        frame.undistorted[y1:y2, x1:x2] = 0
+        frame.raw[y1:y2, x1:x2] = 0
+
+
+def suppress_center_overlays(frames: list[Frame]) -> None:
+    """Gaussian-blur bracket and crosshair HUD overlays in frame.undistorted.
+
+    Called after estimate_poses (brackets known) and detect_anchor (crosshair
+    known), and before MASt3R, so the feature matcher never sees HUD lines.
+    """
+    K, D, K_new = build_K(), build_D(), build_K_new(build_K())
+    ksize = config.OVERLAY_BLUR_KERNEL
+    pad   = config.OVERLAY_BLUR_PAD
+
+    for frame in frames:
+        if frame.undistorted is None:
+            continue
+        img  = frame.undistorted
+        h, w = img.shape[:2]
+
+        # ── Brackets ─────────────────────────────────────────────────────────
+        if frame.bracket_rects_raw:
+            for (ry1, ry2, rx1, rx2) in frame.bracket_rects_raw:
+                # Map raw-space corners to undistorted space, take axis-aligned bbox
+                corners = [(rx1, ry1), (rx2, ry1), (rx2, ry2), (rx1, ry2)]
+                pts_u   = [undistort_point(x, y, K, D, K_new) for x, y in corners]
+                ux = [p[0] for p in pts_u]
+                uy = [p[1] for p in pts_u]
+                y1c = max(0, int(min(uy)) - pad)
+                y2c = min(h, int(max(uy)) + pad)
+                x1c = max(0, int(min(ux)) - pad)
+                x2c = min(w, int(max(ux)) + pad)
+                if y2c > y1c and x2c > x1c:
+                    roi = img[y1c:y2c, x1c:x2c]
+                    img[y1c:y2c, x1c:x2c] = cv2.GaussianBlur(roi, (ksize, ksize), 0)
+        else:
+            # Fallback: blur entire center window (brackets not detected)
+            cx, cy = w // 2, h // 2
+            margin = config.BRACKET_SEARCH_MARGIN
+            y1c = max(0, cy - margin); y2c = min(h, cy + margin)
+            x1c = max(0, cx - margin); x2c = min(w, cx + margin)
+            roi = img[y1c:y2c, x1c:x2c]
+            img[y1c:y2c, x1c:x2c] = cv2.GaussianBlur(roi, (ksize, ksize), 0)
+            logger.debug("[%s] bracket fallback: blurred full ±%dpx center window",
+                         frame.stem, margin)
+
+        # ── Crosshair ────────────────────────────────────────────────────────
+        if frame.crosshair_bbox_norm is not None:
+            yn1, xn1, yn2, xn2 = frame.crosshair_bbox_norm
+            y1c = max(0, int(yn1 * h / 1000) - pad)
+            y2c = min(h, int(yn2 * h / 1000) + pad)
+            x1c = max(0, int(xn1 * w / 1000) - pad)
+            x2c = min(w, int(xn2 * w / 1000) + pad)
+            if y2c > y1c and x2c > x1c:
+                roi = img[y1c:y2c, x1c:x2c]
+                img[y1c:y2c, x1c:x2c] = cv2.GaussianBlur(roi, (ksize, ksize), 0)
+            logger.debug("[%s] crosshair blurred at undist px [%d:%d, %d:%d]",
+                         frame.stem, y1c, y2c, x1c, x2c)

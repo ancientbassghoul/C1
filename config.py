@@ -125,7 +125,7 @@ GEOCALIB_ENABLED = True
 # MASt3R's transformer assigns zero confidence to zero-entropy black regions,
 # excluding HUD pixels from feature matching automatically.
 #
-# Each entry is (y1, y2, x1, x2) in the UNDISTORTED frame coordinate space.
+# Each entry is (y1, y2, x1, x2) in the raw/distorted frame coordinate space.
 # Format: (top-row, bottom-row, left-col, right-col)
 HUD_REGIONS = [
     # Top-left: status icons (record dot, power, motor RPM, camera icon)
@@ -167,9 +167,6 @@ CLIP_MODEL  = "openai/clip-vit-large-patch14"
 CLIP_ANCHOR_THRESHOLD  = 0.85
 CLIP_ANCHOR_MIN_WEIGHT = 0.50
 
-# Cache file for Qwen/CLIP anchor results (written on every run, loaded by --use-saved-qwen).
-ANCHOR_CACHE_FILE = "./output/anchor_cache.json"
-
 # ─────────────────────────────────────────────────────────────────────────────
 # MAST3R-SFM
 # ─────────────────────────────────────────────────────────────────────────────
@@ -205,12 +202,25 @@ ESTIMATE_FOCAL_LENGTH = False
 FOCAL_LENGTH_RANGE    = 0.22   # ±22% of FOCAL_LENGTH
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ROLL DETECTION
+# ROLL DETECTION + CENTER OVERLAY SUPPRESSION
 # ─────────────────────────────────────────────────────────────────────────────
 # Area bounds (pixels²) for white connected-component blobs to be considered
 # a HUD bracket symbol.
-ROLL_BRACKET_MIN_AREA = 80
-ROLL_BRACKET_MAX_AREA = 2500
+ROLL_BRACKET_MIN_AREA  = 80
+ROLL_BRACKET_MAX_AREA  = 2500
+
+# Half-width of the bracket search window (pixels from image center).
+# Used by pose.py for detection and by undistort.suppress_center_overlays
+# as the fallback blur window when no brackets are detected.
+BRACKET_SEARCH_MARGIN  = 200
+
+# Gaussian blur applied to brackets and crosshair in frame.undistorted
+# before MASt3R and Qwen see the images.
+OVERLAY_BLUR_KERNEL    = 51    # must be odd
+OVERLAY_BLUR_PAD       = 10    # extra padding (px) around each detected bbox
+
+# IoU threshold above which a Qwen discovery result is excluded as crosshair.
+CROSSHAIR_IOU_EXCLUDE  = 0.3
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CAMERA POSE OVERRIDES

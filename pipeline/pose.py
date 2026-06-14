@@ -155,7 +155,24 @@ def build_rotation(yaw_deg: float, pitch_deg: float, roll_deg: float = 0.0) -> n
 # Roll detection from artificial horizon indicator
 # ─────────────────────────────────────────────────────────────────────────────
 
-def detect_camera_roll(raw_img: np.ndarray) -> Optional[float]:
+def _blob_rects_to_raw(
+    label_indices: list,
+    stats: np.ndarray,
+    x0: int,
+    y0: int,
+) -> list:
+    """Convert crop-local blob stats to raw-frame (y1,y2,x1,x2) tuples."""
+    rects = []
+    for li in label_indices:
+        left   = int(stats[li, cv2.CC_STAT_LEFT])
+        top    = int(stats[li, cv2.CC_STAT_TOP])
+        width  = int(stats[li, cv2.CC_STAT_WIDTH])
+        height = int(stats[li, cv2.CC_STAT_HEIGHT])
+        rects.append((y0 + top, y0 + top + height, x0 + left, x0 + left + width))
+    return rects
+
+
+def detect_camera_roll(raw_img: np.ndarray):
     """
     Detect camera roll from the artificial horizon bracket indicator in the HUD.
 
@@ -174,13 +191,15 @@ def detect_camera_roll(raw_img: np.ndarray) -> Optional[float]:
     All three methods produce the same answer when blobs are perfectly symmetric,
     so there is no discontinuity between them.
 
-    Returns roll in degrees (positive = roll right) or None if all three fail.
+    Returns (roll_deg, bracket_rects) where roll_deg is None if all strategies
+    fail and bracket_rects is a list of (y1,y2,x1,x2) tuples in raw-frame coords
+    for the winning blobs (used by suppress_center_overlays for blurring).
     """
     h, w = raw_img.shape[:2]
     cx, cy = w // 2, h // 2
 
     # Generous window — handles brackets at any roll angle including ±90°
-    margin = 200
+    margin = config.BRACKET_SEARCH_MARGIN
     x0, x1 = max(0, cx - margin), min(w, cx + margin)
     y0, y1 = max(0, cy - margin), min(h, cy + margin)
     crop = raw_img[y0:y1, x0:x1]
@@ -207,14 +226,14 @@ def detect_camera_roll(raw_img: np.ndarray) -> Optional[float]:
     MAX_AREA = config.ROLL_BRACKET_MAX_AREA
     centre   = np.array([bw / 2.0, bh / 2.0])
 
-    candidates = []
+    candidates = []  # (centroid, dist, area, label_index)
     for i in range(1, n_labels):   # skip label 0 (background)
         area = int(stats[i, cv2.CC_STAT_AREA])
         if MIN_AREA <= area <= MAX_AREA:
             c = centroids[i]
             dist = float(np.linalg.norm(c - centre))
             if dist > inner:       # must be outside the blanked crosshair zone
-                candidates.append((c, dist, area))
+                candidates.append((c, dist, area, i))
 
     # ── Strategy 1: two-blob (most reliable) ─────────────────────────────────
     if len(candidates) >= 2:
@@ -222,9 +241,9 @@ def detect_camera_roll(raw_img: np.ndarray) -> Optional[float]:
         best_pair  = None
 
         for i in range(len(candidates)):
-            c1, d1, _ = candidates[i]
+            c1, d1, _, li1 = candidates[i]
             for j in range(i + 1, len(candidates)):
-                c2, d2, _ = candidates[j]
+                c2, d2, _, li2 = candidates[j]
 
                 v1 = c1 - centre
                 v2 = c2 - centre
@@ -238,10 +257,10 @@ def detect_camera_roll(raw_img: np.ndarray) -> Optional[float]:
 
                 if score > best_score:
                     best_score = score
-                    best_pair  = (c1, c2)
+                    best_pair  = (c1, c2, li1, li2)
 
         if best_pair is not None and best_score >= 0.5:
-            c1, c2 = best_pair
+            c1, c2, li1, li2 = best_pair
             left, right = (c1, c2) if c1[0] < c2[0] else (c2, c1)
             angle = math.degrees(math.atan2(
                 float(right[1] - left[1]),
@@ -251,7 +270,7 @@ def detect_camera_roll(raw_img: np.ndarray) -> Optional[float]:
                 "Roll (two-blob): %.1f°  left=[%.0f,%.0f] right=[%.0f,%.0f]  score=%.2f",
                 angle, left[0], left[1], right[0], right[1], best_score,
             )
-            return float(angle)
+            return float(angle), _blob_rects_to_raw([li1, li2], stats, x0, y0)
 
         logger.debug(
             "Roll two-blob failed (best score=%.2f) — trying single-blob fallback.",
@@ -259,9 +278,9 @@ def detect_camera_roll(raw_img: np.ndarray) -> Optional[float]:
         )
 
     # ── Strategy 2: left blob + crosshair centre ──────────────────────────────
-    left_blobs = [(c, d, a) for c, d, a in candidates if c[0] < centre[0]]
+    left_blobs = [(c, d, a, li) for c, d, a, li in candidates if c[0] < centre[0]]
     if left_blobs:
-        c, dist, _ = max(left_blobs, key=lambda x: x[2])   # largest blob
+        c, dist, _, li = max(left_blobs, key=lambda x: x[2])   # largest blob
         angle = math.degrees(math.atan2(
             float(centre[1] - c[1]),
             float(centre[0] - c[0]),
@@ -270,12 +289,12 @@ def detect_camera_roll(raw_img: np.ndarray) -> Optional[float]:
             "Roll (left-blob fallback): %.1f°  blob=[%.0f,%.0f]  dist=%.1f",
             angle, c[0], c[1], dist,
         )
-        return float(angle)
+        return float(angle), _blob_rects_to_raw([li], stats, x0, y0)
 
     # ── Strategy 3: right blob + crosshair centre ─────────────────────────────
-    right_blobs = [(c, d, a) for c, d, a in candidates if c[0] >= centre[0]]
+    right_blobs = [(c, d, a, li) for c, d, a, li in candidates if c[0] >= centre[0]]
     if right_blobs:
-        c, dist, _ = max(right_blobs, key=lambda x: x[2])  # largest blob
+        c, dist, _, li = max(right_blobs, key=lambda x: x[2])  # largest blob
         angle = math.degrees(math.atan2(
             float(c[1] - centre[1]),
             float(c[0] - centre[0]),
@@ -284,10 +303,10 @@ def detect_camera_roll(raw_img: np.ndarray) -> Optional[float]:
             "Roll (right-blob fallback): %.1f°  blob=[%.0f,%.0f]  dist=%.1f",
             angle, c[0], c[1], dist,
         )
-        return float(angle)
+        return float(angle), _blob_rects_to_raw([li], stats, x0, y0)
 
     logger.debug("Roll detection: no usable blobs found — all strategies failed.")
-    return None
+    return None, []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -347,22 +366,31 @@ def estimate_poses(frames: list[Frame], skip_bracket_roll: bool | None = None) -
             roll = config.CAMERA_ROLL_OVERRIDES[frame.stem]
             frame.camera_roll_deg = -roll   # override: same convention as bracket
             logger.info("[%s] Roll from manual override: %.1f°", frame.stem, roll)
-        elif not skip_bracket_roll and (detected_roll := detect_camera_roll(frame.raw)) is not None:
-            roll = detected_roll
-            frame.camera_roll_deg = -roll
-            logger.info("[%s] Roll from horizon indicator: %.1f°", frame.stem, roll)
-        elif frame in geocalib:
-            _, roll = geocalib[frame]
-            frame.camera_roll_deg = roll
-            if skip_bracket_roll:
-                logger.info("[%s] Roll from GeoCalib: %.1f°", frame.stem, roll)
-            else:
+        elif not skip_bracket_roll:
+            _detected_roll, _rects = detect_camera_roll(frame.raw)
+            frame.bracket_rects_raw = _rects
+            if _detected_roll is not None:
+                roll = _detected_roll
+                frame.camera_roll_deg = -roll
+                logger.info("[%s] Roll from horizon indicator: %.1f°", frame.stem, roll)
+            elif frame in geocalib:
+                _, roll = geocalib[frame]
+                frame.camera_roll_deg = roll
                 logger.warning(
                     "[%s] *** BRACKET DETECTION FAILED ON ALL STRATEGIES — "
                     "FALLING BACK TO GEOCALIB (roll=%.1f°) — "
                     "CHECK HUD FOR OBSTRUCTION ***",
                     frame.stem, roll,
                 )
+            else:
+                roll = config.CAMERA_ROLL_DEG
+                frame.camera_roll_deg = -roll
+                logger.info("[%s] Roll: no source available – using default %.1f°",
+                            frame.stem, roll)
+        elif frame in geocalib:
+            _, roll = geocalib[frame]
+            frame.camera_roll_deg = roll
+            logger.info("[%s] Roll from GeoCalib: %.1f°", frame.stem, roll)
         else:
             roll = config.CAMERA_ROLL_DEG
             frame.camera_roll_deg = -roll

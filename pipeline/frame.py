@@ -87,6 +87,14 @@ class Frame:
     # Stored here so refine.py can access it without re-detecting.
     camera_roll_deg: float = 0.0
 
+    # Bounding boxes of detected bracket blobs in raw/distorted pixel coords.
+    # Populated by pose.py; used by undistort.suppress_center_overlays for blurring.
+    bracket_rects_raw: list = field(default_factory=list)  # list of (y1,y2,x1,x2)
+
+    # Crosshair bbox from Qwen in [0,1000] normalized coords (ymin,xmin,ymax,xmax).
+    # Populated by detect_anchor; used by suppress_center_overlays.
+    crosshair_bbox_norm: Optional[tuple] = None
+
     # ── Convenience ───────────────────────────────────────────────────────────
     @property
     def ready(self) -> bool:

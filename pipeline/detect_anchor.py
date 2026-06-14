@@ -83,6 +83,14 @@ def load_anchor_result(path: str) -> AnchorResult:
 # Phase 1 — Per-frame Qwen VL discovery
 # ─────────────────────────────────────────────────────────────────────────────
 
+_CROSSHAIR_PROMPT = (
+    "This is a drone FPV video frame with a HUD overlay. "
+    "Find the white crosshair or aiming reticle (a + or ⊕ symbol) overlaid on the image. "
+    'Return ONLY a single JSON object: {"bbox": [ymin, xmin, ymax, xmax]} '
+    "where values are integers in [0, 1000] normalized to the image dimensions. "
+    'If no crosshair is visible, return {"bbox": null}.'
+)
+
 _DISCOVERY_PROMPT = (
     "List every discrete physical object you can see in this image. "
     "For each object provide a bounding box and a label. "
@@ -93,6 +101,55 @@ _DISCOVERY_PROMPT = (
     'Format: [{"label": "...", "bbox": [ymin, xmin, ymax, xmax]}, ...]  '
     "where bbox values are integers in [0, 1000] normalized to the image dimensions."
 )
+
+
+def _qwen_find_crosshair(model, processor, frame_bgr: np.ndarray):
+    """Locate the HUD crosshair in one frame via a short targeted Qwen query.
+
+    Returns (ymin, xmin, ymax, xmax) in [0,1000] normalized coords, or None.
+    """
+    import torch
+    import cv2
+    from PIL import Image
+
+    rgb     = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    pil_img = Image.fromarray(rgb)
+
+    messages = [{"role": "user", "content": [
+        {"type": "image", "image": pil_img},
+        {"type": "text",  "text": _CROSSHAIR_PROMPT},
+    ]}]
+    text   = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = processor(text=[text], images=[pil_img], return_tensors="pt").to(model.device)
+
+    with torch.no_grad():
+        out_ids = model.generate(**inputs, max_new_tokens=64)
+
+    generated = out_ids[0][inputs["input_ids"].shape[1]:]
+    response  = processor.decode(generated, skip_special_tokens=True).strip()
+
+    try:
+        clean = re.sub(r"```(?:json)?|```", "", response).strip()
+        data  = json.loads(clean)
+        bbox  = data.get("bbox") if isinstance(data, dict) else None
+        if bbox and len(bbox) == 4:
+            return tuple(int(v) for v in bbox)
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        logger.debug("Crosshair parse failed; raw: %s", response[:100])
+    return None
+
+
+def _bbox_iou_norm(a, b) -> float:
+    """IoU of two [ymin,xmin,ymax,xmax] bboxes (any coordinate scale)."""
+    iy1 = max(a[0], b[0]); ix1 = max(a[1], b[1])
+    iy2 = min(a[2], b[2]); ix2 = min(a[3], b[3])
+    inter = max(0, iy2 - iy1) * max(0, ix2 - ix1)
+    if inter == 0:
+        return 0.0
+    area_a = max(0, a[2]-a[0]) * max(0, a[3]-a[1])
+    area_b = max(0, b[2]-b[0]) * max(0, b[3]-b[1])
+    union  = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
 
 
 def _qwen_discover_frame(model, processor, frame_bgr: np.ndarray) -> list[dict]:
@@ -358,8 +415,30 @@ def detect_anchor(frames: list) -> AnchorResult:
             per_frame_objects[frame.stem] = []
             continue
 
+        # Step A: find crosshair first so we can exclude it from anchor candidates
+        logger.info("  Finding crosshair in %s …", frame.stem[-12:])
+        ch_bbox = _qwen_find_crosshair(qwen_model, qwen_proc, frame.undistorted)
+        frame.crosshair_bbox_norm = ch_bbox
+        if ch_bbox is not None:
+            logger.info("    → crosshair at %s (norm [0,1000])", ch_bbox)
+        else:
+            logger.info("    → no crosshair detected")
+
+        # Step B: standard per-frame object discovery
         logger.info("  Querying Qwen for frame %s …", frame.stem[-12:])
         raw_objects = _qwen_discover_frame(qwen_model, qwen_proc, frame.undistorted)
+
+        # Filter out any object whose bbox overlaps the detected crosshair
+        if ch_bbox is not None:
+            before = len(raw_objects)
+            raw_objects = [
+                obj for obj in raw_objects
+                if _bbox_iou_norm(obj.get("bbox", [0,0,0,0]), list(ch_bbox))
+                   <= config.CROSSHAIR_IOU_EXCLUDE
+            ]
+            dropped = before - len(raw_objects)
+            if dropped:
+                logger.info("    → excluded %d object(s) overlapping crosshair", dropped)
 
         h, w = frame.undistorted.shape[:2]
         scaled = []
