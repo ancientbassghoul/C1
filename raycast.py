@@ -176,6 +176,20 @@ def parse_args() -> argparse.Namespace:
              "and reports the delta against the OCR compass heading.  "
              "Skips the interactive UI.",
     )
+    p.add_argument(
+        "--export-solve", nargs="?", const="", default=None,
+        dest="export_solve", metavar="PATH",
+        help="After the solve, write camera poses to PATH "
+             "(default: output/solved_cameras.json) and exit without opening "
+             "the GUI.  Compatible with --manual-fm-json for headless RunPod runs.",
+    )
+    p.add_argument(
+        "--import-solve", nargs="?", const="", default=None,
+        dest="import_solve", metavar="PATH",
+        help="Skip OCR / pose / solver.  Load solved camera state from PATH "
+             "(default: output/solved_cameras.json) and open the interactive "
+             "viewer.  Use locally after copying the JSON from RunPod.",
+    )
     return p.parse_args()
 
 
@@ -591,6 +605,20 @@ def main() -> None:
         show_scores_cmd(args.frames_dir, _score_path, edit_mode=False)
         return
 
+    # Import-solve: skip pipeline, load JSON, open GUI
+    if args.import_solve is not None:
+        from pipeline.frame     import load_frames
+        from pipeline.undistort import undistort_all
+        from pipeline.solve_io  import import_solve
+        import config as _cfg_is
+        _frames = load_frames(args.frames_dir)
+        undistort_all(_frames)
+        _path = args.import_solve or os.path.join(_cfg_is.OUTPUT_DIR, "solved_cameras.json")
+        n = import_solve(_frames, _path)
+        logger.info("Imported solve for %d frame(s) from %s", n, _path)
+        run_interactive(_frames)
+        return
+
     # Run the shared pipeline
     frames = run_pipeline(args.frames_dir, no_refine=args.no_refine, no_enhance=not args.enhance, height_mode=args.height, feature_matcher_debug=args.feature_matcher_debug, preview_ground_masks=args.preview_ground_masks, preview_hsv_masks=args.preview_hsv_masks, cameras_init_from_config=args.cameras_init_from_config, manual_fm_json=args.manual_fm_json,
                         run_matcher_only=args.run_matcher_only)
@@ -605,6 +633,17 @@ def main() -> None:
         import config as _cfg_mo
         print(f"\nDone.  Matches saved to: {_cfg_mo.AUTO_MATCHES_FILE}")
         print("Run --show-scores to inspect them.\n")
+        return
+
+    # Export-solve: serialize solved state and exit without GUI
+    if args.export_solve is not None:
+        from pipeline.solve_io import export_solve
+        import config as _cfg_es
+        _path = args.export_solve or os.path.join(_cfg_es.OUTPUT_DIR, "solved_cameras.json")
+        export_solve(frames, _path)
+        print(f"\nSolved cameras written to: {_path}")
+        print("Copy this file locally and run:")
+        print(f"  python raycast.py --frames_dir ./frames --import-solve {_path}\n")
         return
 
     # Feature-matcher debug UI (replaces the old per-pair PNG file dumps)
