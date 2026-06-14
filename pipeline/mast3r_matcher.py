@@ -89,15 +89,59 @@ def _save_frames_to_tmpdir(frames: list, tmpdir: str) -> tuple[list[str], dict[s
     return filelist, stem_to_path
 
 
-def _load_mast3r_model(device: str):
-    """Load MASt3R model from config.MAST3R_MODEL with caching."""
-    from mast3r.model import AsymmetricMASt3R
+def _resolve_mast3r_pth(model_id: str, cache_dir: str) -> str:
+    """Return a local .pth path for *model_id*, downloading from NAVER CDN if needed.
 
-    logger.info("Loading MASt3R model %s …", config.MAST3R_MODEL)
-    model = AsymmetricMASt3R.from_pretrained(
-        config.MAST3R_MODEL,
-        cache_dir=config.MODEL_CACHE_DIR,
-    ).to(device)
+    model_id may be:
+      - an absolute/relative file path  → returned as-is
+      - a HF-style identifier           → e.g. "naver/MASt3R_ViTLarge_BaseDecoder_512_capdepth"
+
+    HuggingFace Hub loading is deliberately avoided: the HF route requires either
+    network auth (401 on RunPod) or a locally-cached HF model directory, and it
+    triggers a MASt3R-internal bug where img_size arrives as an int rather than a
+    tuple.  The NAVER CDN .pth files load through load_model() which is not affected.
+    """
+    import urllib.request
+
+    # Already a file path?
+    if os.path.isfile(model_id):
+        return model_id
+
+    # Derive .pth filename from the last component of the HF repo id.
+    model_name = model_id.split("/")[-1]  # e.g. "MASt3R_ViTLarge_BaseDecoder_512_capdepth"
+    pth_name = model_name if model_name.endswith(".pth") else f"{model_name}.pth"
+    pth_path = os.path.join(cache_dir, pth_name)
+
+    if os.path.isfile(pth_path):
+        logger.info("Using cached MASt3R weights: %s", pth_path)
+        return pth_path
+
+    # Download from NAVER CDN — no authentication required.
+    cdn_url = f"https://download.europe.naverlabs.com/ComputerVision/MASt3R/{pth_name}"
+    os.makedirs(cache_dir, exist_ok=True)
+    logger.info("Downloading MASt3R weights from %s → %s", cdn_url, pth_path)
+
+    def _progress(block_num, block_size, total_size):
+        if total_size > 0:
+            pct = min(100, block_num * block_size * 100 // total_size)
+            if pct % 10 == 0:
+                logger.info("  … %d%%", pct)
+
+    urllib.request.urlretrieve(cdn_url, pth_path, reporthook=_progress)
+    logger.info("Download complete: %s", pth_path)
+    return pth_path
+
+
+def _load_mast3r_model(device: str):
+    """Load MASt3R model, preferring a local .pth file over the HuggingFace Hub path."""
+    import sys
+    if '/workspace/mast3r' not in sys.path:
+        sys.path.insert(0, '/workspace/mast3r')
+    from mast3r.model import load_model as mast3r_load_model
+
+    pth_path = _resolve_mast3r_pth(config.MAST3R_MODEL, config.MODEL_CACHE_DIR)
+    logger.info("Loading MASt3R model from %s …", pth_path)
+    model = mast3r_load_model(pth_path, device=device, verbose=False)
     model.eval()
     return model
 

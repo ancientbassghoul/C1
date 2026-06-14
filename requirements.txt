@@ -4,5 +4,6 @@ scipy>=1.11
 matplotlib>=3.7
 easyocr>=1.7
 Pillow>=10.0
-ultralytics>=8.0
-transformers==4.38.1
+transformers>=4.49
+pyceres>=2.6
+geocalib @ git+https://github.com/cvg/GeoCalib

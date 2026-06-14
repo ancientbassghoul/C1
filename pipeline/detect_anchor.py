@@ -48,6 +48,38 @@ class AnchorResult:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Cache helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def save_anchor_result(result: AnchorResult, path: str) -> None:
+    """Serialize AnchorResult to JSON for --use-saved-qwen reuse."""
+    import json
+    import os
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    data = {
+        "label": result.label,
+        "bboxes": result.bboxes,
+        "centroids": {k: list(v) for k, v in result.centroids.items()},
+        "weights": result.weights,
+    }
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def load_anchor_result(path: str) -> AnchorResult:
+    """Deserialize AnchorResult from JSON saved by save_anchor_result()."""
+    import json
+    with open(path) as f:
+        data = json.load(f)
+    return AnchorResult(
+        label=data["label"],
+        bboxes=data["bboxes"],
+        centroids={k: tuple(v) for k, v in data["centroids"].items()},
+        weights=data["weights"],
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Phase 1 — Per-frame Qwen VL discovery
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -250,6 +282,10 @@ def _compute_clip_weights(
     ).to(clip_model.device)
     with torch.no_grad():
         text_feats = clip_model.get_text_features(**text_inputs)
+        if not isinstance(text_feats, torch.Tensor):
+            # transformers >= 4.50 returns an output object; pooler_output is the
+            # already-projected CLIP embedding — use it directly, no extra projection.
+            text_feats = text_feats.pooler_output
         text_feats = text_feats / text_feats.norm(dim=-1, keepdim=True)
 
     frame_map = {f.stem: f for f in frames}
@@ -274,6 +310,8 @@ def _compute_clip_weights(
         )
         with torch.no_grad():
             img_feats = clip_model.get_image_features(**img_inputs)
+            if not isinstance(img_feats, torch.Tensor):
+                img_feats = img_feats.pooler_output
             img_feats = img_feats / img_feats.norm(dim=-1, keepdim=True)
 
         similarity = float((img_feats @ text_feats.T).squeeze())
@@ -410,6 +448,8 @@ def detect_anchor(frames: list) -> AnchorResult:
         "Anchor detection complete: label='%s'  frames=%d  above_threshold=%d",
         chosen_label, len(bboxes_pixel), n_above,
     )
+    save_anchor_result(result, config.ANCHOR_CACHE_FILE)
+    logger.info("Saved Qwen/CLIP anchor cache → %s", config.ANCHOR_CACHE_FILE)
     return result
 
 

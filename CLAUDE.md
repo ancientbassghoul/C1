@@ -12,6 +12,19 @@ The scene: a stationary van on highly repetitive agricultural ground. Several fr
 
 ---
 
+## Setup
+
+MASt3R and Qwen must be installed first (from source, into `venv/`) — see §External dependencies below. Once that venv exists, install the remaining dependencies:
+
+```bash
+pip install -r requirements.txt
+pip install -e .
+```
+
+`torch` is not listed in `requirements.txt` — it is already present as a MASt3R dependency.
+
+---
+
 ## Running the pipeline
 
 All commands use `venv\Scripts\python` (Windows). The frames folder (containing PNG/JPG drone footage) must be provided via `--frames_dir`.
@@ -163,11 +176,12 @@ Local:   (copy solved_cameras.json from pod)
 
 ### External dependencies not in requirements.txt
 
-These must be installed manually:
+These must be installed manually (from source, into the same `venv/`):
 - **MASt3R-SfM** (`mast3r`, `dust3r`) — requires CUDA; install from source on RunPod
-- **Qwen VL** (`transformers` + `Qwen2.5-VL-7B-Instruct`) — requires CUDA
-- **CLIP** (`openai/clip-vit-large-patch14`) — via `transformers`
-- **pyceres** + **GeoCalib** — installed via `SETUP_SECOND.bat`
+- **Qwen VL** (`Qwen2.5-VL-7B-Instruct`) — requires CUDA; loaded via `transformers>=4.49`
+- **CLIP** (`openai/clip-vit-large-patch14`) — downloaded at runtime via `transformers`
+
+`pyceres` and `geocalib` are now in `requirements.txt` and install automatically.
 
 **Model download path:** All `from_pretrained()` calls must pass `cache_dir=config.MODEL_CACHE_DIR` (default `./models/`). Never let models download to the pod's `/root/.cache` — it is wiped when the pod stops. `models/` is in `.gitignore`.
 

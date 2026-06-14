@@ -167,6 +167,9 @@ CLIP_MODEL  = "openai/clip-vit-large-patch14"
 CLIP_ANCHOR_THRESHOLD  = 0.85
 CLIP_ANCHOR_MIN_WEIGHT = 0.50
 
+# Cache file for Qwen/CLIP anchor results (written on every run, loaded by --use-saved-qwen).
+ANCHOR_CACHE_FILE = "./output/anchor_cache.json"
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MAST3R-SFM
 # ─────────────────────────────────────────────────────────────────────────────
