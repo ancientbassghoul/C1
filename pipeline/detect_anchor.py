@@ -45,6 +45,8 @@ class AnchorResult:
     bboxes:    dict = field(default_factory=dict) # frame.stem → [y1,x1,y2,x2] pixel
     centroids: dict = field(default_factory=dict) # frame.stem → (u, v) pixel
     weights:   dict = field(default_factory=dict) # frame.stem → CLIP cosine similarity
+    # per-frame crosshair bbox in Qwen processed-image coords (xmin,ymin,xmax,ymax) or None
+    crosshair_bboxes: dict = field(default_factory=dict)  # frame.stem → tuple|None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -61,6 +63,10 @@ def save_anchor_result(result: AnchorResult, path: str) -> None:
         "bboxes": result.bboxes,
         "centroids": {k: list(v) for k, v in result.centroids.items()},
         "weights": result.weights,
+        "crosshair_bboxes": {
+            k: list(v) if v is not None else None
+            for k, v in result.crosshair_bboxes.items()
+        },
     }
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
@@ -71,11 +77,16 @@ def load_anchor_result(path: str) -> AnchorResult:
     import json
     with open(path) as f:
         data = json.load(f)
+    raw_ch = data.get("crosshair_bboxes", {})
     return AnchorResult(
         label=data["label"],
         bboxes=data["bboxes"],
         centroids={k: tuple(v) for k, v in data["centroids"].items()},
         weights=data["weights"],
+        crosshair_bboxes={
+            k: tuple(v) if v is not None else None
+            for k, v in raw_ch.items()
+        },
     )
 
 
@@ -721,6 +732,7 @@ def detect_anchor(frames: list) -> AnchorResult:
         bboxes=bboxes_pixel,
         centroids=centroids,
         weights=weights,
+        crosshair_bboxes={f.stem: f.crosshair_bbox_px for f in frames},
     )
 
     n_above = sum(1 for w in weights.values() if w >= config.CLIP_ANCHOR_THRESHOLD)

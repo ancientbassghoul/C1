@@ -206,7 +206,25 @@ def suppress_center_overlays(frames: list[Frame]) -> None:
 
         # ── Brackets ─────────────────────────────────────────────────────────
         if frame.bracket_rects_raw:
-            for (ry1, ry2, rx1, rx2) in frame.bracket_rects_raw:
+            rects_to_blur = list(frame.bracket_rects_raw)
+            if len(frame.bracket_rects_raw) == 1:
+                # Mirror the single detected bracket through the raw-image centre
+                # so the undetected opposite bracket is also blurred.
+                ry1, ry2, rx1, rx2 = frame.bracket_rects_raw[0]
+                raw_h, raw_w = frame.raw.shape[:2]
+                rcx = (rx1 + rx2) / 2.0
+                rcy = (ry1 + ry2) / 2.0
+                hw  = (rx2 - rx1) / 2.0
+                hh  = (ry2 - ry1) / 2.0
+                mx  = 2 * (raw_w // 2) - rcx
+                my  = 2 * (raw_h // 2) - rcy
+                rects_to_blur.append((
+                    int(my - hh), int(my + hh),
+                    int(mx - hw), int(mx + hw),
+                ))
+                logger.debug("[%s] bracket symmetry: added mirror rect (%.0f,%.0f)→(%.0f,%.0f)",
+                             frame.stem, mx - hw, my - hh, mx + hw, my + hh)
+            for (ry1, ry2, rx1, rx2) in rects_to_blur:
                 # Map raw-space corners to undistorted space, take axis-aligned bbox
                 corners = [(rx1, ry1), (rx2, ry1), (rx2, ry2), (rx1, ry2)]
                 pts_u   = [undistort_point(x, y, K, D, K_new) for x, y in corners]
@@ -230,7 +248,7 @@ def suppress_center_overlays(frames: list[Frame]) -> None:
             logger.debug("[%s] bracket fallback: blurred full ±%dpx center window",
                          frame.stem, margin)
 
-        # ── Crosshair ────────────────────────────────────────────────────────
+        # ── Crosshair (Qwen-detected) ─────────────────────────────────────────
         if frame.crosshair_bbox_px is not None:
             x1p, y1p, x2p, y2p = frame.crosshair_bbox_px  # [xmin,ymin,xmax,ymax] proc pixels
             h_proc = max(28, round(h / 28) * 28)
@@ -244,3 +262,14 @@ def suppress_center_overlays(frames: list[Frame]) -> None:
                 img[y1c:y2c, x1c:x2c] = cv2.GaussianBlur(roi, (ksize, ksize), 0)
             logger.debug("[%s] crosshair blurred at undist px [%d:%d, %d:%d]",
                          frame.stem, y1c, y2c, x1c, x2c)
+
+        # ── Fixed center reticle (always present, ~17×17 px "+" symbol) ───────
+        # Blur unconditionally — idempotent if Qwen already covered this region.
+        half = 8  # 8+1+8 = 17 px
+        cy, cx = h // 2, w // 2
+        y1c = max(0, cy - half - pad)
+        y2c = min(h, cy + half + pad)
+        x1c = max(0, cx - half - pad)
+        x2c = min(w, cx + half + pad)
+        roi = img[y1c:y2c, x1c:x2c]
+        img[y1c:y2c, x1c:x2c] = cv2.GaussianBlur(roi, (ksize, ksize), 0)
