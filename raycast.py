@@ -150,6 +150,13 @@ def parse_args() -> argparse.Namespace:
              "(output/anchor_cache.json) instead of re-running Qwen.  "
              "If the cache does not exist, Qwen runs and saves it as usual.",
     )
+    p.add_argument(
+        "--save-mast3r-images", nargs="?", const="", default=None,
+        dest="save_mast3r_images", metavar="DIR",
+        help="Save the HUD-masked undistorted images that would be fed to MASt3R "
+             "to DIR (default: output/debug/mast3r_inputs/), then exit without "
+             "running MASt3R or Ceres.",
+    )
     return p.parse_args()
 
 
@@ -165,6 +172,7 @@ def run_pipeline(
     use_manual_features: bool = False,
     run_matcher_only: bool = False,
     use_saved_qwen: bool = False,
+    save_mast3r_images: str | None = None,
 ) -> list:
     """
     Full pipeline: load → OCR → undistort → pose → detect_anchor → MASt3R+Ceres.
@@ -240,6 +248,7 @@ def run_pipeline(
             cameras_init_from_config=cameras_init_from_config,
             use_manual_features=use_manual_features,
             matcher_only=run_matcher_only,
+            save_mast3r_images=save_mast3r_images,
         )
 
     ready = [f for f in frames if f.ready]
@@ -546,6 +555,7 @@ def main() -> None:
         use_manual_features=_use_manual,
         run_matcher_only=args.run_matcher_only,
         use_saved_qwen=args.use_saved_qwen,
+        save_mast3r_images=args.save_mast3r_images,
     )
 
     # Camera deltas analysis

@@ -435,7 +435,7 @@ def _fps_subsample(
 # Public entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_complete_graph(frames: list) -> MASt3RResult:
+def run_complete_graph(frames: list, save_mast3r_images: str | None = None) -> MASt3RResult:
     """
     Run MASt3R-SfM on all pairs of undistorted frames.
 
@@ -455,6 +455,15 @@ def run_complete_graph(frames: list) -> MASt3RResult:
         if len(filelist) < 2:
             logger.error("Need at least 2 frames for MASt3R; got %d", len(filelist))
             return MASt3RResult()
+
+        if save_mast3r_images is not None:
+            import shutil, sys
+            out_dir = save_mast3r_images or os.path.join(config.OUTPUT_DIR, "debug", "mast3r_inputs")
+            os.makedirs(out_dir, exist_ok=True)
+            for fpath in filelist:
+                shutil.copy(fpath, out_dir)
+            logger.info("--save-mast3r-images: saved %d images to %s", len(filelist), out_dir)
+            sys.exit(0)
 
         logger.info("Running MASt3R-SfM complete graph on %d frames …", len(filelist))
 

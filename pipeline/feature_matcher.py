@@ -196,6 +196,7 @@ def refine_pitches(
     cameras_init_from_config: bool = False,
     use_manual_features: bool = False,
     matcher_only: bool = False,
+    save_mast3r_images: str | None = None,
 ) -> None:
     """
     Refine camera poses using MASt3R-SfM + Ceres full bundle adjustment.
@@ -238,7 +239,7 @@ def refine_pitches(
     from pipeline.mast3r_matcher import run_complete_graph, save_auto_matches
 
     logger.info("Running MASt3R-SfM on %d frames …", len(ready))
-    mast3r_result = run_complete_graph(ready)
+    mast3r_result = run_complete_graph(ready, save_mast3r_images=save_mast3r_images)
 
     if len(mast3r_result.camera_poses) == 0:
         logger.error("MASt3R returned no camera poses — aborting refinement.")
