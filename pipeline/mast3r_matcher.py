@@ -473,7 +473,6 @@ def run_complete_graph(frames: list, save_mast3r_images: str | None = None) -> M
         # ── MASt3R-SfM pipeline ───────────────────────────────────────────────
         from dust3r.utils.image import load_images
         from mast3r.cloud_opt.sparse_ga import sparse_global_alignment
-        from dust3r.inference import inference
         from dust3r.image_pairs import make_pairs
 
         cache_dir = os.path.join(config.MODEL_CACHE_DIR, "mast3r_cache")
@@ -486,13 +485,10 @@ def run_complete_graph(frames: list, save_mast3r_images: str | None = None) -> M
         pairs = make_pairs(images, scene_graph="complete", prefilter=None, symmetrize=True)
         logger.info("%d pairs for %d frames", len(pairs), len(filelist))
 
-        logger.info("Running pairwise MASt3R inference …")
-        output = inference(pairs, model, device, batch_size=1, verbose=True)
-
         logger.info("Running sparse global alignment …")
         scene = sparse_global_alignment(
             filelist,
-            output,
+            pairs,
             cache_dir,
             model,
             device=device,
@@ -507,7 +503,7 @@ def run_complete_graph(frames: list, save_mast3r_images: str | None = None) -> M
         points_3d, observations = _extract_pointcloud(scene, filelist, frames, cam_poses)
 
         # Tear down model before returning (VRAM for Ceres host is fine; Ceres is CPU)
-        del model, scene, output, images, pairs
+        del model, scene, images, pairs
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
