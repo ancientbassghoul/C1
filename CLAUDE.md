@@ -8,6 +8,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Add log lines freely when diagnosing issues — the user is happy to re-run and share output.
 - Never commit unless the user explicitly asks.
 
+## Git / GitHub
+
+Remote: `https://github.com/ancientbassghoul/C1`
+
+Push command (requires a GitHub personal access token):
+```bash
+git push https://<TOKEN>@github.com/ancientbassghoul/C1.git master
+```
+
+To let Claude push without exposing the token in chat, the user sets it as an env var first:
+```bash
+export GITHUB_TOKEN=<token>   # paste in terminal, not in chat
+```
+Then Claude can run: `git push https://$GITHUB_TOKEN@github.com/ancientbassghoul/C1.git master`
+
 ## Overview
 
 Spatial alignment pipeline for drone FPV frames. Given a pixel picked in any frame, the corresponding ground point is re-projected into all other frames (target accuracy ≤ 10 px).
