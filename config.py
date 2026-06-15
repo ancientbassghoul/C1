@@ -170,7 +170,7 @@ CLIP_ANCHOR_MIN_WEIGHT = 0.50
 # ─────────────────────────────────────────────────────────────────────────────
 # MAST3R-SFM
 # ─────────────────────────────────────────────────────────────────────────────
-MAST3R_MODEL          = "naver/MASt3R_ViTLarge_BaseDecoder_512_capdepth"
+MAST3R_MODEL          = "naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric"
 MAST3R_CONF_THRESHOLD = 0.5    # per-pixel confidence; points below this are dropped
 MAST3R_MAX_POINTS     = 5000   # max 3D points passed to Ceres (subsampled if more)
 
