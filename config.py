@@ -90,6 +90,14 @@ MANUAL_CORRESPONDENCES_FILE = "./output/manual_correspondences.json"
 # Path where MASt3R automatic matches are saved after --run-matcher-only.
 AUTO_MATCHES_FILE = "./output/auto_matches.json"
 
+# Path where the Qwen/CLIP anchor detection result is cached.
+ANCHOR_CACHE_FILE = "./output/anchor_cache.json"
+
+# Max fraction of total image area a single anchor bbox may cover.
+# Detections larger than this threshold are treated as scene backgrounds
+# (e.g. "field" covering 50% of the frame) and discarded.
+MAX_ANCHOR_BBOX_FRACTION = 0.35
+
 # Weight of each manually-picked correspondence relative to a MASt3R match
 # in the Ceres solver.
 MANUAL_CORRESPONDENCE_WEIGHT = 10.0

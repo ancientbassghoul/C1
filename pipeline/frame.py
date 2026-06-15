@@ -91,9 +91,9 @@ class Frame:
     # Populated by pose.py; used by undistort.suppress_center_overlays for blurring.
     bracket_rects_raw: list = field(default_factory=list)  # list of (y1,y2,x1,x2)
 
-    # Crosshair bbox from Qwen in [0,1000] normalized coords (ymin,xmin,ymax,xmax).
+    # Crosshair bbox from Qwen in processed-image pixel coords (xmin,ymin,xmax,ymax).
     # Populated by detect_anchor; used by suppress_center_overlays.
-    crosshair_bbox_norm: Optional[tuple] = None
+    crosshair_bbox_px: Optional[tuple] = None
 
     # ── Convenience ───────────────────────────────────────────────────────────
     @property

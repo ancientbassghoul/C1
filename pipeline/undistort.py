@@ -231,12 +231,14 @@ def suppress_center_overlays(frames: list[Frame]) -> None:
                          frame.stem, margin)
 
         # ── Crosshair ────────────────────────────────────────────────────────
-        if frame.crosshair_bbox_norm is not None:
-            yn1, xn1, yn2, xn2 = frame.crosshair_bbox_norm
-            y1c = max(0, int(yn1 * h / 1000) - pad)
-            y2c = min(h, int(yn2 * h / 1000) + pad)
-            x1c = max(0, int(xn1 * w / 1000) - pad)
-            x2c = min(w, int(xn2 * w / 1000) + pad)
+        if frame.crosshair_bbox_px is not None:
+            x1p, y1p, x2p, y2p = frame.crosshair_bbox_px  # [xmin,ymin,xmax,ymax] proc pixels
+            h_proc = max(28, round(h / 28) * 28)
+            w_proc = max(28, round(w / 28) * 28)
+            y1c = max(0, int(y1p * h / h_proc) - pad)
+            y2c = min(h, int(y2p * h / h_proc) + pad)
+            x1c = max(0, int(x1p * w / w_proc) - pad)
+            x2c = min(w, int(x2p * w / w_proc) + pad)
             if y2c > y1c and x2c > x1c:
                 roi = img[y1c:y2c, x1c:x2c]
                 img[y1c:y2c, x1c:x2c] = cv2.GaussianBlur(roi, (ksize, ksize), 0)
