@@ -462,10 +462,10 @@ def run_complete_graph(frames: list) -> MASt3RResult:
         model = _load_mast3r_model(device)
 
         # ── MASt3R-SfM pipeline ───────────────────────────────────────────────
-        from mast3r.utils.image import load_images
+        from dust3r.utils.image import load_images
         from mast3r.cloud_opt.sparse_ga import sparse_global_alignment
         from dust3r.inference import inference
-        from dust3r.utils.image import make_pairs
+        from dust3r.image_pairs import make_pairs
 
         cache_dir = os.path.join(config.MODEL_CACHE_DIR, "mast3r_cache")
         os.makedirs(cache_dir, exist_ok=True)
