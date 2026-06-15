@@ -2,6 +2,12 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Working style
+
+- **Always create a task list** at the start of any multi-step implementation, using the TaskCreate tool. Mark each task `in_progress` when you start it and `completed` as soon as it's done. This lets the user see live progress.
+- Add log lines freely when diagnosing issues — the user is happy to re-run and share output.
+- Never commit unless the user explicitly asks.
+
 ## Overview
 
 Spatial alignment pipeline for drone FPV frames. Given a pixel picked in any frame, the corresponding ground point is re-projected into all other frames (target accuracy ≤ 10 px).

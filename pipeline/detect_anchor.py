@@ -517,28 +517,54 @@ def detect_anchor(frames: list) -> AnchorResult:
         else:
             logger.info("    → no crosshair detected")
 
-        # Step B: standard per-frame object discovery
-        logger.info("  Querying Qwen for frame %s …", frame.stem[-12:])
-        raw_objects = _qwen_discover_frame(qwen_model, qwen_proc, frame.undistorted)
+        h, w = frame.undistorted.shape[:2]
+
+        # Step B: build a temporary discovery image with the crosshair region
+        # painted solid black so Qwen never sees the ⊕/+ HUD elements.
+        # The original frame.undistorted is NOT modified; Phase 3b second-pass
+        # uses it unmasked, so a van that falls inside the masked region is
+        # recovered cleanly by the targeted query.
+        if ch_bbox is not None:
+            x1p, y1p, x2p, y2p = ch_bbox
+            h_proc, w_proc = _proc_dims(h, w)
+            pad = config.CROSSHAIR_MASK_PAD_PX
+            mx1 = max(0, int(x1p * w / w_proc) - pad)
+            my1 = max(0, int(y1p * h / h_proc) - pad)
+            mx2 = min(w, int(x2p * w / w_proc) + pad)
+            my2 = min(h, int(y2p * h / h_proc) + pad)
+            discovery_img = frame.undistorted.copy()
+            discovery_img[my1:my2, mx1:mx2] = 0
+            logger.info("  Querying Qwen (crosshair masked y=%d:%d x=%d:%d) …",
+                        my1, my2, mx1, mx2)
+        else:
+            discovery_img = frame.undistorted
+            logger.info("  Querying Qwen for frame %s …", frame.stem[-12:])
+
+        raw_objects = _qwen_discover_frame(qwen_model, qwen_proc, discovery_img)
         logger.info("    → raw detections: %s",
                     [(o.get("label"), o.get("bbox")) for o in raw_objects])
 
-        # Filter out any object whose bbox overlaps the detected crosshair.
-        # Both ch_bbox and discovery bboxes are in the same processed-pixel space,
-        # so IoU is computed correctly regardless of axis labelling.
+        # Belt-and-suspenders: also IoU-exclude same-sized detections overlapping
+        # the crosshair (handles edge cases where ch_bbox is None or mask was tiny).
         if ch_bbox is not None:
+            ch_area = max(1, (ch_bbox[2]-ch_bbox[0]) * (ch_bbox[3]-ch_bbox[1]))
             keep, drop = [], []
             for obj in raw_objects:
-                iou = _bbox_iou_norm(obj.get("bbox", [0, 0, 0, 0]), list(ch_bbox))
-                (keep if iou <= config.CROSSHAIR_IOU_EXCLUDE else drop).append((obj, iou))
+                det_bbox = obj.get("bbox", [0, 0, 0, 0])
+                iou = _bbox_iou_norm(det_bbox, list(ch_bbox))
+                det_area = max(1, (det_bbox[2]-det_bbox[0]) * (det_bbox[3]-det_bbox[1]))
+                size_match = det_area < config.CROSSHAIR_SIZE_RATIO * ch_area
+                (drop if iou > config.CROSSHAIR_IOU_EXCLUDE and size_match else keep).append(obj)
             if drop:
-                for obj, iou in drop:
-                    logger.info("    → EXCLUDED '%s' bbox=%s  IoU=%.3f > threshold %.2f",
-                                obj.get("label"), obj.get("bbox"), iou,
-                                config.CROSSHAIR_IOU_EXCLUDE)
-            raw_objects = [obj for obj, _ in keep]
+                for obj in drop:
+                    det_bbox = obj.get("bbox", [0, 0, 0, 0])
+                    det_area = max(1, (det_bbox[2]-det_bbox[0])*(det_bbox[3]-det_bbox[1]))
+                    logger.info("    → EXCLUDED '%s' bbox=%s  (IoU=%.3f, area ratio=%.1f)",
+                                obj.get("label"), det_bbox,
+                                _bbox_iou_norm(det_bbox, list(ch_bbox)),
+                                det_area / ch_area)
+            raw_objects = keep
 
-        h, w = frame.undistorted.shape[:2]
         scaled = []
         for obj in raw_objects:
             bbox_norm = obj.get("bbox", [])

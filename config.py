@@ -172,8 +172,8 @@ CLIP_MODEL  = "openai/clip-vit-large-patch14"
 # CLIP cosine similarity thresholds for anchor weighting.
 # w >= CLIP_ANCHOR_THRESHOLD  → rigid anchor frame (used as control point in Sim(3)).
 # w <  CLIP_ANCHOR_MIN_WEIGHT → frame's AnchorRayCost skipped entirely.
-CLIP_ANCHOR_THRESHOLD  = 0.85
-CLIP_ANCHOR_MIN_WEIGHT = 0.50
+CLIP_ANCHOR_THRESHOLD  = 0.20
+CLIP_ANCHOR_MIN_WEIGHT = 0.10
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAST3R-SFM
@@ -229,6 +229,16 @@ OVERLAY_BLUR_PAD       = 10    # extra padding (px) around each detected bbox
 
 # IoU threshold above which a Qwen discovery result is excluded as crosshair.
 CROSSHAIR_IOU_EXCLUDE  = 0.3
+
+# Pixel padding (original image space) painted solid black around the detected
+# crosshair bbox in the temporary copy passed to _qwen_discover_frame.
+# Large enough to cover the ⊕ waypoint indicator adjacent to the + crosshair;
+# if the van also falls inside the masked region it is recovered by Phase 3b.
+CROSSHAIR_MASK_PAD_PX  = 40
+
+# IoU exclusion only applies when the candidate's bbox area is below this multiple
+# of the crosshair area — prevents large van bboxes from being wrongly excluded.
+CROSSHAIR_SIZE_RATIO   = 1.5
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CAMERA POSE OVERRIDES
