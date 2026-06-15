@@ -157,6 +157,16 @@ def _bbox_iou_norm(a, b) -> float:
     return inter / union if union > 0 else 0.0
 
 
+def _bbox_overlaps_region(bbox_px, mx1: int, my1: int, mx2: int, my2: int) -> bool:
+    """True if bbox_px [py1,px1,py2,px2] overlaps the rectangle (mx1,my1)–(mx2,my2).
+
+    bbox_px uses (row, col) order; mask rectangle uses (col, row) naming from
+    the crosshair masking code: mx1/mx2 are columns, my1/my2 are rows.
+    """
+    py1, px1, py2, px2 = bbox_px
+    return max(py1, my1) < min(py2, my2) and max(px1, mx1) < min(px2, mx2)
+
+
 def _qwen_discover_frame(model, processor, frame_bgr: np.ndarray) -> list[dict]:
     """Run Qwen VL on one frame; return list of {label, bbox} dicts."""
     import torch
@@ -501,6 +511,7 @@ def detect_anchor(frames: list) -> AnchorResult:
     # ── Phase 1: Per-frame discovery ──────────────────────────────────────────
     logger.info("Phase 1: per-frame Qwen object discovery (%d frames) …", len(frames))
     per_frame_objects: dict[str, list[dict]] = {}
+    frame_mask_regions: dict[str, tuple] = {}   # stem → (mx1, my1, mx2, my2) orig pixels
 
     for frame in frames:
         if frame.undistorted is None:
@@ -534,6 +545,7 @@ def detect_anchor(frames: list) -> AnchorResult:
             my2 = min(h, int(y2p * h / h_proc) + pad)
             discovery_img = frame.undistorted.copy()
             discovery_img[my1:my2, mx1:mx2] = 0
+            frame_mask_regions[frame.stem] = (mx1, my1, mx2, my2)
             logger.info("  Querying Qwen (crosshair masked y=%d:%d x=%d:%d) …",
                         my1, my2, mx1, mx2)
         else:
@@ -634,18 +646,31 @@ def detect_anchor(frames: list) -> AnchorResult:
         cx = (bbox[1] + bbox[3]) / 2.0
         centroids[stem] = (cx, cy)   # (u, v) pixel
 
-    # ── Second-pass: targeted query for frames that missed the anchor ─────────
-    missed_frames = [f for f in frames
-                     if f.stem not in bboxes_pixel and f.undistorted is not None]
-    if missed_frames:
+    # ── Second-pass: targeted query for missed frames and mask-clipped frames ──
+    missed = [f for f in frames
+              if f.stem not in bboxes_pixel and f.undistorted is not None]
+
+    # Frames whose Phase 1 detection bbox overlaps the crosshair mask region —
+    # those detections are likely truncated; re-query against the unmasked image.
+    mask_clipped = [
+        f for f in frames
+        if f.stem in bboxes_pixel
+        and f.stem in frame_mask_regions
+        and _bbox_overlaps_region(bboxes_pixel[f.stem], *frame_mask_regions[f.stem])
+    ]
+
+    second_pass_frames = missed + mask_clipped
+    if second_pass_frames:
         logger.info(
-            "Phase 3b: targeted second-pass for %d frame(s) missing '%s' …",
-            len(missed_frames), chosen_label,
+            "Phase 3b: targeted second-pass for %d frame(s) (%d missing, %d mask-clipped) …",
+            len(second_pass_frames), len(missed), len(mask_clipped),
         )
-        for frame in missed_frames:
+        for frame in second_pass_frames:
+            reason = "missing" if frame in missed else "mask-clipped"
             h, w = frame.undistorted.shape[:2]
             bbox_norm = _qwen_find_object(qwen_model, qwen_proc, frame.undistorted, chosen_label)
-            logger.info("    [%s] second-pass raw bbox: %s", frame.stem[-12:], bbox_norm)
+            logger.info("    [%s] second-pass (%s) raw bbox: %s",
+                        frame.stem[-12:], reason, bbox_norm)
             if bbox_norm is not None:
                 bbox_px = _scale_bbox_to_pixels(list(bbox_norm), h, w)
                 area_frac = (
@@ -656,14 +681,16 @@ def detect_anchor(frames: list) -> AnchorResult:
                     cy = (bbox_px[0] + bbox_px[2]) / 2.0
                     cx = (bbox_px[1] + bbox_px[3]) / 2.0
                     centroids[frame.stem] = (cx, cy)
-                    logger.info("    [%s] found '%s' on second pass", frame.stem[-12:], chosen_label)
+                    logger.info("    [%s] found '%s' on second pass (%s)",
+                                frame.stem[-12:], chosen_label, reason)
                 else:
                     logger.debug(
                         "    [%s] second-pass bbox too large (%.0f%%) — skipped",
                         frame.stem[-12:], area_frac * 100,
                     )
             else:
-                logger.info("    [%s] '%s' not found on second pass", frame.stem[-12:], chosen_label)
+                logger.info("    [%s] '%s' not found on second pass (%s)",
+                            frame.stem[-12:], chosen_label, reason)
 
     # ── Tear down Qwen before loading CLIP ────────────────────────────────────
     _teardown_models(qwen_model, qwen_proc)
