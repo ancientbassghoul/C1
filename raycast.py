@@ -144,6 +144,12 @@ def parse_args() -> argparse.Namespace:
              "(default: output/solved_cameras.json) and open the interactive "
              "viewer.  Use locally after copying the JSON from RunPod.",
     )
+    p.add_argument(
+        "--use-saved-qwen", action="store_true", dest="use_saved_qwen",
+        help="Load Qwen/CLIP anchor results from the cache file "
+             "(output/anchor_cache.json) instead of re-running Qwen.  "
+             "If the cache does not exist, Qwen runs and saves it as usual.",
+    )
     return p.parse_args()
 
 
@@ -158,6 +164,7 @@ def run_pipeline(
     cameras_init_from_config: bool = False,
     use_manual_features: bool = False,
     run_matcher_only: bool = False,
+    use_saved_qwen: bool = False,
 ) -> list:
     """
     Full pipeline: load → OCR → undistort → pose → detect_anchor → MASt3R+Ceres.
@@ -205,8 +212,17 @@ def run_pipeline(
 
     logger.info("═" * 60)
     logger.info("Step 5/6 – Anchor detection (Qwen VL + CLIP)")
-    from pipeline.detect_anchor import detect_anchor
-    anchor_result = detect_anchor(frames)
+    from pipeline.detect_anchor import detect_anchor, load_anchor_result
+    import os as _os
+    if use_saved_qwen and _os.path.isfile(config.ANCHOR_CACHE_FILE):
+        logger.info("--use-saved-qwen: loading anchor cache from %s", config.ANCHOR_CACHE_FILE)
+        anchor_result = load_anchor_result(config.ANCHOR_CACHE_FILE)
+    else:
+        if use_saved_qwen:
+            logger.warning(
+                "--use-saved-qwen: no cache at %s — running Qwen", config.ANCHOR_CACHE_FILE
+            )
+        anchor_result = detect_anchor(frames)
 
     logger.info("Step 5b – Suppressing bracket + crosshair overlays in undistorted frames")
     from pipeline.undistort import suppress_center_overlays
@@ -529,6 +545,7 @@ def main() -> None:
         cameras_init_from_config=args.cameras_init_from_config,
         use_manual_features=_use_manual,
         run_matcher_only=args.run_matcher_only,
+        use_saved_qwen=args.use_saved_qwen,
     )
 
     # Camera deltas analysis
