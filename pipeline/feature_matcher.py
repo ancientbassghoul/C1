@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -24,6 +25,19 @@ from pipeline.pose import build_rotation
 import config
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class RefineResult:
+    """
+    Bundle of intermediate solve products from refine_pitches(), returned so
+    callers can optionally build the debug .glb export (--export-mesh)
+    without re-running MASt3R/Ceres. None of this is needed for the normal
+    pipeline path — raycast.py's default flow ignores the return value.
+    """
+    mast3r_result: object               # MASt3RResult — carries .dense when keep_dense=True
+    points_3d_solved: np.ndarray        # Ceres-refined sparse points, MASt3R frame (pre-Sim3)
+    sim3: tuple[float, np.ndarray, np.ndarray] | None  # (scale, R_sim, t_sim), MASt3R frame → ENU
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -197,7 +211,9 @@ def refine_pitches(
     use_manual_features: bool = False,
     matcher_only: bool = False,
     save_mast3r_images: str | None = None,
-) -> None:
+    keep_dense: bool = False,
+    export_raw_glb_dir: str | None = None,
+) -> RefineResult | None:
     """
     Refine camera poses using MASt3R-SfM + Ceres full bundle adjustment.
 
@@ -219,6 +235,16 @@ def refine_pitches(
     cameras_init_from_config : apply CAMERA_POSE_OVERRIDES before solving.
     use_manual_features : load and inject MANUAL_CORRESPONDENCES_FILE.
     matcher_only        : run MASt3R only, save auto_matches.json, then return.
+    keep_dense          : passed through to run_complete_graph — retain dense
+                          per-view data for the Blender mesh exporter.
+    export_raw_glb_dir  : passed through to run_complete_graph — write
+                          MASt3R's raw reconstruction as a debug .glb.
+
+    Returns
+    -------
+    A RefineResult bundling mast3r_result / points_3d_solved / sim3, for
+    optional debug export (--export-mesh). None on any early abort (too few
+    frames, MASt3R failure, or --run-matcher-only).
     """
     # ── Apply manual pose overrides ───────────────────────────────────────────
     if cameras_init_from_config:
@@ -233,22 +259,27 @@ def refine_pitches(
     ]
     if len(ready) < 2:
         logger.warning("refine_pitches: fewer than 2 undistorted frames — aborting.")
-        return
+        return None
 
     # ── Step 1: MASt3R-SfM ───────────────────────────────────────────────────
     from pipeline.mast3r_matcher import run_complete_graph, save_auto_matches
 
     logger.info("Running MASt3R-SfM on %d frames …", len(ready))
-    mast3r_result = run_complete_graph(ready, save_mast3r_images=save_mast3r_images)
+    mast3r_result = run_complete_graph(
+        ready,
+        save_mast3r_images=save_mast3r_images,
+        keep_dense=keep_dense,
+        export_raw_glb_dir=export_raw_glb_dir,
+    )
 
     if len(mast3r_result.camera_poses) == 0:
         logger.error("MASt3R returned no camera poses — aborting refinement.")
-        return
+        return None
 
     if matcher_only:
         save_auto_matches(mast3r_result, config.AUTO_MATCHES_FILE)
         logger.info("--run-matcher-only: saved auto_matches.json, stopping before Ceres.")
-        return
+        return None
 
     # ── Step 2: Anchor rays ───────────────────────────────────────────────────
     anchor_rays = _build_anchor_rays(anchor_result)
@@ -279,6 +310,11 @@ def refine_pitches(
 
     # ── Step 6: Sim(3) alignment to GPS/ENU ──────────────────────────────────
     logger.info("Aligning solved poses to GPS/ENU via Umeyama Sim(3) …")
-    align_to_telemetry_sim3(ready, cam_params_solved, anchor_result=anchor_result)
+    sim3 = align_to_telemetry_sim3(ready, cam_params_solved, anchor_result=anchor_result)
 
     logger.info("refine_pitches complete.")
+    return RefineResult(
+        mast3r_result=mast3r_result,
+        points_3d_solved=points_3d_solved,
+        sim3=sim3,
+    )

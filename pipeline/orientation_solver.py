@@ -421,7 +421,7 @@ def align_to_telemetry_sim3(
     frames,
     cam_params_solved: dict[str, np.ndarray],
     anchor_result=None,
-) -> None:
+) -> tuple[float, np.ndarray, np.ndarray] | None:
     """
     Map solved camera poses from MASt3R's coordinate frame to GPS/ENU.
 
@@ -432,6 +432,13 @@ def align_to_telemetry_sim3(
 
     After this function, each frame's position_enu, heading_deg,
     gimbal_pitch_deg, camera_roll_deg, and R are updated in-place.
+
+    Returns
+    -------
+    (scale, R_sim, t_sim) — the fitted Sim(3) transform (MASt3R frame → ENU),
+    so callers can apply the identical transform to other MASt3R-frame
+    artifacts (e.g. the dense point cloud, for the Blender mesh export).
+    None if alignment was skipped (fewer than 3 valid control points).
     """
     frame_map = {f.stem: f for f in frames}
 
@@ -472,7 +479,7 @@ def align_to_telemetry_sim3(
             "Sim(3): fewer than 3 valid control points (%d) — skipping ENU alignment.",
             len(ctrl_frames),
         )
-        return
+        return None
 
     src_arr = np.stack(src_pts, axis=0)
     dst_arr = np.stack(dst_pts, axis=0)
@@ -502,6 +509,7 @@ def align_to_telemetry_sim3(
         _apply_rotation_to_frame(f, R_enu_wc)
 
     logger.info("ENU alignment applied to %d frames.", len(frames))
+    return scale, R_sim, t_sim
 
 
 def _apply_rotation_to_frame(frame, R_wc: np.ndarray) -> None:
@@ -509,27 +517,47 @@ def _apply_rotation_to_frame(frame, R_wc: np.ndarray) -> None:
     Decompose a world-to-camera rotation matrix (in ENU frame) into
     heading_deg, gimbal_pitch_deg, camera_roll_deg and store into the frame.
 
-    ENU → OpenCV camera: R_wc maps ENU world → OpenCV cam frame
-    We parameterise as:  R_wc = R_roll @ R_pitch @ R_yaw
-    where yaw is compass heading (Z-up in ENU, but note ENU has Z=Up).
+    This is the EXACT analytic inverse of pipeline/pose.py build_rotation() —
+    NOT a generic Euler-angle decomposition. build_rotation() is not a plain
+    3-matrix Euler product (Rx@Ry@Rz or similar): it computes `fwd` from
+    yaw/pitch via explicit ENU trig, derives `right = fwd × world_up`, then
+    applies roll as a Rodrigues rotation of `right` *around the fwd axis*
+    (roll about the camera's own boresight, not a fixed world axis). A
+    generic scipy `as_euler(...)` decomposition assumes rotations about fixed
+    axes and does NOT correctly invert this — verified numerically: feeding
+    its output back into build_rotation() reproduced a completely different
+    matrix (max abs diff ~1.3, not a rounding error). This function instead
+    reverses build_rotation()'s actual construction step by step.
 
-    Uses scipy Rotation to extract intrinsic ZYX Euler angles.
+    R_world_from_cam's columns are [right | down | fwd] (see build_rotation),
+    and R_wc = R_world_from_cam.T, so:
+      row 0 of R_wc = right
+      row 2 of R_wc = fwd
     """
-    # scipy intrinsic ZYX: first Z (yaw), then Y (pitch), then X (roll)
-    # but we need to account for the ENU → camera axis mapping.
-    # Instead, we store R directly and decompose as yaw/pitch/roll matching
-    # the convention in pipeline/pose.py build_rotation().
-    #
-    # build_rotation(heading, pitch, roll) computes:
-    #   R = R_x(roll) @ R_y(pitch) @ R_z(heading)   [in the ENU tangent frame]
-    # We extract by: r = Rotation.from_matrix(R_wc); ZYX angles.
     try:
-        rot = Rotation.from_matrix(R_wc)
-        # Extrinsic ZYX = intrinsic XYZ applied in reverse
-        angles_zyx = rot.as_euler("ZYX", degrees=True)
-        heading_deg = float(angles_zyx[0])
-        pitch_deg   = float(angles_zyx[1])
-        roll_deg    = float(angles_zyx[2])
+        fwd   = R_wc[2, :].copy()
+        right = R_wc[0, :].copy()
+        fwd  /= np.linalg.norm(fwd)
+
+        # Invert the fwd = [sin(yaw)cos(pitch), cos(yaw)cos(pitch), sin(pitch)]
+        # construction directly.
+        pitch_deg = math.degrees(math.asin(np.clip(fwd[2], -1.0, 1.0)))
+        heading_deg = math.degrees(math.atan2(fwd[0], fwd[1]))
+
+        # Recompute the *unrolled* right vector exactly as build_rotation()
+        # does (same nadir/zenith special case), then recover roll as the
+        # signed angle between it and the actual (rolled) right, about fwd.
+        world_up = np.array([0.0, 0.0, 1.0])
+        if abs(np.dot(fwd, world_up)) > 0.999:
+            yaw_rad = math.radians(heading_deg)
+            right0 = np.array([math.cos(yaw_rad), -math.sin(yaw_rad), 0.0])
+        else:
+            right0 = np.cross(fwd, world_up)
+            right0 /= np.linalg.norm(right0)
+
+        cos_roll = float(np.dot(right, right0))
+        sin_roll = float(np.dot(np.cross(right0, right), fwd))
+        roll_deg = math.degrees(math.atan2(sin_roll, cos_roll))
     except Exception:
         logger.warning("[%s] rotation decomposition failed", frame.stem[-12:])
         return
@@ -538,4 +566,6 @@ def _apply_rotation_to_frame(frame, R_wc: np.ndarray) -> None:
     frame.gimbal_pitch_deg = pitch_deg
     frame.camera_roll_deg  = roll_deg
     frame.R                = R_wc.copy()
-    frame.ready            = True
+    # frame.ready is a computed property (pipeline/frame.py) derived from
+    # undistorted/R/position_enu/K_undist — no setter exists, none needed:
+    # it already evaluates True once those fields are populated.

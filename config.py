@@ -179,8 +179,17 @@ CLIP_ANCHOR_MIN_WEIGHT = 0.10
 # MAST3R-SFM
 # ─────────────────────────────────────────────────────────────────────────────
 MAST3R_MODEL          = "naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric"
-MAST3R_CONF_THRESHOLD = 0.5    # per-pixel confidence; points below this are dropped
+MAST3R_CONF_THRESHOLD = 1.5    # per-pixel confidence from SparseGA.get_dense_pts3d();
+                                # NOT a 0-1 normalized score — SparseGA's own .show()
+                                # uses `c > 1` as its validity heuristic. Re-tune by
+                                # inspecting a real confidence histogram once GPU access
+                                # is available; points below this are dropped.
 MAST3R_MAX_POINTS     = 5000   # max 3D points passed to Ceres (subsampled if more)
+
+# Reference-card size (metres) for the Sim(3)-aligned debug .glb export
+# (--export-mesh). This scene is in real ENU units, unlike the raw MASt3R
+# export (which auto-sizes itself off the scene's own arbitrary scale).
+MAST3R_GLB_CAM_SIZE_M = 1.0
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ORIENTATION SOLVER
