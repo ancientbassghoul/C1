@@ -96,10 +96,16 @@ def load_anchor_result(path: str) -> AnchorResult:
 
 _CROSSHAIR_PROMPT = (
     "This is a drone FPV video frame with a HUD overlay. "
-    "Find the white crosshair or aiming reticle (a + or ⊕ symbol) overlaid on the image. "
+    "Find the small circular target-lock reticle overlaid on the image: it is made of "
+    "four separate short white/light-gray chevron or bracket marks arranged in a ring "
+    "(at the top, bottom, left, and right of a small center point), NOT a simple + or "
+    "⊕ sign. The whole icon is small, roughly 20–40 pixels across. "
+    "It tracks a point in the scene, so it can be located anywhere in the frame — do "
+    "not assume it is at the image center; search the full frame for it. "
     'Return ONLY a single JSON object: {"bbox": [xmin, ymin, xmax, ymax]} '
-    "where values are absolute pixel coordinates (x=column, y=row, origin top-left). "
-    'If no crosshair is visible, return {"bbox": null}.'
+    "tightly enclosing all four marks, where values are absolute pixel coordinates "
+    "(x=column, y=row, origin top-left). "
+    'If no such reticle is visible, return {"bbox": null}.'
 )
 
 _DISCOVERY_PROMPT = (
