@@ -7,6 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Always create a task list** at the start of any multi-step implementation, using the TaskCreate tool. Mark each task `in_progress` when you start it and `completed` as soon as it's done. This lets the user see live progress.
 - Add log lines freely when diagnosing issues — the user is happy to re-run and share output.
 - Never commit unless the user explicitly asks.
+- **The pipeline is meant to run automatically and autonomously, without manual correspondences.** Don't suggest `--manual-fm-json` (or `--manual-correspondences`) as part of a normal/default `raycast.py` invocation. Only bring it up when the conversation is specifically about strengthening a weak/poorly-constrained frame with hand-picked features.
 
 ## Git / GitHub
 
@@ -57,11 +58,11 @@ venv\Scripts\python raycast.py --frames_dir ./frames --preview-undistort
 :: Open manual correspondence picker — mark features, save JSON
 venv\Scripts\python raycast.py --frames_dir ./frames --manual-correspondences
 
-:: Run full pipeline (automatic anchor discovery + MASt3R)
+:: Run full pipeline (automatic anchor discovery + MASt3R) — the default, autonomous path
 venv\Scripts\python raycast.py --frames_dir ./frames
 
-:: Run full pipeline with optional manual correspondences injected
-venv\Scripts\python raycast.py --frames_dir ./frames --manual-fm-json
+:: Reuse a cached Qwen/CLIP anchor result instead of re-running Qwen (output/anchor_cache.json)
+venv\Scripts\python raycast.py --frames_dir ./frames --use-saved-qwen
 
 :: Compare solved vs telemetry camera state
 venv\Scripts\python raycast.py --frames_dir ./frames --camera-deltas
@@ -76,11 +77,19 @@ venv\Scripts\python raycast.py --frames_dir ./frames --show-scores output/manual
 venv\Scripts\python raycast.py --frames_dir ./frames --run-matcher-only
 
 :: Headless solve on RunPod — run full pipeline, export solved cameras, no GUI
-venv\Scripts\python raycast.py --frames_dir ./frames --manual-fm-json --export-solve
+venv\Scripts\python raycast.py --frames_dir ./frames --use-saved-qwen --export-solve
+
+:: Same run, also dump debug .glb scenes for inspecting the MASt3R reconstruction in Blender
+venv\Scripts\python raycast.py --frames_dir ./frames --use-saved-qwen --export-solve --export-mesh
 
 :: Local GUI from RunPod solve — skip pipeline, load JSON, open viewer
 venv\Scripts\python raycast.py --frames_dir ./frames --import-solve
 ```
+
+`--manual-fm-json` / `--manual-correspondences` exist for strengthening a specific
+poorly-constrained frame (see §Manual correspondences below) — they are **not** part
+of the normal/default workflow and shouldn't be suggested unless that's explicitly
+what's being discussed.
 
 Interactive viewer controls: click = pick pixel | scroll = zoom | mid-drag = pan | `s` = save proof sheet | `R` = reset | `q` = quit.
 
@@ -176,7 +185,7 @@ Saved to `MANUAL_CORRESPONDENCES_FILE` (default `./output/manual_correspondences
 Heavy compute (MASt3R, Qwen) runs on RunPod (no display). The local machine handles the interactive viewer.
 
 ```
-RunPod:  python raycast.py --frames_dir ./frames --manual-fm-json --export-solve
+RunPod:  python raycast.py --frames_dir ./frames --use-saved-qwen --export-solve
          → writes output/solved_cameras.json
 
 Local:   (copy solved_cameras.json from pod)
@@ -186,11 +195,38 @@ Local:   (copy solved_cameras.json from pod)
 
 `--import-solve` runs only load + undistort (a few seconds) then injects the solved poses. Default path is `output/solved_cameras.json` for both flags; override with an explicit path argument.
 
+### Debug mesh export (`--export-mesh`) — inspecting the MASt3R reconstruction in Blender
+
+`solved_cameras.json` only carries camera poses — it has no view into the actual MASt3R 3D
+reconstruction that fed the Ceres solve. `--export-mesh [DIR]` (default `output/debug/`) writes
+two self-contained `.glb` scenes, built from `pipeline/mast3r_matcher.py`'s
+`export_raw_glb()` / `export_aligned_glb()`, both of which reuse `dust3r.viz`'s own building
+blocks directly (`pts3d_to_trimesh`, `cat_meshes`, `add_scene_cam` — the same ones behind the
+"download .glb" button in MASt3R/dust3r's official demo; **not** `dust3r.demo`, which imports
+`gradio` at module level):
+
+- `mast3r_raw_scene.glb` — MASt3R's raw per-view dense mesh + camera reference cards, in
+  MASt3R's own native (arbitrary-scale, pre-Ceres, pre-Sim(3)) coordinate frame. Written inside
+  `run_complete_graph` right after `sparse_global_alignment`, before teardown — works even with
+  `--run-matcher-only` (Ceres never has to run).
+- `mast3r_aligned_scene.glb` — the same dense mesh plus the Ceres-refined sparse point cloud,
+  both rigidly moved into ENU via the identical Sim(3) transform applied to the final cameras,
+  with reference cards at each frame's *final solved* pose (the same ones in
+  `solved_cameras.json`). This is the one that answers "does the reconstructed terrain actually
+  sit where the solved cameras say it should" — open it alongside the `app_cameras` collection
+  from `export_blender.py`'s output to compare directly. Requires a real Ceres/Sim(3) result;
+  not written under `--run-matcher-only` or an aborted solve.
+
+Open either with Blender's **File > Import > glTF 2.0**. No custom Blender script is needed for
+this part — it's a self-contained snapshot, separate from `export_blender.py`'s camera-rig
+script (which you can still run and import alongside it).
+
 ### Key output files
 
 - `output/manual_correspondences.json` — hand-picked feature correspondences (ground truth for solver).
 - `output/auto_matches.json` — MASt3R automatic matches saved after `--run-matcher-only`.
 - `output/solved_cameras.json` — serialized solved camera state (position_enu, heading, pitch, roll, K_undist) for the RunPod → local handoff.
+- `output/debug/mast3r_raw_scene.glb` / `mast3r_aligned_scene.glb` — debug mesh exports from `--export-mesh` (see above).
 - `output/debug/anchor/` — anchor detection debug images from `--preview-anchor`.
 - `output/debug/hud_masks/` — HUD masking before/after from `--preview-hud-masks`.
 - `models/` — downloaded model weights (`./models/`, gitignored).
@@ -203,6 +239,10 @@ These must be installed manually (from source, into the same `venv/`):
 - **CLIP** (`openai/clip-vit-large-patch14`) — downloaded at runtime via `transformers`
 
 `pyceres` and `geocalib` are now in `requirements.txt` and install automatically.
+
+`trimesh` is not listed in `requirements.txt` either — like `torch`, it's already present as a
+dust3r dependency (declared in `dust3r/requirements.txt`), installed when MASt3R/dust3r is set
+up from source. Only needed for `--export-mesh`.
 
 **Model download path:** All `from_pretrained()` calls must pass `cache_dir=config.MODEL_CACHE_DIR` (default `./models/`). Never let models download to the pod's `/root/.cache` — it is wiped when the pod stops. `models/` is in `.gitignore`.
 

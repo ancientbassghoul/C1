@@ -157,6 +157,18 @@ def parse_args() -> argparse.Namespace:
              "to DIR (default: output/debug/mast3r_inputs/), then exit without "
              "running MASt3R or Ceres.",
     )
+    p.add_argument(
+        "--export-mesh", nargs="?", const="", default=None,
+        dest="export_mesh", metavar="DIR",
+        help="After the solve, write two debug .glb scenes to DIR (default: "
+             "output/debug/): mast3r_raw_scene.glb (MASt3R's raw reconstruction, "
+             "its own native coordinate frame) and mast3r_aligned_scene.glb "
+             "(the same mesh + Ceres-refined point cloud, moved into ENU via "
+             "the solved Sim(3), with reference cards at the final solved "
+             "camera poses). Open either in Blender via File > Import > glTF. "
+             "Exits without opening the GUI. With --run-matcher-only, only the "
+             "raw scene is produced (Ceres never runs).",
+    )
     return p.parse_args()
 
 
@@ -173,10 +185,15 @@ def run_pipeline(
     run_matcher_only: bool = False,
     use_saved_qwen: bool = False,
     save_mast3r_images: str | None = None,
-) -> list:
+    keep_dense: bool = False,
+    export_raw_glb_dir: str | None = None,
+) -> tuple[list, "RefineResult | None"]:
     """
     Full pipeline: load → OCR → undistort → pose → detect_anchor → MASt3R+Ceres.
-    Returns all frames (check f.ready for which have solved poses).
+    Returns (frames, refine_result) — check f.ready on the frames for which
+    have solved poses. refine_result is None if refinement was skipped or
+    aborted early (e.g. --no-refine, --run-matcher-only, MASt3R failure); see
+    pipeline.feature_matcher.RefineResult.
     """
     from pipeline.frame     import load_frames
     from pipeline.ocr       import extract_telemetry_all
@@ -244,19 +261,22 @@ def run_pipeline(
     from pipeline.undistort import suppress_center_overlays
     suppress_center_overlays(frames)
 
+    refine_result = None
     if no_refine:
         logger.info("Step 6/6 – Refinement SKIPPED (--no-refine)")
     else:
         logger.info("═" * 60)
         logger.info("Step 6/6 – MASt3R-SfM + Ceres full-BA")
         from pipeline.feature_matcher import refine_pitches
-        refine_pitches(
+        refine_result = refine_pitches(
             frames,
             anchor_result=anchor_result,
             cameras_init_from_config=cameras_init_from_config,
             use_manual_features=use_manual_features,
             matcher_only=run_matcher_only,
             save_mast3r_images=save_mast3r_images,
+            keep_dense=keep_dense,
+            export_raw_glb_dir=export_raw_glb_dir,
         )
 
     ready = [f for f in frames if f.ready]
@@ -268,7 +288,7 @@ def run_pipeline(
     for f in (f for f in frames if not f.ready):
         logger.warning("  NOT READY: %s  (check OCR output above)", f.stem)
 
-    return frames
+    return frames, refine_result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -555,7 +575,11 @@ def main() -> None:
 
     # Run the shared pipeline
     _use_manual = args.manual_fm_json is not None
-    frames = run_pipeline(
+    _export_mesh_dir = (
+        args.export_mesh or os.path.join(config.OUTPUT_DIR, "debug")
+        if args.export_mesh is not None else None
+    )
+    frames, refine_result = run_pipeline(
         args.frames_dir,
         no_refine=args.no_refine,
         height_mode=args.height,
@@ -564,6 +588,8 @@ def main() -> None:
         run_matcher_only=args.run_matcher_only,
         use_saved_qwen=args.use_saved_qwen,
         save_mast3r_images=args.save_mast3r_images,
+        keep_dense=args.export_mesh is not None,
+        export_raw_glb_dir=_export_mesh_dir,
     )
 
     # Camera deltas analysis
@@ -571,13 +597,21 @@ def main() -> None:
         camera_deltas_cmd(frames)
         return
 
-    # Matcher-only: auto_matches.json already written inside run_pipeline
+    # Matcher-only: auto_matches.json (and the raw .glb, if --export-mesh was
+    # also given — it's written inside run_complete_graph before Ceres runs)
+    # already written inside run_pipeline.
     if args.run_matcher_only:
         print(f"\nDone.  Matches saved to: {config.AUTO_MATCHES_FILE}")
         print("Run --show-scores to inspect them.\n")
+        if args.export_mesh is not None:
+            print(f"Raw MASt3R scene written to: "
+                  f"{os.path.join(_export_mesh_dir, 'mast3r_raw_scene.glb')}\n")
         return
 
-    # Export-solve: serialize and exit
+    # Export-solve / export-mesh: serialize debug artifacts and exit (no GUI).
+    # Both can be combined in one invocation for a single RunPod round-trip.
+    did_export = False
+
     if args.export_solve is not None:
         from pipeline.solve_io import export_solve
         _path = args.export_solve or os.path.join(config.OUTPUT_DIR, "solved_cameras.json")
@@ -585,6 +619,35 @@ def main() -> None:
         print(f"\nSolved cameras written to: {_path}")
         print("Copy this file locally and run:")
         print(f"  python raycast.py --frames_dir ./frames --import-solve {_path}\n")
+        did_export = True
+
+    if args.export_mesh is not None:
+        # The raw .glb was already written inside run_complete_graph (before
+        # Ceres ran). The aligned .glb needs the post-Ceres/Sim3 result, so
+        # it's built here.
+        _raw_path = os.path.join(_export_mesh_dir, "mast3r_raw_scene.glb")
+        print(f"\nRaw MASt3R scene written to: {_raw_path}")
+
+        if (refine_result is not None
+                and refine_result.sim3 is not None
+                and refine_result.mast3r_result.dense):
+            from pipeline.mast3r_matcher import export_aligned_glb
+            _aligned_path = os.path.join(_export_mesh_dir, "mast3r_aligned_scene.glb")
+            export_aligned_glb(
+                refine_result.mast3r_result,
+                refine_result.points_3d_solved,
+                refine_result.sim3,
+                frames,
+                _aligned_path,
+            )
+            print(f"Aligned (ENU) scene written to: {_aligned_path}")
+        else:
+            print("Aligned scene NOT written — no Ceres/Sim(3) result available "
+                  "(check the log above for an aborted solve).")
+        print("Open either in Blender via File > Import > glTF 2.0.\n")
+        did_export = True
+
+    if did_export:
         return
 
     # Mode dispatch

@@ -12,11 +12,22 @@ MASt3R-SfM API summary:
   4. inference(pairs, model, device)           – pairwise matching
   5. sparse_global_alignment(filelist, output, cache, model) → scene
 
-The scene object provides:
-  scene.im_poses          – list of 4×4 world-to-camera transforms
-  scene.get_pts3d()       – list of (H, W, 3) per-view world-space pointmaps
-  scene.get_masks()       – list of (H, W) bool valid-pixel masks
-  scene.get_im_confs()    – list of (H, W) per-pixel confidence scores
+sparse_global_alignment() returns a mast3r.cloud_opt.sparse_ga.SparseGA
+instance — NOT a dust3r dense global_aligner — so it has a different API:
+  scene.get_im_poses()                       – (N,4,4) cam2world tensor
+  scene.get_dense_pts3d(clean_depth, subsample)
+                                              – (pts3d, depthmaps, confs), one
+                                                flattened (H*W,3) / (H,W) entry
+                                                per image, in world coordinates
+  scene.imgs[i]                              – RGB image at the exact
+                                                resolution pts3d/confs use
+  scene.get_masks()                          – no real per-pixel mask exists;
+                                                always returns slice(None) —
+                                                confidence is the only filter
+                                                (see SparseGA.show(): masks =
+                                                [c > 1 for c in confs] — the
+                                                confidence scale is NOT 0-1
+                                                normalized)
 
 All coordinates live in MASt3R's internal (arbitrary) coordinate frame.
 ENU alignment happens AFTER Ceres via Sim(3) in orientation_solver.py.
@@ -65,6 +76,13 @@ class MASt3RResult:
 
     # All 2D observations associating frames with 3D points.
     observations: list = field(default_factory=list)  # list[Observation]
+
+    # Dense per-view data for the Blender mesh exporter — only populated when
+    # run_complete_graph(..., keep_dense=True). Dict: frame.stem → (pts3d,
+    # img, valid), where pts3d is (H,W,3) world-space, img is (H,W,3) uint8
+    # RGB, valid is (H,W) bool. Same resolution MASt3R itself worked at, NOT
+    # the full undistorted resolution.
+    dense: dict = field(default_factory=dict)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -150,7 +168,7 @@ def _extract_poses(scene, filelist: list[str], frames: list) -> dict[str, np.nda
     """
     Extract per-frame 4×4 world-to-camera matrices from the aligned scene.
 
-    MASt3R's `im_poses` are camera-to-world; we invert them for Ceres
+    scene.get_im_poses() returns camera-to-world; we invert them for Ceres
     (which expects world-to-camera: p_cam = R @ p_world + t).
     """
     import torch
@@ -163,19 +181,10 @@ def _extract_poses(scene, filelist: list[str], frames: list) -> dict[str, np.nda
 
     cam_poses: dict[str, np.ndarray] = {}
 
-    # scene.im_poses is a list (one per image) of (4,4) tensors or arrays,
-    # camera-to-world (c2w).
-    raw_poses = scene.im_poses if hasattr(scene, "im_poses") else []
-    if hasattr(raw_poses, "detach"):
-        raw_poses_np = raw_poses.detach().cpu().numpy()
-    else:
-        try:
-            raw_poses_np = [
-                p.detach().cpu().numpy() if hasattr(p, "detach") else np.array(p)
-                for p in raw_poses
-            ]
-        except Exception:
-            raw_poses_np = []
+    # scene is a mast3r.cloud_opt.sparse_ga.SparseGA — get_im_poses() returns
+    # a single (N,4,4) cam2world tensor (there is no .im_poses attribute).
+    raw_poses = scene.get_im_poses()
+    raw_poses_np = raw_poses.detach().cpu().numpy() if hasattr(raw_poses, "detach") else np.asarray(raw_poses)
 
     for idx, fpath in enumerate(filelist):
         stem = path_to_stem.get(fpath)
@@ -198,7 +207,8 @@ def _extract_pointcloud(
     filelist: list[str],
     frames: list,
     cam_poses: dict[str, np.ndarray],
-) -> tuple[np.ndarray, list[Observation]]:
+    keep_dense: bool = False,
+) -> tuple[np.ndarray, list[Observation], dict]:
     """
     Build a global point cloud and cross-frame observations from per-view pointmaps.
 
@@ -209,29 +219,51 @@ def _extract_pointcloud(
        record an additional observation.
     3. Keep only 3D points with ≥ 2 observations (degenerate ones have no cross-frame constraint).
     4. Subsample to MAST3R_MAX_POINTS using farthest-point sampling.
+
+    If keep_dense, also returns a third value: dict[stem] → (pts3d (H,W,3),
+    img (H,W,3) uint8 RGB, valid (H,W) bool) — the full per-view dense data,
+    reusing the same get_dense_pts3d() call already made below rather than
+    querying the scene a second time. Used by the Blender mesh exporter.
     """
     import torch
 
     stem_to_idx = {Path(fpath).stem: i for i, fpath in enumerate(filelist)}
     frame_map   = {f.stem: f for f in frames}
 
-    # Get per-view pointmaps, masks, and confidences
+    # Get per-view pointmaps and confidences.
+    # scene is a mast3r.cloud_opt.sparse_ga.SparseGA — it has no get_pts3d()/
+    # get_im_confs() (those belong to dust3r's dense global_aligner classes).
+    # The dense per-pixel API here is get_dense_pts3d(), which returns flattened
+    # (H*W, 3) / (H, W) entries already in world coordinates. get_masks() exists
+    # but is a no-op (always slice(None)) — confidence is the only real filter.
     try:
-        pts3d_views  = scene.get_pts3d()   # list of (H, W, 3) world-space arrays
-        masks_views  = scene.get_masks()   # list of (H, W) bool
-        confs_views  = scene.get_im_confs() # list of (H, W) float
+        pts3d_list, _depthmaps_list, confs_list = scene.get_dense_pts3d(clean_depth=True, subsample=8)
     except AttributeError as e:
-        logger.error("Cannot extract pointmaps from scene object: %s", e)
-        return np.empty((0, 3)), []
+        logger.error("Cannot extract dense pointmaps from scene object: %s", e)
+        return np.empty((0, 3)), [], {}
 
     def to_numpy(x):
         if hasattr(x, "detach"):
             return x.detach().cpu().numpy()
         return np.array(x)
 
-    pts3d_views  = [to_numpy(p) for p in pts3d_views]
-    masks_views  = [to_numpy(m).astype(bool) for m in masks_views]
-    confs_views  = [to_numpy(c).astype(np.float32) for c in confs_views]
+    pts3d_views: list[np.ndarray] = []
+    masks_views: list[np.ndarray] = []
+    confs_views: list[np.ndarray] = []
+    dense_out: dict[str, tuple] = {}
+    for i in range(len(filelist)):
+        img_native = to_numpy(scene.imgs[i])   # (H, W, 3) float in [0, 1]
+        h, w = img_native.shape[:2]
+        pts3d_hw3 = to_numpy(pts3d_list[i]).reshape(h, w, 3)
+        conf_hw   = to_numpy(confs_list[i]).reshape(h, w).astype(np.float32)
+        pts3d_views.append(pts3d_hw3)
+        confs_views.append(conf_hw)
+        masks_views.append(np.ones((h, w), dtype=bool))
+        if keep_dense:
+            stem = Path(filelist[i]).stem
+            img_u8 = np.clip(img_native * 255.0, 0, 255).astype(np.uint8)
+            valid  = conf_hw >= config.MAST3R_CONF_THRESHOLD
+            dense_out[stem] = (pts3d_hw3, img_u8, valid)
 
     n_frames    = len(filelist)
     points_per_frame = max(10, config.MAST3R_MAX_POINTS // max(1, n_frames))
@@ -271,7 +303,7 @@ def _extract_pointcloud(
 
     if not sampled_pts3d:
         logger.error("No valid 3D points extracted from MASt3R scene")
-        return np.empty((0, 3)), []
+        return np.empty((0, 3)), [], dense_out
 
     all_pts  = np.stack(sampled_pts3d, axis=0)  # (N, 3)
     all_px   = sampled_pixels
@@ -284,26 +316,41 @@ def _extract_pointcloud(
     # For each sampled 3D point, project into all frames and check if a
     # confident MASt3R pixel is nearby.
 
-    # Build per-frame intrinsics for projection.
-    # We use frame.K_undist if available; fall back to config intrinsics.
+    # Two different intrinsics are needed here, for two different purposes:
+    #   K_native — MASt3R's own per-camera K (scene.intrinsics), matching the
+    #              pixel space that pts3d_views/masks_views/confs_views actually
+    #              live in (≈512px-resized images). Used to test whether a
+    #              point lands on a valid/confident pixel of view j.
+    #   K_undist — this project's real calibration for the full undistorted
+    #              image (1280×720). Used only for the pixel coordinate we
+    #              *store*, since that's the space orientation_solver.py's
+    #              MASt3RReprojCost expects (it's built with f.K_undist).
+    # Projecting with K_undist and then bounds-checking against the small
+    # native (h, w) arrays — as this used to do — means nearly every
+    # projection lands outside [0, w)×[0, h) before any real match is even
+    # attempted (K_undist's cx=640 alone exceeds a ~512px-wide native image).
     from pipeline.undistort import build_K_new, build_K
 
     K_default = build_K_new(build_K())
 
-    def get_K(stem: str) -> Optional[np.ndarray]:
+    def get_K_undist(stem: str) -> Optional[np.ndarray]:
         f = frame_map.get(stem)
         if f is not None and f.K_undist is not None:
             return f.K_undist
         return K_default
 
-    # index_of_stem → (pts3d, mask, conf) for observation lookup
+    def to_numpy_local(x):
+        return x.detach().cpu().numpy() if hasattr(x, "detach") else np.array(x)
+
+    # index_of_stem → (pts3d, mask, conf, h, w, K_native) for observation lookup
     view_data = {}
     for fpath in filelist:
         stem = Path(fpath).stem
         idx  = stem_to_idx.get(stem)
         if idx is not None and idx < len(pts3d_views):
             h, w = pts3d_views[idx].shape[:2]
-            view_data[stem] = (pts3d_views[idx], masks_views[idx], confs_views[idx], h, w)
+            K_native = to_numpy_local(scene.intrinsics[idx])
+            view_data[stem] = (pts3d_views[idx], masks_views[idx], confs_views[idx], h, w, K_native)
 
     observations: list[Observation] = []
     point_to_obs_count = [0] * len(all_pts)  # track per-point multi-view count
@@ -317,9 +364,8 @@ def _extract_pointcloud(
         for fpath in filelist:
             stem = Path(fpath).stem
             w2c = cam_poses.get(stem)
-            K   = get_K(stem)
             vd  = view_data.get(stem)
-            if w2c is None or K is None or vd is None:
+            if w2c is None or vd is None:
                 continue
 
             R34 = w2c[:3, :3]
@@ -328,11 +374,12 @@ def _extract_pointcloud(
             if p_cam[2] <= 0:  # behind camera
                 continue
 
-            u_proj = K[0, 0] * p_cam[0] / p_cam[2] + K[0, 2]
-            v_proj = K[1, 1] * p_cam[1] / p_cam[2] + K[1, 2]
+            pts_view, mask_view, conf_view, h, w, K_native = vd
 
-            pts_view, mask_view, conf_view, h, w = vd
-            ui, vi = int(round(u_proj)), int(round(v_proj))
+            # Validity/confidence check in MASt3R's own native pixel space.
+            u_native = K_native[0, 0] * p_cam[0] / p_cam[2] + K_native[0, 2]
+            v_native = K_native[1, 1] * p_cam[1] / p_cam[2] + K_native[1, 2]
+            ui, vi = int(round(u_native)), int(round(v_native))
             if not (0 <= ui < w and 0 <= vi < h):
                 continue
 
@@ -348,6 +395,12 @@ def _extract_pointcloud(
                     # Use projection pixel even if 3D doesn't match — the solver corrects it
                     pass
 
+            # Pixel coordinate to store — in K_undist's full-resolution space,
+            # since that's what MASt3RReprojCost reprojects against.
+            K_undist = get_K_undist(stem)
+            u_proj = K_undist[0, 0] * p_cam[0] / p_cam[2] + K_undist[0, 2]
+            v_proj = K_undist[1, 1] * p_cam[1] / p_cam[2] + K_undist[1, 2]
+
             observations.append(Observation(
                 frame_stem=stem,
                 point_idx=pt_idx,
@@ -360,15 +413,19 @@ def _extract_pointcloud(
     keep_mask = np.array(point_to_obs_count) >= 2
     keep_idxs = np.where(keep_mask)[0]
 
-    if len(keep_idxs) == 0:
-        # Fall back to single-view points to avoid empty Ceres problem
-        logger.warning("No multi-view points found; using single-view seed points")
-        keep_idxs = np.arange(len(all_pts))
-
     logger.info(
         "%d / %d 3D points have ≥2 observations",
         len(keep_idxs), len(all_pts),
     )
+
+    if len(keep_idxs) == 0:
+        # Fall back to single-view points to avoid empty Ceres problem
+        logger.warning(
+            "No multi-view points found; using all %d single-view seed points instead "
+            "(MASt3RReprojCost will contribute little/no real cross-frame constraint)",
+            len(all_pts),
+        )
+        keep_idxs = np.arange(len(all_pts))
 
     # Remap point indices
     old_to_new = {old: new for new, old in enumerate(keep_idxs)}
@@ -393,7 +450,7 @@ def _extract_pointcloud(
         "Final 3D cloud: %d points, %d observations",
         len(final_pts), len(final_obs),
     )
-    return final_pts, final_obs
+    return final_pts, final_obs, dense_out
 
 
 def _fps_subsample(
@@ -435,13 +492,25 @@ def _fps_subsample(
 # Public entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_complete_graph(frames: list, save_mast3r_images: str | None = None) -> MASt3RResult:
+def run_complete_graph(
+    frames: list,
+    save_mast3r_images: str | None = None,
+    keep_dense: bool = False,
+    export_raw_glb_dir: str | None = None,
+) -> MASt3RResult:
     """
     Run MASt3R-SfM on all pairs of undistorted frames.
 
     Frames without an undistorted image are silently skipped.
     Returns a MASt3RResult with camera poses in MASt3R's internal coordinate
     frame and a filtered/subsampled point cloud with cross-frame observations.
+
+    keep_dense          : also populate MASt3RResult.dense (per-view pointmap +
+                           image + valid mask) for the Blender mesh exporter.
+    export_raw_glb_dir   : if set, write MASt3R's raw reconstruction (its own
+                           native frame, pre-Ceres/pre-Sim3) as a debug .glb
+                           to this directory, using the `scene` object before
+                           it's torn down. Works even with --run-matcher-only.
     """
     import torch
 
@@ -495,12 +564,23 @@ def run_complete_graph(frames: list, save_mast3r_images: str | None = None) -> M
             verbose=True,
         )
 
+        if export_raw_glb_dir is not None:
+            try:
+                export_raw_glb(
+                    scene, filelist,
+                    os.path.join(export_raw_glb_dir, "mast3r_raw_scene.glb"),
+                )
+            except Exception as e:
+                logger.warning("Raw MASt3R .glb export failed (continuing): %s", e)
+
         # ── Extract results ───────────────────────────────────────────────────
         logger.info("Extracting camera poses …")
         cam_poses = _extract_poses(scene, filelist, frames)
 
         logger.info("Extracting 3D pointcloud and observations …")
-        points_3d, observations = _extract_pointcloud(scene, filelist, frames, cam_poses)
+        points_3d, observations, dense = _extract_pointcloud(
+            scene, filelist, frames, cam_poses, keep_dense=keep_dense,
+        )
 
         # Tear down model before returning (VRAM for Ceres host is fine; Ceres is CPU)
         del model, scene, images, pairs
@@ -513,6 +593,7 @@ def run_complete_graph(frames: list, save_mast3r_images: str | None = None) -> M
         camera_poses=cam_poses,
         points_3d=points_3d,
         observations=observations,
+        dense=dense,
     )
 
 
@@ -548,3 +629,146 @@ def save_auto_matches(result: MASt3RResult, path: str | Path) -> None:
         "Auto-matches saved to %s  (%d pts, %d obs)",
         path, len(result.points_3d), len(result.observations),
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Blender .glb mesh export (debug visualization)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Both functions below reuse dust3r's own viz building blocks directly —
+# the same ones that power the "download .glb" button in MASt3R/dust3r's
+# official demo (dust3r.demo._convert_scene_output_to_glb does the same
+# three steps). We don't import dust3r.demo itself: it imports gradio at
+# module level, which we don't want as a pipeline dependency just to reuse
+# one helper function.
+#
+#   pts3d_to_trimesh(img, pts3d, valid) — one view's dense per-pixel
+#       pointmap → textured triangle mesh (quad-per-pixel, face-colored
+#       from the RGB image).
+#   cat_meshes(meshes)   — merges per-view meshes into one.
+#   add_scene_cam(...)   — a camera-frustum gizmo with the actual photo
+#       textured onto a card at the frustum's near plane.
+
+def _to_numpy(x):
+    return x.detach().cpu().numpy() if hasattr(x, "detach") else np.array(x)
+
+
+def export_raw_glb(scene, filelist: list[str], out_path: str | Path) -> None:
+    """
+    Export MASt3R's raw reconstruction — its own native coordinate frame,
+    pre-Ceres, pre-Sim(3) — as a single .glb: per-view textured mesh plus a
+    reference card (the actual photo) at each camera's frustum.
+
+    Must be called with the live `scene` object, before run_complete_graph
+    tears it down. Independent of the Ceres solve — works even under
+    --run-matcher-only.
+    """
+    import trimesh
+    from dust3r.viz import pts3d_to_trimesh, cat_meshes, add_scene_cam
+    from dust3r.utils.geometry import get_med_dist_between_poses
+
+    imgs_f   = [_to_numpy(im) for im in scene.imgs]               # float [0,1], (H,W,3)
+    imgs_u8  = [np.clip(im * 255.0, 0, 255).astype(np.uint8) for im in imgs_f]
+    focals   = _to_numpy(scene.get_focals())                      # (N,)
+    cams2w   = _to_numpy(scene.get_im_poses())                    # (N,4,4)
+    pts3d_list, _depthmaps, confs_list = scene.get_dense_pts3d(clean_depth=True, subsample=8)
+
+    meshes = []
+    for i in range(len(filelist)):
+        h, w = imgs_u8[i].shape[:2]
+        pts   = _to_numpy(pts3d_list[i]).reshape(h, w, 3)
+        conf  = _to_numpy(confs_list[i]).reshape(h, w)
+        valid = conf >= config.MAST3R_CONF_THRESHOLD
+        meshes.append(pts3d_to_trimesh(imgs_u8[i], pts, valid))
+
+    scene_glb = trimesh.Scene()
+    if meshes:
+        scene_glb.add_geometry(trimesh.Trimesh(**cat_meshes(meshes)))
+
+    # MASt3R's own units are arbitrary — size reference cards relative to
+    # the scene's own scale rather than a fixed constant.
+    cam_size = max(1e-3, 0.1 * float(get_med_dist_between_poses(cams2w)))
+    for i in range(len(filelist)):
+        add_scene_cam(
+            scene_glb, cams2w[i], (255, 60, 60),
+            image=imgs_u8[i], focal=float(focals[i]),
+            imsize=(imgs_u8[i].shape[1], imgs_u8[i].shape[0]),
+            screen_width=cam_size,
+        )
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    scene_glb.export(str(out_path))
+    logger.info("Raw MASt3R scene exported to %s (%d view(s))", out_path, len(filelist))
+
+
+def _apply_sim3(P: np.ndarray, scale: float, R_sim: np.ndarray, t_sim: np.ndarray) -> np.ndarray:
+    """Apply scale * R_sim @ P + t_sim to an array of points, shape (..., 3)."""
+    flat = P.reshape(-1, 3)
+    return (scale * (flat @ R_sim.T) + t_sim).reshape(P.shape)
+
+
+def export_aligned_glb(
+    mast3r_result: MASt3RResult,
+    points_3d_solved: np.ndarray,
+    sim3: tuple[float, np.ndarray, np.ndarray],
+    frames: list,
+    out_path: str | Path,
+) -> None:
+    """
+    Export the full-pipeline result as a single .glb, all in real ENU meters:
+    MASt3R's dense per-view mesh (mast3r_result.dense) rigidly moved into ENU
+    via the same Sim(3) transform applied to the final solved cameras, the
+    Ceres-refined sparse point cloud (points_3d_solved, also Sim(3)-mapped),
+    and reference cards using each frame's FINAL solved pose + K_undist +
+    actual undistorted image.
+
+    Requires mast3r_result.dense to be populated (run_complete_graph(...,
+    keep_dense=True)) and frames to already carry their final solved
+    R/position_enu (i.e. called after align_to_telemetry_sim3).
+    """
+    import trimesh
+    from dust3r.viz import pts3d_to_trimesh, cat_meshes, add_scene_cam
+
+    scale, R_sim, t_sim = sim3
+
+    scene_glb = trimesh.Scene()
+
+    # Dense mesh, moved into ENU.
+    meshes = []
+    for stem, (pts3d_hw3, img_u8, valid) in mast3r_result.dense.items():
+        pts_enu = _apply_sim3(pts3d_hw3, scale, R_sim, t_sim)
+        meshes.append(pts3d_to_trimesh(img_u8, pts_enu, valid))
+    if meshes:
+        scene_glb.add_geometry(trimesh.Trimesh(**cat_meshes(meshes)))
+
+    # Ceres-refined sparse point cloud, moved into ENU.
+    if len(points_3d_solved):
+        pts_enu = _apply_sim3(np.asarray(points_3d_solved), scale, R_sim, t_sim)
+        scene_glb.add_geometry(trimesh.PointCloud(pts_enu, colors=(255, 220, 0)))
+
+    # Reference cards at each frame's FINAL solved pose (post-Sim3) — same
+    # poses solved_cameras.json carries, so this overlays directly against
+    # what the raycast app actually uses.
+    ready = [f for f in frames if f.ready]
+    cam_size = max(0.1, float(config.MAST3R_GLB_CAM_SIZE_M))
+    for f in ready:
+        # p_cam = R @ (p_world - position_enu)  ⟹  camera-to-world:
+        c2w = np.eye(4)
+        c2w[:3, :3] = f.R.T
+        c2w[:3, 3]  = f.position_enu
+
+        img_rgb = cv2.cvtColor(f.undistorted, cv2.COLOR_BGR2RGB) if f.undistorted is not None else None
+        focal   = float(f.K_undist[0, 0]) if f.K_undist is not None else None
+        imsize  = (img_rgb.shape[1], img_rgb.shape[0]) if img_rgb is not None else None
+
+        add_scene_cam(
+            scene_glb, c2w, (60, 180, 255),
+            image=img_rgb, focal=focal, imsize=imsize,
+            screen_width=cam_size,
+        )
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    scene_glb.export(str(out_path))
+    logger.info("Aligned (ENU) scene exported to %s (%d camera(s))", out_path, len(ready))
