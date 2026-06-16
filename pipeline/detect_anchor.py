@@ -47,6 +47,8 @@ class AnchorResult:
     weights:   dict = field(default_factory=dict) # frame.stem → CLIP cosine similarity
     # per-frame crosshair bbox in Qwen processed-image coords (xmin,ymin,xmax,ymax) or None
     crosshair_bboxes: dict = field(default_factory=dict)  # frame.stem → tuple|None
+    # per-frame status-banner bbox in Qwen processed-image coords, or None (transient HUD element)
+    banner_bboxes: dict = field(default_factory=dict)  # frame.stem → tuple|None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -67,6 +69,10 @@ def save_anchor_result(result: AnchorResult, path: str) -> None:
             k: list(v) if v is not None else None
             for k, v in result.crosshair_bboxes.items()
         },
+        "banner_bboxes": {
+            k: list(v) if v is not None else None
+            for k, v in result.banner_bboxes.items()
+        },
     }
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
@@ -78,6 +84,7 @@ def load_anchor_result(path: str) -> AnchorResult:
     with open(path) as f:
         data = json.load(f)
     raw_ch = data.get("crosshair_bboxes", {})
+    raw_bn = data.get("banner_bboxes", {})
     return AnchorResult(
         label=data["label"],
         bboxes=data["bboxes"],
@@ -86,6 +93,10 @@ def load_anchor_result(path: str) -> AnchorResult:
         crosshair_bboxes={
             k: tuple(v) if v is not None else None
             for k, v in raw_ch.items()
+        },
+        banner_bboxes={
+            k: tuple(v) if v is not None else None
+            for k, v in raw_bn.items()
         },
     )
 
@@ -108,6 +119,25 @@ _CROSSHAIR_PROMPT = (
     'If no such reticle is visible, return {"bbox": null}.'
 )
 
+_BANNER_PROMPT = (
+    "This is a drone FPV video frame with a HUD overlay. "
+    "Find the horizontal status banner overlaid on the image: a synthetic, flat, "
+    "semi-transparent dark rectangular box rendered by the flight controller's UI, "
+    "containing a single thin line of crisp white status/navigation text (for "
+    "example 'En Route To Waypoint 1'). It is typically located in the lower-center "
+    "area of the frame, and is transient — only shown some of the time. "
+    "This banner is a UI overlay, NOT anything physically in the photographed scene. "
+    "Ground markings such as tire tracks, tilled soil lines, crop rows, plow furrows, "
+    "and shadows are part of the terrain, not text — even if a track or furrow looks "
+    "wavy or line-like, it is NOT the banner and must never be reported as one. Only "
+    "report a detection if you can actually read crisp, legible UI text characters; "
+    "if you are not confident you are looking at rendered UI text, return null. "
+    'Return ONLY a single JSON object: {"bbox": [xmin, ymin, xmax, ymax]} '
+    "tightly enclosing the dark banner box (not just the text glyphs), where values "
+    "are absolute pixel coordinates (x=column, y=row, origin top-left). "
+    'If no such banner is visible, return {"bbox": null}.'
+)
+
 _DISCOVERY_PROMPT = (
     "List every discrete, bounded physical object you can see in this image. "
     "Only label man-made objects and structures: vehicles, buildings, towers, poles, "
@@ -125,8 +155,11 @@ _DISCOVERY_PROMPT = (
 )
 
 
-def _qwen_find_crosshair(model, processor, frame_bgr: np.ndarray):
-    """Locate the HUD crosshair in one frame via a short targeted Qwen query.
+def _qwen_find_bbox(model, processor, frame_bgr: np.ndarray, prompt: str, what: str = "region"):
+    """Locate one HUD overlay element in a frame via a short targeted Qwen query.
+
+    Generic worker shared by `_qwen_find_crosshair` and `_qwen_find_banner` — both
+    just send one image + one bbox-or-null prompt and parse the same JSON shape.
 
     Returns (xmin, ymin, xmax, ymax) in processed-image pixel coords, or None.
     """
@@ -139,7 +172,7 @@ def _qwen_find_crosshair(model, processor, frame_bgr: np.ndarray):
 
     messages = [{"role": "user", "content": [
         {"type": "image", "image": pil_img},
-        {"type": "text",  "text": _CROSSHAIR_PROMPT},
+        {"type": "text",  "text": prompt},
     ]}]
     text   = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inputs = processor(text=[text], images=[pil_img], return_tensors="pt").to(model.device)
@@ -157,8 +190,52 @@ def _qwen_find_crosshair(model, processor, frame_bgr: np.ndarray):
         if bbox and len(bbox) == 4:
             return tuple(int(v) for v in bbox)
     except (json.JSONDecodeError, TypeError, AttributeError):
-        logger.debug("Crosshair parse failed; raw: %s", response[:100])
+        logger.debug("%s parse failed; raw: %s", what, response[:100])
     return None
+
+
+def _qwen_find_crosshair(model, processor, frame_bgr: np.ndarray):
+    """Locate the HUD crosshair in one frame. See `_qwen_find_bbox`."""
+    return _qwen_find_bbox(model, processor, frame_bgr, _CROSSHAIR_PROMPT, what="Crosshair")
+
+
+def _qwen_find_banner(model, processor, frame_bgr: np.ndarray):
+    """Locate the transient HUD status banner in one frame. See `_qwen_find_bbox`.
+
+    Qwen has two known false-positive modes, neither of which remotely matches a
+    real banner: (1) ground texture (e.g. a tire-tread imprint that vaguely
+    resembles a wavy line of text), which produces an implausibly tall/blocky
+    bbox; (2) the central crosshair/bracket HUD cluster (white marks clustered
+    at the frame's true centre), which can look like "white text on a dark sky"
+    from a distance. A real banner is one thin line of text sitting well below
+    centre in a fixed HUD layout slot — reject anything that doesn't match both
+    the expected shape AND position rather than trust Qwen's bbox alone (the
+    same belt-and-suspenders philosophy as the crosshair IoU/size-ratio gate).
+    """
+    bbox = _qwen_find_bbox(model, processor, frame_bgr, _BANNER_PROMPT, what="Banner")
+    if bbox is None:
+        return None
+    x1, y1, x2, y2 = bbox
+    width, height = x2 - x1, y2 - y1
+    if height <= 0 or width <= 0:
+        return None
+    if height > config.BANNER_MAX_HEIGHT_PX or (width / height) < config.BANNER_MIN_ASPECT_RATIO:
+        logger.info(
+            "    → rejected implausible banner shape %s (w=%d h=%d aspect=%.1f)",
+            bbox, width, height, width / height,
+        )
+        return None
+    h, w = frame_bgr.shape[:2]
+    h_proc, _ = _proc_dims(h, w)
+    offset_from_center = (y1 + y2) / 2.0 - h_proc / 2.0
+    if offset_from_center < config.BANNER_MIN_Y_OFFSET_FROM_CENTER_PX:
+        logger.info(
+            "    → rejected banner too close to frame centre %s (offset=%.0fpx) — "
+            "likely the crosshair/bracket HUD cluster, not the status banner",
+            bbox, offset_from_center,
+        )
+        return None
+    return bbox
 
 
 def _bbox_iou_norm(a, b) -> float:
@@ -528,7 +605,7 @@ def detect_anchor(frames: list) -> AnchorResult:
     # ── Phase 1: Per-frame discovery ──────────────────────────────────────────
     logger.info("Phase 1: per-frame Qwen object discovery (%d frames) …", len(frames))
     per_frame_objects: dict[str, list[dict]] = {}
-    frame_mask_regions: dict[str, tuple] = {}   # stem → (mx1, my1, mx2, my2) orig pixels
+    frame_mask_regions: dict[str, list] = {}   # stem → [(mx1, my1, mx2, my2), ...] orig pixels
 
     for frame in frames:
         if frame.undistorted is None:
@@ -536,7 +613,9 @@ def detect_anchor(frames: list) -> AnchorResult:
             per_frame_objects[frame.stem] = []
             continue
 
-        # Step A: find crosshair first so we can exclude it from anchor candidates
+        # Step A: find crosshair + status banner first so we can exclude them from
+        # anchor candidates. Both are independent, optional (None when not present)
+        # Qwen-detected HUD overlay regions in processed-image pixel coords.
         logger.info("  Finding crosshair in %s …", frame.stem[-12:])
         ch_bbox = _qwen_find_crosshair(qwen_model, qwen_proc, frame.undistorted)
         frame.crosshair_bbox_px = ch_bbox
@@ -545,26 +624,38 @@ def detect_anchor(frames: list) -> AnchorResult:
         else:
             logger.info("    → no crosshair detected")
 
+        logger.info("  Finding status banner in %s …", frame.stem[-12:])
+        banner_bbox = _qwen_find_banner(qwen_model, qwen_proc, frame.undistorted)
+        frame.banner_bbox_px = banner_bbox
+        if banner_bbox is not None:
+            logger.info("    → banner at %s (proc-image pixels)", banner_bbox)
+        else:
+            logger.info("    → no banner detected")
+
+        exclude_regions = [b for b in (ch_bbox, banner_bbox) if b is not None]
+
         h, w = frame.undistorted.shape[:2]
 
-        # Step B: build a temporary discovery image with the crosshair region
-        # painted solid black so Qwen never sees the ⊕/+ HUD elements.
+        # Step B: build a temporary discovery image with each detected overlay region
+        # painted solid black so Qwen never sees the ⊕/+ crosshair or the status banner.
         # The original frame.undistorted is NOT modified; Phase 3b second-pass
-        # uses it unmasked, so a van that falls inside the masked region is
+        # uses it unmasked, so a van that falls inside a masked region is
         # recovered cleanly by the targeted query.
-        if ch_bbox is not None:
-            x1p, y1p, x2p, y2p = ch_bbox
+        if exclude_regions:
             h_proc, w_proc = _proc_dims(h, w)
             pad = config.CROSSHAIR_MASK_PAD_PX
-            mx1 = max(0, int(x1p * w / w_proc) - pad)
-            my1 = max(0, int(y1p * h / h_proc) - pad)
-            mx2 = min(w, int(x2p * w / w_proc) + pad)
-            my2 = min(h, int(y2p * h / h_proc) + pad)
+            mask_rects = []
             discovery_img = frame.undistorted.copy()
-            discovery_img[my1:my2, mx1:mx2] = 0
-            frame_mask_regions[frame.stem] = (mx1, my1, mx2, my2)
-            logger.info("  Querying Qwen (crosshair masked y=%d:%d x=%d:%d) …",
-                        my1, my2, mx1, mx2)
+            for x1p, y1p, x2p, y2p in exclude_regions:
+                mx1 = max(0, int(x1p * w / w_proc) - pad)
+                my1 = max(0, int(y1p * h / h_proc) - pad)
+                mx2 = min(w, int(x2p * w / w_proc) + pad)
+                my2 = min(h, int(y2p * h / h_proc) + pad)
+                discovery_img[my1:my2, mx1:mx2] = 0
+                mask_rects.append((mx1, my1, mx2, my2))
+                logger.info("  Masking region y=%d:%d x=%d:%d before discovery query …",
+                            my1, my2, mx1, mx2)
+            frame_mask_regions[frame.stem] = mask_rects
         else:
             discovery_img = frame.undistorted
             logger.info("  Querying Qwen for frame %s …", frame.stem[-12:])
@@ -574,24 +665,25 @@ def detect_anchor(frames: list) -> AnchorResult:
                     [(o.get("label"), o.get("bbox")) for o in raw_objects])
 
         # Belt-and-suspenders: also IoU-exclude same-sized detections overlapping
-        # the crosshair (handles edge cases where ch_bbox is None or mask was tiny).
-        if ch_bbox is not None:
-            ch_area = max(1, (ch_bbox[2]-ch_bbox[0]) * (ch_bbox[3]-ch_bbox[1]))
+        # any excluded overlay region (handles edge cases where the mask was tiny).
+        if exclude_regions:
             keep, drop = [], []
             for obj in raw_objects:
                 det_bbox = obj.get("bbox", [0, 0, 0, 0])
-                iou = _bbox_iou_norm(det_bbox, list(ch_bbox))
                 det_area = max(1, (det_bbox[2]-det_bbox[0]) * (det_bbox[3]-det_bbox[1]))
-                size_match = det_area < config.CROSSHAIR_SIZE_RATIO * ch_area
-                (drop if iou > config.CROSSHAIR_IOU_EXCLUDE and size_match else keep).append(obj)
-            if drop:
-                for obj in drop:
-                    det_bbox = obj.get("bbox", [0, 0, 0, 0])
-                    det_area = max(1, (det_bbox[2]-det_bbox[0])*(det_bbox[3]-det_bbox[1]))
-                    logger.info("    → EXCLUDED '%s' bbox=%s  (IoU=%.3f, area ratio=%.1f)",
-                                obj.get("label"), det_bbox,
-                                _bbox_iou_norm(det_bbox, list(ch_bbox)),
-                                det_area / ch_area)
+                excluded = False
+                for region in exclude_regions:
+                    region_area = max(1, (region[2]-region[0]) * (region[3]-region[1]))
+                    iou = _bbox_iou_norm(det_bbox, list(region))
+                    size_match = det_area < config.CROSSHAIR_SIZE_RATIO * region_area
+                    if iou > config.CROSSHAIR_IOU_EXCLUDE and size_match:
+                        excluded = True
+                        logger.info(
+                            "    → EXCLUDED '%s' bbox=%s  (IoU=%.3f, area ratio=%.1f)",
+                            obj.get("label"), det_bbox, iou, det_area / region_area,
+                        )
+                        break
+                (drop if excluded else keep).append(obj)
             raw_objects = keep
 
         scaled = []
@@ -667,13 +759,14 @@ def detect_anchor(frames: list) -> AnchorResult:
     missed = [f for f in frames
               if f.stem not in bboxes_pixel and f.undistorted is not None]
 
-    # Frames whose Phase 1 detection bbox overlaps the crosshair mask region —
+    # Frames whose Phase 1 detection bbox overlaps a crosshair/banner mask region —
     # those detections are likely truncated; re-query against the unmasked image.
     mask_clipped = [
         f for f in frames
         if f.stem in bboxes_pixel
         and f.stem in frame_mask_regions
-        and _bbox_overlaps_region(bboxes_pixel[f.stem], *frame_mask_regions[f.stem])
+        and any(_bbox_overlaps_region(bboxes_pixel[f.stem], *region)
+                for region in frame_mask_regions[f.stem])
     ]
 
     second_pass_frames = missed + mask_clipped
@@ -739,6 +832,7 @@ def detect_anchor(frames: list) -> AnchorResult:
         centroids=centroids,
         weights=weights,
         crosshair_bboxes={f.stem: f.crosshair_bbox_px for f in frames},
+        banner_bboxes={f.stem: f.banner_bbox_px for f in frames},
     )
 
     n_above = sum(1 for w in weights.values() if w >= config.CLIP_ANCHOR_THRESHOLD)

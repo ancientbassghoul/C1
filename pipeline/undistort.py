@@ -189,10 +189,12 @@ def _apply_hud_mask_raw(frame: Frame) -> None:
 
 
 def suppress_center_overlays(frames: list[Frame]) -> None:
-    """Gaussian-blur bracket and crosshair HUD overlays in frame.undistorted.
+    """Gaussian-blur bracket, crosshair, and status-banner HUD overlays in
+    frame.undistorted.
 
     Called after estimate_poses (brackets known) and detect_anchor (crosshair
-    known), and before MASt3R, so the feature matcher never sees HUD lines.
+    and banner known), and before MASt3R, so the feature matcher never sees
+    HUD lines or text.
     """
     K, D, K_new = build_K(), build_D(), build_K_new(build_K())
     ksize = config.OVERLAY_BLUR_KERNEL
@@ -261,6 +263,21 @@ def suppress_center_overlays(frames: list[Frame]) -> None:
                 roi = img[y1c:y2c, x1c:x2c]
                 img[y1c:y2c, x1c:x2c] = cv2.GaussianBlur(roi, (ksize, ksize), 0)
             logger.debug("[%s] crosshair blurred at undist px [%d:%d, %d:%d]",
+                         frame.stem, y1c, y2c, x1c, x2c)
+
+        # ── Status banner (Qwen-detected, transient — only present some frames) ───
+        if frame.banner_bbox_px is not None:
+            x1p, y1p, x2p, y2p = frame.banner_bbox_px  # [xmin,ymin,xmax,ymax] proc pixels
+            h_proc = max(28, round(h / 28) * 28)
+            w_proc = max(28, round(w / 28) * 28)
+            y1c = max(0, int(y1p * h / h_proc) - pad)
+            y2c = min(h, int(y2p * h / h_proc) + pad)
+            x1c = max(0, int(x1p * w / w_proc) - pad)
+            x2c = min(w, int(x2p * w / w_proc) + pad)
+            if y2c > y1c and x2c > x1c:
+                roi = img[y1c:y2c, x1c:x2c]
+                img[y1c:y2c, x1c:x2c] = cv2.GaussianBlur(roi, (ksize, ksize), 0)
+            logger.debug("[%s] status banner blurred at undist px [%d:%d, %d:%d]",
                          frame.stem, y1c, y2c, x1c, x2c)
 
         # ── Fixed center reticle (always present, ~17×17 px "+" symbol) ───────

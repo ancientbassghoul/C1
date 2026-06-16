@@ -225,11 +225,14 @@ def run_pipeline(
     if use_saved_qwen and _os.path.isfile(config.ANCHOR_CACHE_FILE):
         logger.info("--use-saved-qwen: loading anchor cache from %s", config.ANCHOR_CACHE_FILE)
         anchor_result = load_anchor_result(config.ANCHOR_CACHE_FILE)
-        # Restore crosshair bboxes that were detected during the original Qwen run
+        # Restore crosshair/banner bboxes that were detected during the original Qwen run
         frame_map = {f.stem: f for f in frames}
         for stem, bbox in anchor_result.crosshair_bboxes.items():
             if stem in frame_map:
                 frame_map[stem].crosshair_bbox_px = bbox
+        for stem, bbox in anchor_result.banner_bboxes.items():
+            if stem in frame_map:
+                frame_map[stem].banner_bbox_px = bbox
     else:
         if use_saved_qwen:
             logger.warning(
@@ -237,7 +240,7 @@ def run_pipeline(
             )
         anchor_result = detect_anchor(frames)
 
-    logger.info("Step 5b – Suppressing bracket + crosshair overlays in undistorted frames")
+    logger.info("Step 5b – Suppressing bracket + crosshair + banner overlays in undistorted frames")
     from pipeline.undistort import suppress_center_overlays
     suppress_center_overlays(frames)
 

@@ -95,6 +95,11 @@ class Frame:
     # Populated by detect_anchor; used by suppress_center_overlays.
     crosshair_bbox_px: Optional[tuple] = None
 
+    # Status-banner bbox from Qwen in processed-image pixel coords (xmin,ymin,xmax,ymax).
+    # Populated by detect_anchor; used by suppress_center_overlays. None when no banner
+    # is present in this frame (it's a transient HUD element, not always shown).
+    banner_bbox_px: Optional[tuple] = None
+
     # ── Convenience ───────────────────────────────────────────────────────────
     @property
     def ready(self) -> bool:

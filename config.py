@@ -147,7 +147,7 @@ HUD_REGIONS = [
     # Top-right: system icons + battery percentage + battery bar
     (  0,  65,1025, 1280),
     # Bottom-left: aircraft status rows (CHARLIE / BETA / DELTA)
-    (548, 685,   0,  400),
+    (575, 685,   0,  400),
     # Bottom-left: date, time and flight timer
     (678, 720,   0,  400),
     # Bottom-right: telemetry readout (alt, AGL, ground speed + unit labels)
@@ -239,6 +239,19 @@ CROSSHAIR_MASK_PAD_PX  = 40
 # IoU exclusion only applies when the candidate's bbox area is below this multiple
 # of the crosshair area — prevents large van bboxes from being wrongly excluded.
 CROSSHAIR_SIZE_RATIO   = 1.5
+
+# A real status banner is one thin line of text (~20px tall, ~11:1 aspect ratio
+# in the verified examples). Qwen occasionally false-positives on ground texture
+# (e.g. tire tracks) that vaguely resembles text; reject implausibly-shaped
+# "banner" detections outright rather than trust Qwen's bbox alone.
+BANNER_MAX_HEIGHT_PX     = 50   # proc-px; real banner ≈20px, generous margin
+BANNER_MIN_ASPECT_RATIO  = 3.0  # width/height; real banner ≈11:1, false positive was ≈2:1
+
+# Confirmed real banner detections sit ~140px below the frame's vertical centre in
+# proc-px (a fixed HUD layout slot). Qwen also frequently mistakes the central
+# crosshair/bracket HUD cluster (which sits AT the centre, offset ≈0) for the banner.
+# Reject anything whose vertical centre isn't clearly below the centre cluster.
+BANNER_MIN_Y_OFFSET_FROM_CENTER_PX = 60
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CAMERA POSE OVERRIDES
