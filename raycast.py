@@ -613,11 +613,17 @@ def main() -> None:
     did_export = False
 
     if args.export_solve is not None:
-        from pipeline.solve_io import export_solve
+        from pipeline.solve_io import export_solve, export_mast3r_cameras
         _path = args.export_solve or os.path.join(config.OUTPUT_DIR, "solved_cameras.json")
         export_solve(frames, _path)
         print(f"\nSolved cameras written to: {_path}")
-        print("Copy this file locally and run:")
+
+        if refine_result is not None and refine_result.mast3r_cameras_enu:
+            _mast3r_path = os.path.join(config.OUTPUT_DIR, "solved_camera_mast3r.json")
+            export_mast3r_cameras(refine_result.mast3r_cameras_enu, _mast3r_path)
+            print(f"MASt3R seed cameras written to: {_mast3r_path}")
+
+        print("Copy these files locally and run:")
         print(f"  python raycast.py --frames_dir ./frames --import-solve {_path}\n")
         did_export = True
 

@@ -38,6 +38,7 @@ class RefineResult:
     mast3r_result: object               # MASt3RResult — carries .dense when keep_dense=True
     points_3d_solved: np.ndarray        # Ceres-refined sparse points, MASt3R frame (pre-Sim3)
     sim3: tuple[float, np.ndarray, np.ndarray] | None  # (scale, R_sim, t_sim), MASt3R frame → ENU
+    mast3r_cameras_enu: dict = None     # MASt3R seed cameras in ENU (before Ceres) — same schema as solved_cameras.json
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -99,6 +100,46 @@ def _load_manual_features(frames: list[Frame]) -> list[dict]:
 
     logger.info("Loaded %d manual feature(s) from %s", len(features), path)
     return features
+
+
+def _build_mast3r_cameras_enu(frames, w2c_poses: dict, sim3) -> dict:
+    """
+    Apply the Ceres-derived Sim(3) to MASt3R's initial W2C matrices and
+    return a camera dict in the same schema as solved_cameras.json.
+
+    Using the same Sim(3) as the Ceres-solved export keeps both files in the
+    same ENU frame so positions are directly comparable.
+    """
+    if sim3 is None:
+        return {}
+
+    from pipeline.orientation_solver import decompose_R_wc
+
+    scale, R_sim, t_sim = sim3
+    cameras = {}
+    for f in frames:
+        w2c = w2c_poses.get(f.stem)
+        if w2c is None or f.K_undist is None:
+            continue
+        R34 = w2c[:3, :3]
+        t3  = w2c[:3, 3]
+
+        C_enu    = scale * R_sim @ (-R34.T @ t3) + t_sim
+        R_enu_wc = R34 @ R_sim.T
+        angles   = decompose_R_wc(R_enu_wc)
+        if angles is None:
+            logger.warning("[%s] MASt3R camera rotation decomposition failed", f.stem[-12:])
+            continue
+        heading_deg, pitch_deg, roll_deg = angles
+
+        cameras[f.stem] = {
+            "position_enu":     C_enu.tolist(),
+            "heading_deg":      heading_deg,
+            "gimbal_pitch_deg": pitch_deg,
+            "camera_roll_deg":  roll_deg,
+            "K_undist":         f.K_undist.tolist(),
+        }
+    return cameras
 
 
 def _build_anchor_rays(anchor_result) -> list[tuple]:
@@ -312,9 +353,15 @@ def refine_pitches(
     logger.info("Aligning solved poses to GPS/ENU via Umeyama Sim(3) …")
     sim3 = align_to_telemetry_sim3(ready, cam_params_solved, anchor_result=anchor_result)
 
+    # Build MASt3R-before-Ceres cameras in ENU using the same Sim(3).
+    mast3r_cams_enu = _build_mast3r_cameras_enu(ready, mast3r_result.camera_poses, sim3)
+    if mast3r_cams_enu:
+        logger.info("MASt3R seed cameras converted to ENU (%d frames).", len(mast3r_cams_enu))
+
     logger.info("refine_pitches complete.")
     return RefineResult(
         mast3r_result=mast3r_result,
         points_3d_solved=points_3d_solved,
         sim3=sim3,
+        mast3r_cameras_enu=mast3r_cams_enu,
     )

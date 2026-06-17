@@ -212,6 +212,16 @@ def ceres_solve(
             cam_params[f.stem] = np.zeros(6, dtype=np.float64)
 
     n_pts       = len(points_3d_init)
+    if n_pts == 0:
+        logger.error(
+            "Ceres solve aborted: zero 3D points (all frames below "
+            "MAST3R_CONF_THRESHOLD=%.1f). Returning MASt3R seed cameras.",
+            config.MAST3R_CONF_THRESHOLD,
+        )
+        return cam_params, np.empty((0, 3), dtype=np.float64), \
+               np.asarray(p_anchor_init, dtype=np.float64).copy(), \
+               "Aborted: zero 3D points"
+
     point_params = [
         np.asarray(points_3d_init[k], dtype=np.float64).copy()
         for k in range(n_pts)
@@ -512,10 +522,10 @@ def align_to_telemetry_sim3(
     return scale, R_sim, t_sim
 
 
-def _apply_rotation_to_frame(frame, R_wc: np.ndarray) -> None:
+def decompose_R_wc(R_wc: np.ndarray) -> tuple[float, float, float] | None:
     """
     Decompose a world-to-camera rotation matrix (in ENU frame) into
-    heading_deg, gimbal_pitch_deg, camera_roll_deg and store into the frame.
+    (heading_deg, pitch_deg, roll_deg).
 
     This is the EXACT analytic inverse of pipeline/pose.py build_rotation() —
     NOT a generic Euler-angle decomposition. build_rotation() is not a plain
@@ -533,38 +543,44 @@ def _apply_rotation_to_frame(frame, R_wc: np.ndarray) -> None:
     and R_wc = R_world_from_cam.T, so:
       row 0 of R_wc = right
       row 2 of R_wc = fwd
+
+    Returns None on numerical failure.
     """
     try:
         fwd   = R_wc[2, :].copy()
         right = R_wc[0, :].copy()
         fwd  /= np.linalg.norm(fwd)
 
-        # Invert the fwd = [sin(yaw)cos(pitch), cos(yaw)cos(pitch), sin(pitch)]
-        # construction directly.
-        pitch_deg = math.degrees(math.asin(np.clip(fwd[2], -1.0, 1.0)))
+        pitch_deg   = math.degrees(math.asin(np.clip(fwd[2], -1.0, 1.0)))
         heading_deg = math.degrees(math.atan2(fwd[0], fwd[1]))
 
-        # Recompute the *unrolled* right vector exactly as build_rotation()
-        # does (same nadir/zenith special case), then recover roll as the
-        # signed angle between it and the actual (rolled) right, about fwd.
         world_up = np.array([0.0, 0.0, 1.0])
         if abs(np.dot(fwd, world_up)) > 0.999:
             yaw_rad = math.radians(heading_deg)
-            right0 = np.array([math.cos(yaw_rad), -math.sin(yaw_rad), 0.0])
+            right0  = np.array([math.cos(yaw_rad), -math.sin(yaw_rad), 0.0])
         else:
-            right0 = np.cross(fwd, world_up)
+            right0  = np.cross(fwd, world_up)
             right0 /= np.linalg.norm(right0)
 
-        cos_roll = float(np.dot(right, right0))
-        sin_roll = float(np.dot(np.cross(right0, right), fwd))
-        roll_deg = math.degrees(math.atan2(sin_roll, cos_roll))
+        roll_deg = math.degrees(math.atan2(
+            float(np.dot(np.cross(right0, right), fwd)),
+            float(np.dot(right, right0)),
+        ))
     except Exception:
+        return None
+
+    return heading_deg % 360.0, pitch_deg, roll_deg
+
+
+def _apply_rotation_to_frame(frame, R_wc: np.ndarray) -> None:
+    """Decompose R_wc and store heading/pitch/roll/R into the frame."""
+    result = decompose_R_wc(R_wc)
+    if result is None:
         logger.warning("[%s] rotation decomposition failed", frame.stem[-12:])
         return
-
-    frame.heading_deg      = heading_deg % 360.0
-    frame.gimbal_pitch_deg = pitch_deg
-    frame.camera_roll_deg  = roll_deg
+    frame.heading_deg      = result[0]
+    frame.gimbal_pitch_deg = result[1]
+    frame.camera_roll_deg  = result[2]
     frame.R                = R_wc.copy()
     # frame.ready is a computed property (pipeline/frame.py) derived from
     # undistorted/R/position_enu/K_undist — no setter exists, none needed:

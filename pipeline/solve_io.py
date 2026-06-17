@@ -49,6 +49,28 @@ def export_solve(frames: list, path: str | Path) -> None:
     logger.info("Solved cameras written to %s  (%d frame(s))", path, len(cameras))
 
 
+def export_mast3r_cameras(cameras_enu: dict, path: str | Path) -> None:
+    """Write MASt3R-before-Ceres camera state to a JSON file.
+
+    `cameras_enu` is the dict built by feature_matcher._build_mast3r_cameras_enu():
+    { stem: { position_enu, heading_deg, gimbal_pitch_deg, camera_roll_deg, K_undist } }.
+    Schema is identical to solved_cameras.json so --import-solve can load either file.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    payload = {
+        "metadata": {
+            "created":     datetime.now(timezone.utc).isoformat(),
+            "frame_count": len(cameras_enu),
+        },
+        "cameras": cameras_enu,
+    }
+
+    path.write_text(json.dumps(payload, indent=2))
+    logger.info("MASt3R seed cameras written to %s  (%d frame(s))", path, len(cameras_enu))
+
+
 def import_solve(frames: list, path: str | Path) -> int:
     """
     Load solved camera state from JSON and apply it to matching frames (by stem).

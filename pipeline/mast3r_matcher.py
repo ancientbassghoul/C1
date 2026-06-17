@@ -492,6 +492,103 @@ def _fps_subsample(
 # Public entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _log_pairwise_match_diagnostics(
+    pairs: list,
+    filelist: list[str],
+    model,
+    cache_dir: str,
+    device: str,
+    path_to_stem: dict[str, str],
+) -> None:
+    """Run MASt3R's own pairwise matching pass up front and log per-pair match
+    counts plus a connected-components check over the resulting graph.
+
+    sparse_global_alignment() runs this exact same forward_mast3r() pass
+    internally — calling it here first just primes the on-disk cache, so this
+    costs no extra GPU work.
+
+    Why this matters: MASt3R-SfM's sparse_scene_optimizer demotes any pair whose
+    best correspondence confidence falls at/under `matching_conf_thr` from a
+    rigid cross-view 3D constraint to a much weaker single-view loss — i.e. the
+    two frames stop being tied together (see `matching_check()` in
+    mast3r.cloud_opt.sparse_ga). If enough pairs fail this check, the global
+    optimization can converge to several locally-consistent but globally
+    disconnected sub-reconstructions ("islands" in the exported debug .glb).
+    This logs exactly which pairs/frames are at risk, instead of only seeing
+    the fragmented result after the fact.
+    """
+    import torch
+    from mast3r.cloud_opt.sparse_ga import convert_dust3r_pairs_naming, forward_mast3r
+
+    thr = config.MAST3R_MATCHING_CONF_THR
+
+    # Mutates `pairs` in place (idempotent — sparse_global_alignment() does the
+    # exact same conversion again right after this, from the same `idx` field).
+    pairs = convert_dust3r_pairs_naming(filelist, pairs)
+    res_paths, _cache_dir = forward_mast3r(pairs, model, cache_path=cache_dir, device=device)
+
+    # res_paths has both (a,b) and (b,a) directions; dedupe to one row per
+    # unordered pair.
+    pair_stats: dict[tuple[str, str], tuple[int, float, float]] = {}
+    for (inst1, inst2), (_forward_paths, path_corres) in res_paths.items():
+        stem1 = path_to_stem.get(inst1, inst1)
+        stem2 = path_to_stem.get(inst2, inst2)
+        key = tuple(sorted((stem1, stem2)))
+        if key in pair_stats:
+            continue
+        try:
+            matching_score, corres = torch.load(path_corres, map_location="cpu")
+        except FileNotFoundError:
+            logger.warning("[%s ↔ %s] no cached correspondences", stem1, stem2)
+            continue
+        conf_score, _sum_confs, n_matches = matching_score
+        _xy1, _xy2, confs = corres
+        conf_max = float(confs.max()) if len(confs) else 0.0
+        pair_stats[key] = (n_matches, conf_score, conf_max)
+
+    rows = sorted(pair_stats.items(), key=lambda kv: kv[1][0])  # weakest (fewest matches) first
+    logger.info("── MASt3R pairwise match diagnostics (%d pairs, matching_conf_thr=%.1f) ──",
+                len(rows), thr)
+    for (stem1, stem2), (n_matches, conf_score, conf_max) in rows:
+        ok = conf_max > thr
+        logger.info(
+            "  %-32s ↔ %-32s  n_matches=%5d  conf_score=%6.2f  conf_max=%6.2f  matching_ok=%s",
+            stem1, stem2, n_matches, conf_score, conf_max, ok,
+        )
+
+    # ── Connected-components check over the "matching_ok" edges ────────────
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    stems = sorted(path_to_stem.values())
+    idx_of = {s: i for i, s in enumerate(stems)}
+    row_idx, col_idx = [], []
+    for (stem1, stem2), (_n, _conf_score, conf_max) in pair_stats.items():
+        if conf_max > thr:
+            row_idx.append(idx_of[stem1])
+            col_idx.append(idx_of[stem2])
+    graph = coo_matrix((np.ones(len(row_idx)), (row_idx, col_idx)), shape=(len(stems), len(stems)))
+    n_components, labels = connected_components(graph, directed=False)
+
+    if n_components > 1:
+        groups: dict[int, list[str]] = {}
+        for stem, label in zip(stems, labels):
+            groups.setdefault(int(label), []).append(stem)
+        logger.warning(
+            "MASt3R pairwise match graph has %d disconnected components (matching_ok @ "
+            "matching_conf_thr=%.1f) — sparse_global_alignment is likely to produce that many "
+            "disjoint reconstruction 'islands':",
+            n_components, thr,
+        )
+        for label, group_stems in sorted(groups.items()):
+            logger.warning("  component %d (%d frames): %s", label, len(group_stems), group_stems)
+    else:
+        logger.info(
+            "MASt3R pairwise match graph is fully connected (matching_ok @ matching_conf_thr=%.1f, "
+            "%d frames).", thr, len(stems),
+        )
+
+
 def run_complete_graph(
     frames: list,
     save_mast3r_images: str | None = None,
@@ -554,7 +651,14 @@ def run_complete_graph(
         pairs = make_pairs(images, scene_graph="complete", prefilter=None, symmetrize=True)
         logger.info("%d pairs for %d frames", len(pairs), len(filelist))
 
-        logger.info("Running sparse global alignment …")
+        path_to_stem = {fpath: os.path.splitext(os.path.basename(fpath))[0] for fpath in filelist}
+        try:
+            _log_pairwise_match_diagnostics(pairs, filelist, model, cache_dir, device, path_to_stem)
+        except Exception as e:
+            logger.warning("Pairwise match diagnostics failed (continuing): %s", e)
+
+        logger.info("Running sparse global alignment (matching_conf_thr=%.1f) …",
+                    config.MAST3R_MATCHING_CONF_THR)
         scene = sparse_global_alignment(
             filelist,
             pairs,
@@ -562,6 +666,7 @@ def run_complete_graph(
             model,
             device=device,
             verbose=True,
+            matching_conf_thr=config.MAST3R_MATCHING_CONF_THR,
         )
 
         if export_raw_glb_dir is not None:

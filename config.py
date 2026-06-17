@@ -181,10 +181,30 @@ CLIP_ANCHOR_MIN_WEIGHT = 0.10
 MAST3R_MODEL          = "naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric"
 MAST3R_CONF_THRESHOLD = 1.5    # per-pixel confidence from SparseGA.get_dense_pts3d();
                                 # NOT a 0-1 normalized score — SparseGA's own .show()
-                                # uses `c > 1` as its validity heuristic. Re-tune by
-                                # inspecting a real confidence histogram once GPU access
-                                # is available; points below this are dropped.
+                                # uses `c > 1` as its validity heuristic. The "spaghetti"
+                                # problem (bad per-pixel depth corrupting Ceres) was caused by
+                                # MAST3R_MATCHING_CONF_THR=1.0 admitting very weak pair
+                                # constraints into SGA, not by a low per-pixel threshold. Now
+                                # that MAST3R_MATCHING_CONF_THR=2.5 filters bad pairs at the
+                                # graph level, 1.5 is sufficient here — raising this to 3.0
+                                # wiped out ALL pixels for this scene (all per-pixel dense
+                                # confidences fell in the 1.0–2.5 range after SGA). Points
+                                # below this are dropped.
 MAST3R_MAX_POINTS     = 5000   # max 3D points passed to Ceres (subsampled if more)
+
+# Passed into mast3r.cloud_opt.sparse_ga.sparse_global_alignment()'s `matching_conf_thr`.
+# A pair whose best correspondence confidence falls at/under this is demoted by MASt3R-SfM from
+# a rigid cross-view 3D constraint to a much weaker single-view loss — i.e. the two frames stop
+# being tied together. MASt3R's own internal default is 5.0, which fragmented this scene's
+# repetitive-agricultural-ground reconstruction into several disconnected "islands" (borderline-
+# but-real pairs were landing under the cutoff and getting dropped to the weak loss). Dropping
+# all the way to 1.0 fixed connectivity but let too much low-confidence "spaghetti" through,
+# breaking the Ceres solve (see output/debug/LowThrsh_results/). 2.5 is the current sweet-spot
+# attempt between the two failure modes — paired with the raised MAST3R_CONF_THRESHOLD above to
+# keep spaghetti out of Ceres regardless of what this lets through at the pair level. Also used
+# by run_complete_graph()'s pairwise-match diagnostics for its `matching_ok` column, so the log
+# stays consistent with what the solve actually uses.
+MAST3R_MATCHING_CONF_THR = 2.3
 
 # Reference-card size (metres) for the Sim(3)-aligned debug .glb export
 # (--export-mesh). This scene is in real ENU units, unlike the raw MASt3R
