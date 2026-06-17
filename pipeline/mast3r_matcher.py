@@ -202,6 +202,39 @@ def _extract_poses(scene, filelist: list[str], frames: list) -> dict[str, np.nda
     return cam_poses
 
 
+def _adaptive_conf_mask(conf_hw: np.ndarray) -> np.ndarray:
+    """Per-frame adaptive confidence mask, robust to scene-wide confidence
+    scale shifts (e.g. the gray HUD fill depressing MASt3R's dense per-pixel
+    confidence across the whole frame).
+
+    Keeps pixels above the larger of:
+      - config.MAST3R_CONF_FLOOR — an absolute floor just above MASt3R's ~1.0
+        "no-information" baseline, dropping genuine garbage regardless of band, and
+      - the config.MAST3R_CONF_PERCENTILE-th percentile of the frame's finite
+        confidences, so a uniformly low-confidence frame still yields its most
+        reliable pixels instead of being wiped out entirely by a fixed cutoff.
+
+    Never returns an all-False mask when any finite confidence exists: if the
+    percentile/floor gate clips everything, fall back to the top-N highest pixels.
+    """
+    finite = np.isfinite(conf_hw)
+    if not finite.any():
+        return np.zeros_like(conf_hw, dtype=bool)
+
+    vals = conf_hw[finite]
+    pct  = float(np.percentile(vals, config.MAST3R_CONF_PERCENTILE))
+    thr  = max(float(config.MAST3R_CONF_FLOOR), pct)
+    mask = finite & (conf_hw >= thr)
+
+    if not mask.any():
+        # Degenerate fallback: keep the top-N highest-confidence pixels so a
+        # frame is never dropped wholesale.
+        top_n   = min(256, vals.size)
+        cutoff  = float(np.partition(vals, vals.size - top_n)[vals.size - top_n])
+        mask    = finite & (conf_hw >= cutoff)
+    return mask
+
+
 def _extract_pointcloud(
     scene,
     filelist: list[str],
@@ -259,14 +292,27 @@ def _extract_pointcloud(
         pts3d_views.append(pts3d_hw3)
         confs_views.append(conf_hw)
         masks_views.append(np.ones((h, w), dtype=bool))
+
+        # Per-frame confidence diagnostics — makes a scene-wide confidence scale
+        # shift (e.g. from HUD fill changes) self-diagnosing instead of silently
+        # producing "no confident MASt3R pixels".
+        adaptive_valid = _adaptive_conf_mask(conf_hw)
+        fin = conf_hw[np.isfinite(conf_hw)]
+        if fin.size:
+            logger.info(
+                "[%s] conf min/med/p60/p90/max = %.2f/%.2f/%.2f/%.2f/%.2f  kept=%d/%d",
+                Path(filelist[i]).stem,
+                float(fin.min()), float(np.median(fin)),
+                float(np.percentile(fin, 60)), float(np.percentile(fin, 90)),
+                float(fin.max()), int(adaptive_valid.sum()), int(conf_hw.size),
+            )
+
         if keep_dense:
             stem = Path(filelist[i]).stem
             img_u8 = np.clip(img_native * 255.0, 0, 255).astype(np.uint8)
-            valid  = conf_hw >= config.MAST3R_CONF_THRESHOLD
-            dense_out[stem] = (pts3d_hw3, img_u8, valid)
+            dense_out[stem] = (pts3d_hw3, img_u8, adaptive_valid)
 
     n_frames    = len(filelist)
-    points_per_frame = max(10, config.MAST3R_MAX_POINTS // max(1, n_frames))
 
     sampled_pts3d: list[np.ndarray] = []   # (3,) world coords
     sampled_frame_stems: list[str]  = []   # which frame the seed came from
@@ -283,8 +329,8 @@ def _extract_pointcloud(
         mask  = masks_views[idx]   # (H, W)
         conf  = confs_views[idx]   # (H, W)
 
-        # Restrict to confident, valid pixels
-        valid = mask & (conf >= config.MAST3R_CONF_THRESHOLD)
+        # Restrict to confident, valid pixels (per-frame adaptive gate)
+        valid = mask & _adaptive_conf_mask(conf)
 
         # HUD erosion guard: exclude pixels in (approximately scaled) HUD regions
         # + 20-pixel buffer to prevent boundary-noise points from slipping through.
@@ -302,34 +348,10 @@ def _extract_pointcloud(
             logger.warning("[%s] no confident MASt3R pixels", stem)
             continue
 
-        # Spatial grid sampling: top-confidence per 32×32 cell to guarantee
-        # uniform field coverage instead of concentrating in high-contrast zones.
-        n_sample    = min(points_per_frame, len(ys))
-        CELL_SIZE   = 32
-        confs_valid = conf[ys, xs]
-        ncols       = max(1, (W_m + CELL_SIZE - 1) // CELL_SIZE)
-        cell_ids    = (ys // CELL_SIZE) * ncols + (xs // CELL_SIZE)
-        conf_rank   = np.argsort(-confs_valid)   # global confidence desc
-
-        # Fill per-cell buckets in confidence order so bucket[i] = i-th best in cell
-        cell_buckets: dict[int, list[int]] = {}
-        for i in conf_rank:
-            cell_buckets.setdefault(cell_ids[i], []).append(i)
-
-        per_cell = max(1, n_sample // max(1, len(cell_buckets)))
-        selected: list[int] = []
-        for bucket in cell_buckets.values():
-            selected.extend(bucket[:per_cell])
-
-        # Fill remaining budget with highest-confidence points across all cells
-        if len(selected) < n_sample:
-            sel_set = set(selected)
-            selected += [i for i in conf_rank if i not in sel_set][: n_sample - len(selected)]
-
-        sel_arr    = np.array(selected[:n_sample])
-        ys_s, xs_s = ys[sel_arr], xs[sel_arr]
-
-        for y, x in zip(ys_s, xs_s):
+        # Use ALL valid (confident, non-HUD) pixels as Stage-1 seeds.
+        # Grid sampling is deferred to Stage 3 where it operates on confirmed
+        # multi-view tracks, not on raw seeds that may not survive Stage 2.
+        for y, x in zip(ys, xs):
             sampled_pts3d.append(pts3d[y, x])
             sampled_frame_stems.append(stem)
             sampled_pixels.append(np.array([float(x), float(y)]))
@@ -389,8 +411,7 @@ def _extract_pointcloud(
     observations: list[Observation] = []
     point_to_obs_count = [0] * len(all_pts)  # track per-point multi-view count
 
-    MATCH_DIST_3D_M  = 0.30   # world-space radius to merge across frames
-    MATCH_DIST_PX    = 5.0    # pixel-space tolerance for projection check
+    MATCH_DIST_3D_M  = 2.0    # metric tolerance for 3D geometric cross-frame validation
 
     for pt_idx, (P, seed_stem, seed_px, seed_conf) in enumerate(
         zip(all_pts, all_stem, all_px, all_conf)
@@ -419,15 +440,17 @@ def _extract_pointcloud(
 
             if not mask_view[vi, ui]:
                 continue
-            if conf_view[vi, ui] < config.MAST3R_CONF_THRESHOLD:
-                continue
 
-            # Check that MASt3R's pointmap at this pixel agrees in 3D space
+            # Validate via 3D geometric consistency of globally-aligned SGA pointmaps.
+            # Confidence check removed: gray HUD fill depresses confidence in HUD zones
+            # to near-zero even for the van, causing all cross-frame observations to be
+            # rejected when they project into those zones. 3D consistency is the correct
+            # gate — if SGA's pointmap at the projected pixel agrees with P in world-space
+            # it is a valid match regardless of confidence.  The stored confidence value
+            # is still used by Ceres for weighting, so low-conf observations get low weight.
             P_view = pts_view[vi, ui]
             if np.linalg.norm(P_view - P) > MATCH_DIST_3D_M:
-                if stem != seed_stem:
-                    # Use projection pixel even if 3D doesn't match — the solver corrects it
-                    pass
+                continue
 
             # Pixel coordinate to store — in K_undist's full-resolution space,
             # since that's what MASt3RReprojCost reprojects against.
@@ -476,9 +499,9 @@ def _extract_pointcloud(
         if obs.point_idx in old_to_new
     ]
 
-    # ── Subsample to MAST3R_MAX_POINTS using farthest-point sampling ──────────
+    # ── Subsample to MAST3R_MAX_POINTS using spatial grid sampling ────────────
     if len(final_pts) > config.MAST3R_MAX_POINTS:
-        final_pts, final_obs = _fps_subsample(final_pts, final_obs, config.MAST3R_MAX_POINTS)
+        final_pts, final_obs = _grid_subsample(final_pts, final_obs, config.MAST3R_MAX_POINTS)
 
     logger.info(
         "Final 3D cloud: %d points, %d observations",
@@ -520,6 +543,66 @@ def _fps_subsample(
         if o.point_idx in keep_set
     ]
     return pts_sub, obs_sub
+
+
+def _grid_subsample(
+    pts: np.ndarray,
+    obs: list[Observation],
+    target: int,
+    cell_size: int = 32,
+) -> tuple[np.ndarray, list[Observation]]:
+    """Grid-subsample confirmed multi-view tracks by pixel coverage in K_undist space.
+
+    Operates in config.IMAGE_W × config.IMAGE_H (1280×720), giving ~920 cells
+    for cell_size=32.  Selects top-confidence tracks per cell, then fills the
+    remaining budget in global confidence order.
+    """
+    if len(pts) <= target:
+        return pts, obs
+
+    from collections import defaultdict
+
+    img_w = config.IMAGE_W
+    img_h = config.IMAGE_H
+    ncols = max(1, (img_w + cell_size - 1) // cell_size)
+
+    # Best-confidence observation per point (for cell assignment and ranking)
+    best_conf: dict[int, float] = {}
+    best_uv:   dict[int, tuple[float, float]] = {}
+    for o in obs:
+        if o.point_idx not in best_conf or o.confidence > best_conf[o.point_idx]:
+            best_conf[o.point_idx] = o.confidence
+            best_uv[o.point_idx]   = (float(o.pixel_uv[0]), float(o.pixel_uv[1]))
+
+    buckets: dict[int, list[tuple[float, int]]] = defaultdict(list)
+    for pt_idx in range(len(pts)):
+        u, v = best_uv.get(pt_idx, (img_w / 2.0, img_h / 2.0))
+        ci = int(np.clip(u, 0, img_w - 1)) // cell_size
+        ri = int(np.clip(v, 0, img_h - 1)) // cell_size
+        buckets[ri * ncols + ci].append((best_conf.get(pt_idx, 0.0), pt_idx))
+
+    for b in buckets.values():
+        b.sort(reverse=True)
+
+    per_cell = max(1, target // max(1, len(buckets)))
+    selected: list[int] = []
+    for b in buckets.values():
+        selected.extend(i for _, i in b[:per_cell])
+
+    if len(selected) < target:
+        used = set(selected)
+        global_order = sorted(best_conf.items(), key=lambda kv: kv[1], reverse=True)
+        selected += [k for k, _ in global_order if k not in used][: target - len(selected)]
+
+    keep = set(selected[:target])
+    old_to_new = {old: new for new, old in enumerate(sorted(keep))}
+    new_pts = pts[sorted(keep)]
+    new_obs = [
+        Observation(o.frame_stem, old_to_new[o.point_idx], o.pixel_uv, o.confidence)
+        for o in obs
+        if o.point_idx in keep
+    ]
+    return new_pts, new_obs
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -816,8 +899,8 @@ def export_raw_glb(scene, filelist: list[str], out_path: str | Path) -> None:
     for i in range(len(filelist)):
         h, w = imgs_u8[i].shape[:2]
         pts   = _to_numpy(pts3d_list[i]).reshape(h, w, 3)
-        conf  = _to_numpy(confs_list[i]).reshape(h, w)
-        valid = conf >= config.MAST3R_CONF_THRESHOLD
+        conf  = _to_numpy(confs_list[i]).reshape(h, w).astype(np.float32)
+        valid = _adaptive_conf_mask(conf)
         meshes.append(pts3d_to_trimesh(imgs_u8[i], pts, valid))
 
     scene_glb = trimesh.Scene()

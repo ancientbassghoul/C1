@@ -179,18 +179,36 @@ CLIP_ANCHOR_MIN_WEIGHT = 0.10
 # MAST3R-SFM
 # ─────────────────────────────────────────────────────────────────────────────
 MAST3R_MODEL          = "naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric"
-MAST3R_CONF_THRESHOLD = 1.5    # per-pixel confidence from SparseGA.get_dense_pts3d();
-                                # NOT a 0-1 normalized score — SparseGA's own .show()
-                                # uses `c > 1` as its validity heuristic. The "spaghetti"
-                                # problem (bad per-pixel depth corrupting Ceres) was caused by
-                                # MAST3R_MATCHING_CONF_THR=1.0 admitting very weak pair
-                                # constraints into SGA, not by a low per-pixel threshold. Now
-                                # that MAST3R_MATCHING_CONF_THR=2.5 filters bad pairs at the
-                                # graph level, 1.5 is sufficient here — raising this to 3.0
-                                # wiped out ALL pixels for this scene (all per-pixel dense
-                                # confidences fell in the 1.0–2.5 range after SGA). Points
-                                # below this are dropped.
-MAST3R_MAX_POINTS     = 5000   # max 3D points passed to Ceres (subsampled if more)
+MAST3R_CONF_THRESHOLD = 1.5    # DEPRECATED as a dense-pixel gate — superseded by the
+                                # adaptive MAST3R_CONF_FLOOR / MAST3R_CONF_PERCENTILE knobs
+                                # below. Still referenced only by an orientation_solver.py
+                                # log string; kept to avoid churn.
+                                #
+                                # History: this was the absolute per-pixel confidence cutoff
+                                # from SparseGA.get_dense_pts3d() (NOT a 0-1 score — SparseGA's
+                                # own .show() uses `c > 1` as its validity heuristic). It was a
+                                # fixed value here, which made it brittle: the gray HUD fill
+                                # depresses dense confidence scene-wide, so on this low-texture
+                                # field the whole distribution sits in the ~1.0–2.5 band and a
+                                # fixed 1.5 cutoff wiped out ~all pixels in 11/13 frames,
+                                # collapsing the reconstruction onto 2 frames. The gate is now
+                                # per-frame and percentile-based (see below) so each frame
+                                # contributes its own most-reliable pixels regardless of band.
+MAST3R_MAX_POINTS     = 3000   # max 3D points passed to Ceres (subsampled if more)
+
+# Adaptive per-pixel confidence gating (replaces the brittle absolute
+# MAST3R_CONF_THRESHOLD comparison at the dense-extraction gate sites).
+#
+# The feathered gray HUD fill depresses MASt3R's dense per-pixel confidence
+# scene-wide; on this low-texture agricultural field the whole distribution
+# sits in the ~1.0–2.5 band, so a fixed 1.5 cutoff clipped ~every pixel in most
+# frames (11/13 frames produced "no confident MASt3R pixels", collapsing the
+# reconstruction onto 2 frames). Gating per frame on a percentile makes each
+# frame contribute its own most-reliable pixels regardless of where its absolute
+# confidence band lands; the floor still drops MASt3R's ~1.0 "no-information"
+# baseline pixels.
+MAST3R_CONF_FLOOR      = 1.02  # absolute floor, just above MASt3R's ~1.0 baseline
+MAST3R_CONF_PERCENTILE = 60    # per-frame percentile → keep ~top 40% of each frame's pixels
 
 # Passed into mast3r.cloud_opt.sparse_ga.sparse_global_alignment()'s `matching_conf_thr`.
 # A pair whose best correspondence confidence falls at/under this is demoted by MASt3R-SfM from
@@ -200,11 +218,12 @@ MAST3R_MAX_POINTS     = 5000   # max 3D points passed to Ceres (subsampled if mo
 # but-real pairs were landing under the cutoff and getting dropped to the weak loss). Dropping
 # all the way to 1.0 fixed connectivity but let too much low-confidence "spaghetti" through,
 # breaking the Ceres solve (see output/debug/LowThrsh_results/). 2.5 is the current sweet-spot
-# attempt between the two failure modes — paired with the raised MAST3R_CONF_THRESHOLD above to
-# keep spaghetti out of Ceres regardless of what this lets through at the pair level. Also used
+# attempt between the two failure modes — paired with the adaptive per-pixel gate above
+# (MAST3R_CONF_FLOOR / MAST3R_CONF_PERCENTILE) to keep spaghetti out of Ceres regardless of
+# what this lets through at the pair level. Also used
 # by run_complete_graph()'s pairwise-match diagnostics for its `matching_ok` column, so the log
 # stays consistent with what the solve actually uses.
-MAST3R_MATCHING_CONF_THR = 2.3
+MAST3R_MATCHING_CONF_THR = 1.0
 
 # Reference-card size (metres) for the Sim(3)-aligned debug .glb export
 # (--export-mesh). This scene is in real ENU units, unlike the raw MASt3R
