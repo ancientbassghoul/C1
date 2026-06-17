@@ -175,17 +175,32 @@ def undistort_all(frames: list[Frame]) -> tuple[np.ndarray, np.ndarray, np.ndarr
     return K, D, K_new
 
 
+_FEATHER_K = 41   # Gaussian kernel size for HUD border feathering (must be odd)
+
 def _apply_hud_mask_raw(frame: Frame) -> None:
-    """Paint HUD overlay regions solid black on frame.raw (in-place).
+    """Fill HUD overlay regions with neutral gray and feather the borders.
 
     HUD_REGIONS are defined in raw/distorted pixel coordinates.  Masking
     before undistortion ensures the remap interpolation never blends HUD
     content into adjacent scene pixels.
+
+    Gray fill (128) instead of black eliminates the infinite-contrast step
+    function at mask edges that MASt3R's ViT attention would otherwise treat
+    as rigid 3D geometry.  The feathered border writes a full Gaussian-blurred
+    patch (gray interior + surrounding context) back over the boundary region
+    so there is no mathematical discontinuity on either side of the edge.
     """
     if frame.raw is None:
         return
+    h, w = frame.raw.shape[:2]
+    pad  = _FEATHER_K // 2   # 20-pixel feather zone
     for (y1, y2, x1, x2) in config.HUD_REGIONS:
-        frame.raw[y1:y2, x1:x2] = 0
+        frame.raw[y1:y2, x1:x2] = 128
+        oy1 = max(0, y1 - pad); oy2 = min(h, y2 + pad)
+        ox1 = max(0, x1 - pad); ox2 = min(w, x2 + pad)
+        patch   = frame.raw[oy1:oy2, ox1:ox2].copy()
+        blurred = cv2.GaussianBlur(patch, (_FEATHER_K, _FEATHER_K), 0)
+        frame.raw[oy1:oy2, ox1:ox2] = blurred
 
 
 def suppress_center_overlays(frames: list[Frame]) -> None:

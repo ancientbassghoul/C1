@@ -285,15 +285,49 @@ def _extract_pointcloud(
 
         # Restrict to confident, valid pixels
         valid = mask & (conf >= config.MAST3R_CONF_THRESHOLD)
+
+        # HUD erosion guard: exclude pixels in (approximately scaled) HUD regions
+        # + 20-pixel buffer to prevent boundary-noise points from slipping through.
+        H_m, W_m = pts3d.shape[:2]
+        for (y1r, y2r, x1r, x2r) in config.HUD_REGIONS:
+            y1m = int(y1r * H_m / config.IMAGE_H); y2m = int(y2r * H_m / config.IMAGE_H)
+            x1m = int(x1r * W_m / config.IMAGE_W); x2m = int(x2r * W_m / config.IMAGE_W)
+            buf_y = max(1, int(20 * H_m / config.IMAGE_H))
+            buf_x = max(1, int(20 * W_m / config.IMAGE_W))
+            valid[max(0, y1m - buf_y):min(H_m, y2m + buf_y),
+                  max(0, x1m - buf_x):min(W_m, x2m + buf_x)] = False
+
         ys, xs = np.where(valid)
         if len(ys) == 0:
             logger.warning("[%s] no confident MASt3R pixels", stem)
             continue
 
-        # Random subsample
-        n_sample = min(points_per_frame, len(ys))
-        sel      = np.random.choice(len(ys), n_sample, replace=False)
-        ys_s, xs_s = ys[sel], xs[sel]
+        # Spatial grid sampling: top-confidence per 32×32 cell to guarantee
+        # uniform field coverage instead of concentrating in high-contrast zones.
+        n_sample    = min(points_per_frame, len(ys))
+        CELL_SIZE   = 32
+        confs_valid = conf[ys, xs]
+        ncols       = max(1, (W_m + CELL_SIZE - 1) // CELL_SIZE)
+        cell_ids    = (ys // CELL_SIZE) * ncols + (xs // CELL_SIZE)
+        conf_rank   = np.argsort(-confs_valid)   # global confidence desc
+
+        # Fill per-cell buckets in confidence order so bucket[i] = i-th best in cell
+        cell_buckets: dict[int, list[int]] = {}
+        for i in conf_rank:
+            cell_buckets.setdefault(cell_ids[i], []).append(i)
+
+        per_cell = max(1, n_sample // max(1, len(cell_buckets)))
+        selected: list[int] = []
+        for bucket in cell_buckets.values():
+            selected.extend(bucket[:per_cell])
+
+        # Fill remaining budget with highest-confidence points across all cells
+        if len(selected) < n_sample:
+            sel_set = set(selected)
+            selected += [i for i in conf_rank if i not in sel_set][: n_sample - len(selected)]
+
+        sel_arr    = np.array(selected[:n_sample])
+        ys_s, xs_s = ys[sel_arr], xs[sel_arr]
 
         for y, x in zip(ys_s, xs_s):
             sampled_pts3d.append(pts3d[y, x])
