@@ -302,6 +302,41 @@ def _init_p_anchor(
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _select_backbone_stems(anchor_result, ready) -> set:
+    """Backbone (good) frames for two-stage MASt3R: anchor bbox area large enough.
+
+    good = bbox_area >= config.MAST3R_BACKBONE_BBOX_FACTOR * median(areas), over
+    eligible (undistorted) frames with a bbox in anchor_result. Median is robust
+    to close-up outliers that would skew the mean. Area is computed order-
+    agnostically (works for [x1,y1,x2,y2] or [y1,x1,y2,x2]). Returns an empty set
+    if no usable bboxes (caller then falls back to the single complete graph).
+    """
+    if anchor_result is None or not getattr(anchor_result, "bboxes", None):
+        return set()
+
+    ready_stems = {f.stem for f in ready}
+    areas: dict[str, float] = {}
+    for stem, bb in anchor_result.bboxes.items():
+        if stem not in ready_stems or bb is None or len(bb) != 4:
+            continue
+        areas[stem] = abs((bb[2] - bb[0]) * (bb[3] - bb[1]))
+    if not areas:
+        return set()
+
+    med = float(np.median(list(areas.values())))
+    thr = config.MAST3R_BACKBONE_BBOX_FACTOR * med
+    backbone = {s for s, a in areas.items() if a >= thr}
+    logger.info(
+        "Anchor-bbox backbone split: median bbox area=%.0f, threshold=%.0f → "
+        "%d good / %d bad.",
+        med, thr, len(backbone), len(areas) - len(backbone),
+    )
+    logger.info("  backbone (good): %s", ", ".join(sorted(backbone)))
+    logger.info("  aux (bad)      : %s",
+                ", ".join(sorted(s for s in areas if s not in backbone)))
+    return backbone
+
+
 def refine_pitches(
     frames: list[Frame],
     anchor_result=None,
@@ -359,16 +394,43 @@ def refine_pitches(
         logger.warning("refine_pitches: fewer than 2 undistorted frames — aborting.")
         return None
 
-    # ── Step 1: MASt3R-SfM ───────────────────────────────────────────────────
-    from pipeline.mast3r_matcher import run_complete_graph, save_auto_matches
-
-    logger.info("Running MASt3R-SfM on %d frames …", len(ready))
-    mast3r_result = run_complete_graph(
-        ready,
-        save_mast3r_images=save_mast3r_images,
-        keep_dense=keep_dense,
-        export_raw_glb_dir=export_raw_glb_dir,
+    # ── Step 1: MASt3R-SfM (single complete graph or two-stage) ──────────────
+    from pipeline.mast3r_matcher import (
+        run_complete_graph, run_two_stage_graph, save_auto_matches,
     )
+
+    backbone_stems = _select_backbone_stems(anchor_result, ready)
+    use_two_stage = (
+        config.MAST3R_TWO_STAGE
+        and save_mast3r_images is None              # debug dump path stays single-graph
+        and len(backbone_stems) >= config.MAST3R_BACKBONE_MIN_FRAMES
+        and len(backbone_stems) < len(ready)        # need at least 1 aux frame to split
+    )
+    if config.MAST3R_TWO_STAGE and not use_two_stage and save_mast3r_images is None:
+        logger.warning(
+            "MAST3R_TWO_STAGE is on but using single complete graph "
+            "(%d backbone frame(s) of %d eligible; min %d).",
+            len(backbone_stems), len(ready), config.MAST3R_BACKBONE_MIN_FRAMES,
+        )
+
+    if use_two_stage:
+        logger.info(
+            "Running two-stage MASt3R-SfM on %d frames (%d backbone) …",
+            len(ready), len(backbone_stems),
+        )
+        mast3r_result = run_two_stage_graph(
+            ready, backbone_stems,
+            keep_dense=keep_dense,
+            export_raw_glb_dir=export_raw_glb_dir,
+        )
+    else:
+        logger.info("Running MASt3R-SfM on %d frames …", len(ready))
+        mast3r_result = run_complete_graph(
+            ready,
+            save_mast3r_images=save_mast3r_images,
+            keep_dense=keep_dense,
+            export_raw_glb_dir=export_raw_glb_dir,
+        )
 
     if len(mast3r_result.camera_poses) == 0:
         logger.error("MASt3R returned no camera poses — aborting refinement.")
@@ -395,14 +457,34 @@ def refine_pitches(
         ceres_solve, ceres_solve_incremental, align_to_telemetry_sim3,
     )
 
-    # Good frames = high-CLIP anchor frames (Stage A backbone for the incremental
-    # solve). Same source as the Sim(3) control set; tunable via its own knob.
-    good_stems = set()
-    if anchor_result is not None:
+    # Good frames = Stage A backbone for the incremental Ceres solve. Prefer the
+    # anchor-bbox split (the same criterion as the two-stage MASt3R backbone) so
+    # the Ceres Stage A/B partition matches the reconstruction partition. This is
+    # forced whenever two-stage MASt3R ran; otherwise it's used when enabled and
+    # enough backbone frames qualify. Fall back to the high-CLIP anchor frames
+    # only when the bbox split is unavailable/disabled.
+    use_bbox_split = (
+        use_two_stage
+        or (config.INCREMENTAL_SPLIT_BY_BBOX
+            and len(backbone_stems) >= config.INCREMENTAL_MIN_GOOD_FRAMES)
+    )
+    if use_bbox_split:
+        good_stems = set(backbone_stems)
+        logger.info(
+            "Ceres Stage A/B split: anchor-bbox backbone — %d good frame(s).",
+            len(good_stems),
+        )
+    elif anchor_result is not None:
         good_stems = {
             s for s, w in anchor_result.weights.items()
             if w >= config.INCREMENTAL_GOOD_THRESHOLD
         }
+        logger.info(
+            "Ceres Stage A/B split: CLIP weight >= %.2f — %d good frame(s).",
+            config.INCREMENTAL_GOOD_THRESHOLD, len(good_stems),
+        )
+    else:
+        good_stems = set()
     use_incremental = (
         config.INCREMENTAL_SOLVE
         and len(good_stems) >= config.INCREMENTAL_MIN_GOOD_FRAMES

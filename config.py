@@ -312,8 +312,17 @@ SOLVER_MAX_ITERATIONS = 200
 # motion-only against that locked structure with widened translation bounds.
 # Protects well-conditioned structure from blurry-frame noise. All inside Ceres
 # (orientation_solver.py) — MASt3R still runs once as a single complete graph.
-INCREMENTAL_SOLVE             = False   # master toggle; False ⇒ exact legacy single-stage path
+INCREMENTAL_SOLVE             = True    # master toggle; False ⇒ exact legacy single-stage path.
+                                       # On by default so the two-stage MASt3R seed data (clean
+                                       # backbone + Sim(3)-stitched bad frames) is processed via
+                                       # Stage A (backbone BA) + Stage B (bad-frame resection).
 INCREMENTAL_GOOD_THRESHOLD    = CLIP_ANCHOR_THRESHOLD  # CLIP weight >= this ⇒ "good" (Stage A)
+INCREMENTAL_SPLIT_BY_BBOX     = True    # split Stage A/B "good" frames by anchor bbox area
+                                       # (>= MAST3R_BACKBONE_BBOX_FACTOR * median) instead of
+                                       # CLIP weight, matching the two-stage MASt3R backbone.
+                                       # Always forced when the two-stage MASt3R path runs so the
+                                       # Ceres split matches the reconstruction split. Falls back
+                                       # to the CLIP threshold above when disabled or no bboxes.
 INCREMENTAL_MIN_GOOD_FRAMES   = 3      # below this many good frames ⇒ fall back to single-stage
 INCREMENTAL_MIN_LOCKED_OBS    = 4      # bad frame needs >= this many obs onto locked points to RUN
                                        # Stage B; below it the frame keeps its MASt3R seed pose
@@ -321,6 +330,36 @@ INCREMENTAL_STAGEB_ROT_OFFSET = 50.0   # ± deg per axis-angle component for bad
 INCREMENTAL_STAGEB_RANGE_H    = 25.0   # ± m East  for bad frames (widened vs SOLVER_POSITION_RANGE_H)
 INCREMENTAL_STAGEB_RANGE_N    = 15.0   # ± m North for bad frames (widened vs SOLVER_POSITION_RANGE_N)
 INCREMENTAL_STAGEB_RANGE_V    =  6.0   # ± m vert  for bad frames (widened vs SOLVER_POSITION_RANGE_V)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TWO-STAGE MASt3R-SfM
+# ─────────────────────────────────────────────────────────────────────────────
+# Running a single SGA over the complete graph of ALL frames lets blurry / far /
+# small-van frames inject noisy pairwise constraints — and, via
+# MAST3R_SHARED_INTRINSICS, a bad shared focal — into one global optimisation,
+# corrupting the backbone cameras + point cloud BEFORE Ceres runs. Splitting
+# MASt3R into two stages protects the backbone:
+#   Stage 1 — run SGA on the "good" (large-anchor) frames alone → clean backbone
+#             (poses + points) in MASt3R frame G.
+#   Stage 2 — for each "bad" frame, run a small SGA over {backbone + that one bad
+#             frame} (no bad↔bad contamination) and rigidly stitch it into G with
+#             a point-cloud-enhanced Umeyama Sim(3) (camera centres ALONE are
+#             coplanar on a constant-altitude arc → tilt; the shared 3D points add
+#             the vertical relief that locks rotation). The bad frame's pose +
+#             points + observations are merged into G; Ceres Stage A/B finish.
+MAST3R_TWO_STAGE           = True    # master toggle; False ⇒ single complete-graph SGA (legacy)
+
+# Good (backbone) vs bad split by anchor bbox area from anchor_cache.json:
+#   good = bbox_area >= MAST3R_BACKBONE_BBOX_FACTOR * median(all bbox areas).
+# Median (not mean) — the mean is dragged up by close-up outliers and would pass
+# too few frames. On the reference dataset factor 1.0 ⇒ 7 good / 6 bad.
+MAST3R_BACKBONE_BBOX_FACTOR = 1.0
+MAST3R_BACKBONE_MIN_FRAMES  = 3      # below this many backbone frames ⇒ fall back to single SGA
+
+# Number of shared backbone 3D-point correspondences added to each Stage-2
+# Umeyama fit (alongside the backbone camera centres) to anchor rotation against
+# the coplanar-camera-centre degeneracy.
+SIM3_STITCH_POINT_SAMPLES   = 250
 
 # ── Focal length estimation ──────────────────────────────────────────────────
 # Set True to add focal length as a free parameter in the Ceres solve.

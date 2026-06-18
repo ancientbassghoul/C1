@@ -715,21 +715,30 @@ def _log_pairwise_match_diagnostics(
         )
 
 
-def run_complete_graph(
+def _sga_on_subset(
     frames: list,
+    *,
+    model=None,
+    device: str | None = None,
     save_mast3r_images: str | None = None,
     keep_dense: bool = False,
     export_raw_glb_dir: str | None = None,
 ) -> MASt3RResult:
     """
-    Run MASt3R-SfM on all pairs of undistorted frames.
+    Run one MASt3R-SfM complete-graph SGA over `frames` and extract a MASt3RResult.
 
-    Frames without an undistorted image are silently skipped.
-    Returns a MASt3RResult with camera poses in MASt3R's internal coordinate
-    frame and a filtered/subsampled point cloud with cross-frame observations.
+    This is the single-SGA core shared by `run_complete_graph` (the legacy
+    all-frames path) and `run_two_stage_graph` (which calls it once per stage).
+
+    model   : a preloaded MASt3R model to reuse across calls. If None, the model
+              is loaded here and torn down before returning (the original
+              run_complete_graph behaviour). When provided, it is left loaded so
+              the caller can reuse it for further subset runs.
+    device  : torch device string; resolved automatically when None.
 
     keep_dense          : also populate MASt3RResult.dense (per-view pointmap +
-                           image + valid mask) for the Blender mesh exporter.
+                           image + valid mask) for the Blender mesh exporter and
+                           the two-stage Sim(3) stitch.
     export_raw_glb_dir   : if set, write MASt3R's raw reconstruction (its own
                            native frame, pre-Ceres/pre-Sim3) as a debug .glb
                            to this directory, using the `scene` object before
@@ -737,8 +746,10 @@ def run_complete_graph(
     """
     import torch
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info("MASt3R using device: %s", device)
+    own_model = model is None
 
     # ── Save undistorted frames to temp PNG files ─────────────────────────────
     with tempfile.TemporaryDirectory(prefix="mast3r_") as tmpdir:
@@ -760,7 +771,8 @@ def run_complete_graph(
         logger.info("Running MASt3R-SfM complete graph on %d frames …", len(filelist))
 
         # ── Load model ────────────────────────────────────────────────────────
-        model = _load_mast3r_model(device)
+        if own_model:
+            model = _load_mast3r_model(device)
 
         # ── MASt3R-SfM pipeline ───────────────────────────────────────────────
         from dust3r.utils.image import load_images
@@ -823,18 +835,330 @@ def run_complete_graph(
             scene, filelist, frames, cam_poses, keep_dense=keep_dense,
         )
 
-        # Tear down model before returning (VRAM for Ceres host is fine; Ceres is CPU)
-        del model, scene, images, pairs
+        # Tear down (VRAM for Ceres host is fine; Ceres is CPU). Keep the model
+        # alive when the caller owns it (two-stage reuses it across subsets).
+        del scene, images, pairs
+        if own_model:
+            del model
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        logger.info("MASt3R VRAM released.")
+        if own_model:
+            logger.info("MASt3R VRAM released.")
 
     return MASt3RResult(
         camera_poses=cam_poses,
         points_3d=points_3d,
         observations=observations,
         dense=dense,
+    )
+
+
+def run_complete_graph(
+    frames: list,
+    save_mast3r_images: str | None = None,
+    keep_dense: bool = False,
+    export_raw_glb_dir: str | None = None,
+) -> MASt3RResult:
+    """
+    Run MASt3R-SfM on all pairs of undistorted frames (single complete graph).
+
+    Frames without an undistorted image are silently skipped.
+    Returns a MASt3RResult with camera poses in MASt3R's internal coordinate
+    frame and a filtered/subsampled point cloud with cross-frame observations.
+
+    Thin wrapper over `_sga_on_subset` (loads + tears down its own model).
+    """
+    return _sga_on_subset(
+        frames,
+        save_mast3r_images=save_mast3r_images,
+        keep_dense=keep_dense,
+        export_raw_glb_dir=export_raw_glb_dir,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Two-stage MASt3R: clean backbone + Sim(3)-stitched aux frames
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _pose_centre(w2c: np.ndarray) -> np.ndarray:
+    """Camera centre in world frame from a 4×4 world-to-camera matrix: C = -Rᵀt."""
+    R = w2c[:3, :3]
+    t = w2c[:3, 3]
+    return -R.T @ t
+
+
+def _transform_w2c(w2c: np.ndarray, s: float, R: np.ndarray, t: np.ndarray) -> np.ndarray:
+    """Map a world-to-camera pose from frame G_b into frame G under the Sim(3)
+    X_G = s·R·X_Gb + t.
+
+    The camera centre transforms as a point; the orientation rotates by R only
+    (scale leaves viewing direction unchanged). Identical convention to
+    align_to_telemetry_sim3: R_wc_G = R_wc_Gb · Rᵀ. Projection is Sim(3)-
+    invariant, so observation pixels computed in G_b stay valid in G.
+    """
+    R_wc_gb = w2c[:3, :3]
+    C_gb    = _pose_centre(w2c)
+    C_g     = s * R @ C_gb + t
+    R_wc_g  = R_wc_gb @ R.T
+    out = np.eye(4, dtype=np.float64)
+    out[:3, :3] = R_wc_g
+    out[:3, 3]  = -R_wc_g @ C_g
+    return out
+
+
+def _hud_exclusion_mask(h: int, w: int) -> np.ndarray:
+    """(h,w) bool mask, False inside (scaled) HUD regions — keeps HUD pixels out
+    of the Sim(3) point correspondences."""
+    m = np.ones((h, w), dtype=bool)
+    for (y1r, y2r, x1r, x2r) in config.HUD_REGIONS:
+        y1 = int(y1r * h / config.IMAGE_H); y2 = int(y2r * h / config.IMAGE_H)
+        x1 = int(x1r * w / config.IMAGE_W); x2 = int(x2r * w / config.IMAGE_W)
+        m[max(0, y1):min(h, y2), max(0, x1):min(w, x2)] = False
+    return m
+
+
+def _stitch_point_correspondences(
+    res_bb: MASt3RResult,
+    res_b: MASt3RResult,
+    backbone_stems: set,
+    n_samples: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build exact 3D↔3D correspondences between the backbone frame G (res_bb)
+    and a mini-SGA frame G_b (res_b).
+
+    Both runs contain the same backbone frames at the same 512px dense grid, so
+    the same (frame, pixel) is an exact correspondence across the two
+    reconstructions — no feature matching needed. Returns (src_Gb, dst_G), each
+    (M,3), uniformly subsampled to ~n_samples.
+    """
+    rng = np.random.default_rng(0)
+    src_chunks, dst_chunks = [], []
+    for stem in backbone_stems:
+        d_bb = res_bb.dense.get(stem)
+        d_b  = res_b.dense.get(stem)
+        if d_bb is None or d_b is None:
+            continue
+        pts_bb, _img_bb, val_bb = d_bb
+        pts_b,  _img_b,  val_b  = d_b
+        if pts_bb.shape != pts_b.shape:
+            continue
+        h, w = pts_bb.shape[:2]
+        valid = (
+            val_bb & val_b
+            & _hud_exclusion_mask(h, w)
+            & np.isfinite(pts_bb).all(axis=2)
+            & np.isfinite(pts_b).all(axis=2)
+        )
+        if not valid.any():
+            continue
+        src_chunks.append(pts_b[valid])   # (k,3) in G_b
+        dst_chunks.append(pts_bb[valid])  # (k,3) in G
+
+    if not src_chunks:
+        return np.empty((0, 3)), np.empty((0, 3))
+
+    src = np.concatenate(src_chunks, axis=0)
+    dst = np.concatenate(dst_chunks, axis=0)
+    if len(src) > n_samples:
+        idx = rng.choice(len(src), size=n_samples, replace=False)
+        src, dst = src[idx], dst[idx]
+    return src, dst
+
+
+def _fit_stitch_sim3(
+    res_bb: MASt3RResult,
+    res_b: MASt3RResult,
+    backbone_stems: set,
+    aux_stem: str,
+) -> tuple[float, np.ndarray, np.ndarray] | None:
+    """Fit the Sim(3) G_b → G for one mini-SGA, anchoring rotation on shared 3D
+    points (not just the coplanar backbone camera centres). Returns (s, R, t)
+    or None if too few correspondences.
+    """
+    from pipeline.orientation_solver import _umeyama_sim3
+
+    # Camera-centre correspondences (src = G_b, dst = G).
+    cen_src, cen_dst = [], []
+    for stem in backbone_stems:
+        w_bb = res_bb.camera_poses.get(stem)
+        w_b  = res_b.camera_poses.get(stem)
+        if w_bb is None or w_b is None:
+            continue
+        cen_src.append(_pose_centre(w_b))
+        cen_dst.append(_pose_centre(w_bb))
+
+    # Shared 3D point correspondences (the coplanar-tilt fix).
+    pt_src, pt_dst = _stitch_point_correspondences(
+        res_bb, res_b, backbone_stems, config.SIM3_STITCH_POINT_SAMPLES
+    )
+
+    n_cen = len(cen_src)
+    src_parts = ([np.stack(cen_src)] if n_cen else []) + ([pt_src] if len(pt_src) else [])
+    dst_parts = ([np.stack(cen_dst)] if n_cen else []) + ([pt_dst] if len(pt_dst) else [])
+    if not src_parts:
+        return None
+    src = np.concatenate(src_parts, axis=0)
+    dst = np.concatenate(dst_parts, axis=0)
+    if len(src) < 3:
+        logger.warning("[%s] only %d Sim(3) correspondences (<3).", aux_stem, len(src))
+        return None
+    if len(pt_src) == 0:
+        logger.warning(
+            "[%s] Sim(3) stitch has NO shared 3D points — falling back to coplanar "
+            "camera centres only; expect tilt risk.", aux_stem,
+        )
+
+    s, R, t = _umeyama_sim3(src, dst)
+
+    pred = (s * (R @ src.T)).T + t
+    err  = pred - dst
+    def _rms(a):
+        return float(np.sqrt(np.mean(np.sum(a ** 2, axis=1)))) if len(a) else float("nan")
+    logger.info(
+        "[%s] Sim(3) stitch: scale=%.4f  centre-RMS=%.4f (n=%d)  point-RMS=%.4f (n=%d)",
+        aux_stem, s, _rms(err[:n_cen]), n_cen, _rms(err[n_cen:]), len(src) - n_cen,
+    )
+    return s, R, t
+
+
+def run_two_stage_graph(
+    frames: list,
+    backbone_stems: set,
+    keep_dense: bool = False,
+    export_raw_glb_dir: str | None = None,
+) -> MASt3RResult:
+    """
+    Two-stage MASt3R-SfM (see config.MAST3R_TWO_STAGE).
+
+    Stage 1: SGA over the backbone (good) frames alone → clean poses + points in
+             MASt3R frame G.
+    Stage 2: for each remaining (bad) frame, a small SGA over {backbone + that
+             frame}; rigidly stitch into G with a point-cloud-enhanced Umeyama
+             Sim(3); merge the bad frame's pose, point block, and (Sim(3)-
+             invariant) observations into the result.
+
+    The merged MASt3RResult feeds `ceres_solve_incremental` unchanged. Backbone
+    pairwise MASt3R features are cached, so only new bad↔backbone pairs cost
+    fresh inference per mini-SGA.
+    """
+    import torch
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    backbone = [f for f in frames if f.stem in backbone_stems and f.undistorted is not None]
+    aux      = [f for f in frames if f.stem not in backbone_stems and f.undistorted is not None]
+    bb_stem_set = {f.stem for f in backbone}
+
+    if len(backbone) < 2:
+        logger.warning(
+            "Two-stage MASt3R: only %d backbone frame(s) — falling back to single complete graph.",
+            len(backbone),
+        )
+        return run_complete_graph(frames, keep_dense=keep_dense, export_raw_glb_dir=export_raw_glb_dir)
+
+    logger.info(
+        "Two-stage MASt3R: %d backbone frame(s), %d aux frame(s).", len(backbone), len(aux)
+    )
+
+    model = _load_mast3r_model(device)
+
+    # ── Stage 1: clean backbone (force keep_dense for the Sim(3) stitch) ──────
+    logger.info(
+        "Two-stage Stage 1 — backbone SGA on %d frame(s): %s",
+        len(backbone), ", ".join(sorted(bb_stem_set)),
+    )
+    res_bb = _sga_on_subset(
+        backbone, model=model, device=device, keep_dense=True,
+        export_raw_glb_dir=export_raw_glb_dir,
+    )
+    if len(res_bb.camera_poses) == 0:
+        logger.error("Two-stage: backbone SGA produced no poses — falling back to single graph.")
+        del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return run_complete_graph(frames, keep_dense=keep_dense, export_raw_glb_dir=export_raw_glb_dir)
+
+    merged_poses = dict(res_bb.camera_poses)
+    point_blocks = [np.asarray(res_bb.points_3d, dtype=np.float64)]
+    merged_obs   = list(res_bb.observations)
+    n_pts        = len(res_bb.points_3d)
+    registered, unregistered = 0, 0
+
+    # ── Stage 2: register each aux (bad) frame against the backbone ──────────
+    for b in aux:
+        subset = backbone + [b]
+        logger.info(
+            "Two-stage Stage 2 — registering [%s] against backbone (%d frames) …",
+            b.stem, len(subset),
+        )
+        res_b = _sga_on_subset(subset, model=model, device=device, keep_dense=True)
+        if b.stem not in res_b.camera_poses:
+            logger.warning("[%s] mini-SGA produced no pose — leaving unregistered.", b.stem)
+            unregistered += 1
+            continue
+
+        sim3 = _fit_stitch_sim3(res_bb, res_b, bb_stem_set, b.stem)
+        if sim3 is None:
+            logger.warning("[%s] Sim(3) stitch failed — leaving unregistered.", b.stem)
+            unregistered += 1
+            continue
+        s, R, t = sim3
+
+        merged_poses[b.stem] = _transform_w2c(res_b.camera_poses[b.stem], s, R, t)
+        registered += 1
+
+        # Keep only the block points frame b actually observes — its Stage-B
+        # resection targets. (Pure-backbone points are already covered, cleanly,
+        # by the Stage-1 cloud; appending all of them would dilute Stage A with a
+        # redundant, noisier reconstruction.) Each kept point still carries its
+        # backbone-frame observations, so points with ≥2 of them get locked by
+        # Ceres Stage A and become usable resection targets.
+        block = np.asarray(res_b.points_3d, dtype=np.float64)
+        b_pt_idxs = {o.point_idx for o in res_b.observations if o.frame_stem == b.stem}
+        keep = sorted(i for i in b_pt_idxs if 0 <= i < len(block))
+        if not keep:
+            logger.warning(
+                "[%s] mini-SGA: frame observes no reconstructed points — pose kept, "
+                "no resection targets (Stage B will keep the seed pose).", b.stem,
+            )
+            continue
+
+        remap   = {old: new for new, old in enumerate(keep)}
+        block_G = (s * (R @ block[keep].T)).T + t
+        offset  = n_pts
+        point_blocks.append(block_G)
+        n_pts  += len(block_G)
+        # Observations are Sim(3)-invariant in pixel space; only re-index points.
+        for o in res_b.observations:
+            if o.point_idx in remap:
+                merged_obs.append(Observation(
+                    frame_stem=o.frame_stem,
+                    point_idx=remap[o.point_idx] + offset,
+                    pixel_uv=o.pixel_uv,
+                    confidence=o.confidence,
+                ))
+
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    logger.info("MASt3R VRAM released.")
+
+    points_3d = (
+        np.concatenate(point_blocks, axis=0) if point_blocks else np.empty((0, 3))
+    )
+    logger.info(
+        "Two-stage MASt3R complete: %d backbone + %d/%d aux registered, "
+        "%d points, %d observations.",
+        len(backbone), registered, len(aux), len(points_3d), len(merged_obs),
+    )
+    return MASt3RResult(
+        camera_poses=merged_poses,
+        points_3d=points_3d,
+        observations=merged_obs,
+        dense=(res_bb.dense if keep_dense else {}),
     )
 
 
