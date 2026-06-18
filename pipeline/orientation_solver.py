@@ -135,7 +135,256 @@ class VanMetricCost:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Ceres problem builder
+# Ceres problem builder — shared infrastructure
+# ─────────────────────────────────────────────────────────────────────────────
+
+_NUMERIC_DIFF_CLS = None   # memoized _NumericDiff class (built once pyceres is importable)
+
+
+def _import_pyceres():
+    """Import pyceres or raise a helpful error."""
+    try:
+        import pyceres
+    except ImportError:
+        raise ImportError("\npyceres not installed — run SETUP_SECOND.bat\n")
+    return pyceres
+
+
+def _numeric_diff_cls(pyceres):
+    """Build & cache the generic numeric-diff CostFunction wrapper.
+
+    Defined lazily because it subclasses ``pyceres.CostFunction`` — the class
+    body cannot be evaluated until pyceres is importable. Cached at module scope
+    so the legacy single-stage path and the incremental path share one class.
+    """
+    global _NUMERIC_DIFF_CLS
+    if _NUMERIC_DIFF_CLS is not None:
+        return _NUMERIC_DIFF_CLS
+
+    class _NumericDiff(pyceres.CostFunction):
+        def __init__(self, callable_cost, num_residuals, block_sizes):
+            super().__init__()
+            self._cost        = callable_cost
+            self._block_sizes = block_sizes
+            self.set_num_residuals(num_residuals)
+            self.set_parameter_block_sizes(block_sizes)
+
+        def Evaluate(self, parameters, residuals, jacobians):
+            res = self._cost(*parameters)
+            residuals[:] = res
+            if jacobians is not None:
+                for bi, bs in enumerate(self._block_sizes):
+                    if jacobians[bi] is None:
+                        continue
+                    jac = jacobians[bi]
+                    for k in range(bs):
+                        p_plus  = [p.copy() for p in parameters]
+                        p_minus = [p.copy() for p in parameters]
+                        p_plus[bi][k]  += _FD_EPS
+                        p_minus[bi][k] -= _FD_EPS
+                        jac[k::bs] = (
+                            self._cost(*p_plus) - self._cost(*p_minus)
+                        ) / (2.0 * _FD_EPS)
+            return True
+
+    _NUMERIC_DIFF_CLS = _NumericDiff
+    return _NUMERIC_DIFF_CLS
+
+
+def _solver_options(pyceres):
+    """The pyceres SolverOptions used by every solve (legacy + incremental)."""
+    options = pyceres.SolverOptions()
+    options.linear_solver_type          = pyceres.LinearSolverType.SPARSE_SCHUR
+    options.minimizer_progress_to_stdout = True
+    options.max_num_iterations          = config.SOLVER_MAX_ITERATIONS
+    options.function_tolerance          = 1e-6
+    options.gradient_tolerance          = 1e-8
+    options.parameter_tolerance         = 1e-8
+    return options
+
+
+def _init_cam_params(frames, cam_poses_init):
+    """MASt3R W2C seed → per-stem 6-vec [rx,ry,rz,tx,ty,tz] (identity fallback)."""
+    cam_params = {}
+    for f in frames:
+        W2C = cam_poses_init.get(f.stem)
+        if W2C is not None:
+            cam_params[f.stem] = _params_from_w2c(W2C)
+        else:
+            logger.warning("[%s] no MASt3R pose — using identity", f.stem)
+            cam_params[f.stem] = np.zeros(6, dtype=np.float64)
+    return cam_params
+
+
+def _add_mast3r_residuals(problem, pyceres, observations, cam_params, point_params,
+                          frame_map, loss, n_pts,
+                          restrict_stems=None, restrict_point_idxs=None):
+    """Add MASt3RReprojCost blocks; return the set of stems that got ≥1 residual.
+
+    restrict_stems / restrict_point_idxs (sets or None) gate which observations
+    are added. With both None this is identical to the legacy single-pass loop.
+    """
+    ND = _numeric_diff_cls(pyceres)
+    touched = set()
+    for obs in observations:
+        stem = obs.frame_stem
+        if restrict_stems is not None and stem not in restrict_stems:
+            continue
+        f = frame_map.get(stem)
+        if f is None or f.K_undist is None:
+            continue
+        kidx = obs.point_idx
+        if kidx >= n_pts:
+            continue
+        if restrict_point_idxs is not None and kidx not in restrict_point_idxs:
+            continue
+        functor = MASt3RReprojCost(obs.pixel_uv, f.K_undist, obs.confidence)
+        cost    = ND(functor, num_residuals=2, block_sizes=[6, 3])
+        problem.add_residual_block(cost, loss, [cam_params[stem], point_params[kidx]])
+        touched.add(stem)
+    return touched
+
+
+def _add_anchor_residuals(problem, pyceres, anchor_rays, cam_params, p_anchor,
+                          frame_map, loss, restrict_stems=None):
+    """Add AnchorRayCost blocks (skips weights < CLIP_ANCHOR_MIN_WEIGHT)."""
+    ND = _numeric_diff_cls(pyceres)
+    touched = set()
+    for stem, pixel_uv, clip_weight in anchor_rays:
+        if clip_weight < config.CLIP_ANCHOR_MIN_WEIGHT:
+            continue
+        if restrict_stems is not None and stem not in restrict_stems:
+            continue
+        f = frame_map.get(stem)
+        if f is None or f.K_undist is None:
+            continue
+        functor = AnchorRayCost(pixel_uv, f.K_undist, clip_weight)
+        cost    = ND(functor, num_residuals=2, block_sizes=[6, 3])
+        problem.add_residual_block(cost, loss, [cam_params[stem], p_anchor])
+        touched.add(stem)
+    return touched
+
+
+def _add_manual_residuals(problem, pyceres, manual_features, cam_params,
+                          frame_map, metric_loss, restrict_stems=None):
+    """Add ManualReprojCost + VanMetricCost blocks for hand-picked features.
+
+    Manual point params (one shared 3-vec per feature endpoint) are seeded at
+    zero and pulled into place by the reprojection residuals. With
+    restrict_stems=None this is byte-for-byte the legacy behavior. When
+    restrict_stems is given (incremental Stage A), per-frame reproj residuals are
+    added only for frames in that set, the VanMetricCost is added only for
+    features that contributed ≥1 reproj residual, and purely-excluded features
+    are warned about (incremental + manual is a safe-but-unsupported combo).
+    """
+    ND = _numeric_diff_cls(pyceres)
+    touched = set()
+    manual_point_params: dict[tuple, np.ndarray] = {}
+
+    def _get_manual_point(feat_idx: int, end: str) -> np.ndarray:
+        key = (feat_idx, end)
+        if key not in manual_point_params:
+            manual_point_params[key] = np.zeros(3, dtype=np.float64)
+        return manual_point_params[key]
+
+    for feat_idx, feat in enumerate(manual_features):
+        is_pair    = feat.get("is_pair", False)
+        distance_m = float(feat.get("distance_m", 1.0)) if is_pair else None
+        points_per_frame = feat.get("points", {})
+        added_for_feature = 0
+
+        for stem, pts_list in points_per_frame.items():
+            if restrict_stems is not None and stem not in restrict_stems:
+                continue
+            f = frame_map.get(stem)
+            if f is None or f.K_undist is None:
+                continue
+
+            if is_pair and len(pts_list) >= 2:
+                pix_a = np.asarray(pts_list[0], dtype=np.float64)
+                pix_b = np.asarray(pts_list[1], dtype=np.float64)
+                P_a   = _get_manual_point(feat_idx, "A")
+                P_b   = _get_manual_point(feat_idx, "B")
+
+                cost_a = ND(ManualReprojCost(pix_a, f.K_undist),
+                            num_residuals=2, block_sizes=[6, 3])
+                cost_b = ND(ManualReprojCost(pix_b, f.K_undist),
+                            num_residuals=2, block_sizes=[6, 3])
+                problem.add_residual_block(cost_a, None, [cam_params[stem], P_a])
+                problem.add_residual_block(cost_b, None, [cam_params[stem], P_b])
+                touched.add(stem)
+                added_for_feature += 1
+
+            elif not is_pair and len(pts_list) >= 1:
+                pix = np.asarray(pts_list[0], dtype=np.float64)
+                P   = _get_manual_point(feat_idx, "A")
+                cost = ND(ManualReprojCost(pix, f.K_undist),
+                          num_residuals=2, block_sizes=[6, 3])
+                problem.add_residual_block(cost, None, [cam_params[stem], P])
+                touched.add(stem)
+                added_for_feature += 1
+
+        # Van metric constraint (once per feature, not per frame). In legacy mode
+        # (restrict_stems is None) this is added unconditionally for pair features,
+        # exactly as before; in restricted mode only when the feature contributed.
+        if is_pair and distance_m is not None and (restrict_stems is None or added_for_feature > 0):
+            P_a = _get_manual_point(feat_idx, "A")
+            P_b = _get_manual_point(feat_idx, "B")
+            cost = ND(VanMetricCost(distance_m), num_residuals=1, block_sizes=[3, 3])
+            problem.add_residual_block(cost, metric_loss, [P_a, P_b])
+
+        if restrict_stems is not None and added_for_feature == 0:
+            logger.warning(
+                "Manual feature #%d touches no Stage-A (good) frame — ignored in incremental mode.",
+                feat_idx,
+            )
+
+    logger.info("Added %d manual feature constraints.", len(manual_features))
+    return touched
+
+
+def _add_camera_bounds(problem, cam_params, stems, rot_range_rad, trans_ranges):
+    """Apply seed-window bounds (axis-angle ± rot, translation ± per-axis) to
+    the cameras named in `stems`."""
+    for stem in stems:
+        p = cam_params.get(stem)
+        if p is None:
+            continue
+        for i in range(3):
+            problem.set_parameter_lower_bound(p, i, float(p[i]) - rot_range_rad)
+            problem.set_parameter_upper_bound(p, i, float(p[i]) + rot_range_rad)
+        for i, rng in enumerate(trans_ranges):
+            problem.set_parameter_lower_bound(p, 3 + i, float(p[3 + i]) - rng)
+            problem.set_parameter_upper_bound(p, 3 + i, float(p[3 + i]) + rng)
+
+
+def _freeze_block(problem, block):
+    """Freeze a parameter block constant, defending against pyceres binding
+    quirks: the block must already be referenced by a residual (else no-op),
+    and `set_parameter_block_constant` can silently fail / raise depending on the
+    pybind11 wrapper. We verify with `is_parameter_block_constant` and fall back
+    to the bounds-trick (lower==upper per component) so the block is frozen
+    regardless. Always pass the SAME array object used in add_residual_block.
+    """
+    if not problem.has_parameter_block(block):
+        return
+    try:
+        problem.set_parameter_block_constant(block)
+        if problem.is_parameter_block_constant(block):
+            return
+        logger.warning("_freeze_block: set_parameter_block_constant did not take — "
+                       "using bounds-trick fallback.")
+    except Exception as e:  # noqa: BLE001 — binding-specific; fall back regardless
+        logger.warning("_freeze_block: set_parameter_block_constant raised (%s) — "
+                       "using bounds-trick fallback.", e)
+    for c in range(int(block.size)):
+        v = float(block[c])
+        problem.set_parameter_lower_bound(block, c, v)
+        problem.set_parameter_upper_bound(block, c, v)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Single-stage full-BA solve (legacy)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def ceres_solve(
@@ -167,49 +416,11 @@ def ceres_solve(
     p_anchor_out   : np.ndarray(3,) — refined anchor position
     report         : str — Ceres BriefReport
     """
-    try:
-        import pyceres
-    except ImportError:
-        raise ImportError("\npyceres not installed — run SETUP_SECOND.bat\n")
-
-    # ── Generic numeric-diff wrapper ──────────────────────────────────────────
-    class _NumericDiff(pyceres.CostFunction):
-        def __init__(self, callable_cost, num_residuals, block_sizes):
-            super().__init__()
-            self._cost        = callable_cost
-            self._block_sizes = block_sizes
-            self.set_num_residuals(num_residuals)
-            self.set_parameter_block_sizes(block_sizes)
-
-        def Evaluate(self, parameters, residuals, jacobians):
-            res = self._cost(*parameters)
-            residuals[:] = res
-            if jacobians is not None:
-                for bi, bs in enumerate(self._block_sizes):
-                    if jacobians[bi] is None:
-                        continue
-                    jac = jacobians[bi]
-                    for k in range(bs):
-                        p_plus  = [p.copy() for p in parameters]
-                        p_minus = [p.copy() for p in parameters]
-                        p_plus[bi][k]  += _FD_EPS
-                        p_minus[bi][k] -= _FD_EPS
-                        jac[k::bs] = (
-                            self._cost(*p_plus) - self._cost(*p_minus)
-                        ) / (2.0 * _FD_EPS)
-            return True
+    pyceres = _import_pyceres()
 
     # ── Initialise parameter blocks ───────────────────────────────────────────
     frame_map  = {f.stem: f for f in frames}
-    cam_params = {}   # stem → np.ndarray(6,)
-
-    for f in frames:
-        W2C = cam_poses_init.get(f.stem)
-        if W2C is not None:
-            cam_params[f.stem] = _params_from_w2c(W2C)
-        else:
-            logger.warning("[%s] no MASt3R pose — using identity", f.stem)
-            cam_params[f.stem] = np.zeros(6, dtype=np.float64)
+    cam_params = _init_cam_params(frames, cam_poses_init)
 
     n_pts       = len(points_3d_init)
     if n_pts == 0:
@@ -241,106 +452,18 @@ def ceres_solve(
     metric_loss = pyceres.HuberLoss(0.05)  # 5 cm van geometry
 
     frames_in_problem: set = set()
-
-    # ── MASt3R reprojection residuals ─────────────────────────────────────────
-    for obs in mast3r_observations:
-        stem = obs.frame_stem
-        f    = frame_map.get(stem)
-        if f is None or f.K_undist is None:
-            continue
-        kidx = obs.point_idx
-        if kidx >= n_pts:
-            continue
-        functor = MASt3RReprojCost(obs.pixel_uv, f.K_undist, obs.confidence)
-        cost    = _NumericDiff(functor, num_residuals=2, block_sizes=[6, 3])
-        problem.add_residual_block(
-            cost, reproj_loss,
-            [cam_params[stem], point_params[kidx]],
-        )
-        frames_in_problem.add(stem)
-
-    # ── Anchor ray residuals ──────────────────────────────────────────────────
-    for stem, pixel_uv, clip_weight in anchor_rays:
-        if clip_weight < config.CLIP_ANCHOR_MIN_WEIGHT:
-            continue
-        f = frame_map.get(stem)
-        if f is None or f.K_undist is None:
-            continue
-        functor = AnchorRayCost(pixel_uv, f.K_undist, clip_weight)
-        cost    = _NumericDiff(functor, num_residuals=2, block_sizes=[6, 3])
-        problem.add_residual_block(
-            cost, anchor_loss,
-            [cam_params[stem], p_anchor],
-        )
-        frames_in_problem.add(stem)
-
-    # ── Manual feature residuals ──────────────────────────────────────────────
+    frames_in_problem |= _add_mast3r_residuals(
+        problem, pyceres, mast3r_observations, cam_params, point_params,
+        frame_map, reproj_loss, n_pts,
+    )
+    frames_in_problem |= _add_anchor_residuals(
+        problem, pyceres, anchor_rays, cam_params, p_anchor,
+        frame_map, anchor_loss,
+    )
     if manual_features:
-        # manual_point_params: (feature_idx, 'A'/'B') → np.ndarray(3,)
-        # shared across frames that observe the same feature
-        manual_point_params: dict[tuple, np.ndarray] = {}
-
-        def _get_manual_point(feat_idx: int, end: str) -> np.ndarray:
-            key = (feat_idx, end)
-            if key not in manual_point_params:
-                manual_point_params[key] = np.zeros(3, dtype=np.float64)
-            return manual_point_params[key]
-
-        # We need to initialise manual point params from MASt3R's point cloud
-        # or from reprojection if possible.  For simplicity, seed with zeros
-        # and let Ceres solve from there.  The reprojection residuals pull them
-        # toward the correct world position.
-
-        for feat_idx, feat in enumerate(manual_features):
-            feat_type  = feat.get("type", "ground")
-            is_pair    = feat.get("is_pair", False)
-            distance_m = float(feat.get("distance_m", 1.0)) if is_pair else None
-            points_per_frame = feat.get("points", {})
-
-            for stem, pts_list in points_per_frame.items():
-                f = frame_map.get(stem)
-                if f is None or f.K_undist is None:
-                    continue
-
-                if is_pair and len(pts_list) >= 2:
-                    pix_a = np.asarray(pts_list[0], dtype=np.float64)
-                    pix_b = np.asarray(pts_list[1], dtype=np.float64)
-                    P_a   = _get_manual_point(feat_idx, "A")
-                    P_b   = _get_manual_point(feat_idx, "B")
-
-                    cost_a = _NumericDiff(
-                        ManualReprojCost(pix_a, f.K_undist),
-                        num_residuals=2, block_sizes=[6, 3],
-                    )
-                    cost_b = _NumericDiff(
-                        ManualReprojCost(pix_b, f.K_undist),
-                        num_residuals=2, block_sizes=[6, 3],
-                    )
-                    problem.add_residual_block(cost_a, None, [cam_params[stem], P_a])
-                    problem.add_residual_block(cost_b, None, [cam_params[stem], P_b])
-                    frames_in_problem.add(stem)
-
-                elif not is_pair and len(pts_list) >= 1:
-                    pix = np.asarray(pts_list[0], dtype=np.float64)
-                    P   = _get_manual_point(feat_idx, "A")
-                    cost = _NumericDiff(
-                        ManualReprojCost(pix, f.K_undist),
-                        num_residuals=2, block_sizes=[6, 3],
-                    )
-                    problem.add_residual_block(cost, None, [cam_params[stem], P])
-                    frames_in_problem.add(stem)
-
-            # Van metric constraint (once per feature, not per frame)
-            if is_pair and distance_m is not None:
-                P_a = _get_manual_point(feat_idx, "A")
-                P_b = _get_manual_point(feat_idx, "B")
-                cost = _NumericDiff(
-                    VanMetricCost(distance_m),
-                    num_residuals=1, block_sizes=[3, 3],
-                )
-                problem.add_residual_block(cost, metric_loss, [P_a, P_b])
-
-        logger.info("Added %d manual feature constraints.", len(manual_features))
+        frames_in_problem |= _add_manual_residuals(
+            problem, pyceres, manual_features, cam_params, frame_map, metric_loss,
+        )
 
     n_unconstrained = len(set(f.stem for f in frames) - frames_in_problem)
     if n_unconstrained:
@@ -350,29 +473,16 @@ def ceres_solve(
         )
 
     # ── Bounds on camera rotations (small window around MASt3R seeds) ─────────
-    for stem, p in cam_params.items():
-        # Rotation: ±SOLVER_PITCH_OFFSET degrees around seed (applied to each component)
-        rot_range = math.radians(config.SOLVER_PITCH_OFFSET)
-        for i in range(3):
-            problem.set_parameter_lower_bound(p, i, float(p[i]) - rot_range)
-            problem.set_parameter_upper_bound(p, i, float(p[i]) + rot_range)
-        # Translation: ±SOLVER_POSITION_RANGE_H around seed
-        for i, rng in enumerate([
-            config.SOLVER_POSITION_RANGE_H,
-            config.SOLVER_POSITION_RANGE_N,
-            config.SOLVER_POSITION_RANGE_V,
-        ]):
-            problem.set_parameter_lower_bound(p, 3 + i, float(p[3 + i]) - rng)
-            problem.set_parameter_upper_bound(p, 3 + i, float(p[3 + i]) + rng)
+    _add_camera_bounds(
+        problem, cam_params, cam_params.keys(),
+        math.radians(config.SOLVER_PITCH_OFFSET),
+        (config.SOLVER_POSITION_RANGE_H,
+         config.SOLVER_POSITION_RANGE_N,
+         config.SOLVER_POSITION_RANGE_V),
+    )
 
     # ── Solver options ────────────────────────────────────────────────────────
-    options = pyceres.SolverOptions()
-    options.linear_solver_type          = pyceres.LinearSolverType.SPARSE_SCHUR
-    options.minimizer_progress_to_stdout = True
-    options.max_num_iterations          = config.SOLVER_MAX_ITERATIONS
-    options.function_tolerance          = 1e-6
-    options.gradient_tolerance          = 1e-8
-    options.parameter_tolerance         = 1e-8
+    options = _solver_options(pyceres)
 
     logger.info("Starting Ceres full-BA solve …")
     summary = pyceres.SolverSummary()
@@ -383,6 +493,195 @@ def ceres_solve(
 
     # ── Collect results ───────────────────────────────────────────────────────
     points_3d_out = np.stack(point_params, axis=0)
+
+    return cam_params, points_3d_out, p_anchor, report
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Incremental two-stage solve (Phase 3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def ceres_solve_incremental(
+    frames,
+    mast3r_observations,
+    anchor_rays,
+    cam_poses_init,
+    points_3d_init: np.ndarray,
+    p_anchor_init: np.ndarray,
+    good_stems,
+    manual_features=None,
+):
+    """
+    Two-stage solve: a global BA over the "good" frames, then per-bad-frame
+    motion-only registration against that locked structure.
+
+    Stage A — bundle-adjust the cameras of `good_stems` jointly with the 3D
+    points they triangulate (≥2 good-frame observations) and P_anchor.
+    Stage B — for each remaining ("bad") frame, freeze the Stage-A points +
+    P_anchor and solve that one camera's 6-DoF pose against them, with widened
+    translation bounds (its MASt3R seed is the least trustworthy thing about it).
+
+    Same return contract as ceres_solve: (cam_params, points_3d_out, p_anchor,
+    report). Every frame ends with a pose — good frames from Stage A, bad frames
+    from Stage B, and any bad frame with too few locked observations keeps its
+    (still valid, ENU-aligned) MASt3R seed pose.
+
+    Parameters as ceres_solve, plus:
+    good_stems : iterable[str] — frames to solve in Stage A (CLIP weight ≥
+                 config.INCREMENTAL_GOOD_THRESHOLD; chosen by the caller).
+    """
+    from collections import defaultdict
+
+    pyceres = _import_pyceres()
+
+    frame_map  = {f.stem: f for f in frames}
+    cam_params = _init_cam_params(frames, cam_poses_init)
+
+    n_pts = len(points_3d_init)
+    if n_pts == 0:
+        logger.error(
+            "Incremental solve aborted: zero 3D points. Returning MASt3R seed cameras.",
+        )
+        return cam_params, np.empty((0, 3), dtype=np.float64), \
+               np.asarray(p_anchor_init, dtype=np.float64).copy(), \
+               "Aborted: zero 3D points"
+
+    point_params = [
+        np.asarray(points_3d_init[k], dtype=np.float64).copy()
+        for k in range(n_pts)
+    ]
+    p_anchor = np.asarray(p_anchor_init, dtype=np.float64).copy()
+
+    all_stems  = {f.stem for f in frames}
+    good_stems = set(good_stems) & all_stems
+    bad_stems  = all_stems - good_stems
+
+    # ── Explicit good/bad logging (per user request) ──────────────────────────
+    weight_map = {stem: w for stem, _uv, w in anchor_rays}
+    logger.info(
+        "Incremental two-stage solve: %d GOOD frame(s), %d BAD frame(s), %d total points.",
+        len(good_stems), len(bad_stems), n_pts,
+    )
+    logger.info("  GOOD frames — Stage A backbone (CLIP weight ≥ %.2f):",
+                config.INCREMENTAL_GOOD_THRESHOLD)
+    for stem in sorted(good_stems):
+        logger.info("    [GOOD] %s  w=%.3f", stem, weight_map.get(stem, float('nan')))
+    logger.info("  BAD frames — Stage B motion-only registration:")
+    for stem in sorted(bad_stems):
+        logger.info("    [BAD ] %s  w=%.3f", stem, weight_map.get(stem, float('nan')))
+
+    # ── Step 1: locked point subset (≥2 observations among GOOD frames) ────────
+    good_obs_count = defaultdict(int)
+    for o in mast3r_observations:
+        if o.frame_stem in good_stems and o.point_idx < n_pts:
+            good_obs_count[o.point_idx] += 1
+    stageA_point_idxs = {pi for pi, c in good_obs_count.items() if c >= 2}
+    logger.info(
+        "Stage A locked-point subset: %d / %d points have ≥2 good-frame observations.",
+        len(stageA_point_idxs), n_pts,
+    )
+
+    if len(stageA_point_idxs) == 0:
+        logger.error(
+            "Incremental solve: no points triangulated by ≥2 good frames — cannot "
+            "build locked structure. Returning MASt3R seed cameras.",
+        )
+        return cam_params, np.stack(point_params, axis=0), p_anchor, \
+               "Aborted: empty locked structure"
+
+    reproj_loss = pyceres.HuberLoss(1.5)
+    anchor_loss = pyceres.HuberLoss(3.0)
+    metric_loss = pyceres.HuberLoss(0.05)
+
+    # ── Step 2: Stage A — global BA over good frames only ─────────────────────
+    problemA = pyceres.Problem()
+    inA = _add_mast3r_residuals(
+        problemA, pyceres, mast3r_observations, cam_params, point_params,
+        frame_map, reproj_loss, n_pts,
+        restrict_stems=good_stems, restrict_point_idxs=stageA_point_idxs,
+    )
+    inA |= _add_anchor_residuals(
+        problemA, pyceres, anchor_rays, cam_params, p_anchor,
+        frame_map, anchor_loss, restrict_stems=good_stems,
+    )
+    if manual_features:
+        inA |= _add_manual_residuals(
+            problemA, pyceres, manual_features, cam_params, frame_map, metric_loss,
+            restrict_stems=good_stems,
+        )
+
+    _add_camera_bounds(
+        problemA, cam_params, [s for s in good_stems if s in inA],
+        math.radians(config.SOLVER_PITCH_OFFSET),
+        (config.SOLVER_POSITION_RANGE_H,
+         config.SOLVER_POSITION_RANGE_N,
+         config.SOLVER_POSITION_RANGE_V),
+    )
+
+    logger.info("Stage A: solving %d good camera(s) over %d locked-eligible point(s) …",
+                len(inA), len(stageA_point_idxs))
+    summaryA = pyceres.SolverSummary()
+    pyceres.solve(_solver_options(pyceres), problemA, summaryA)
+    reportA = summaryA.BriefReport()
+    logger.info("Stage A complete: %s", reportA)
+
+    # ── Step 3: Stage B — per-bad-frame motion-only registration ──────────────
+    registered = skipped = 0
+    stageb_rot = math.radians(config.INCREMENTAL_STAGEB_ROT_OFFSET)
+    stageb_trans = (config.INCREMENTAL_STAGEB_RANGE_H,
+                    config.INCREMENTAL_STAGEB_RANGE_N,
+                    config.INCREMENTAL_STAGEB_RANGE_V)
+
+    for stem in sorted(bad_stems):
+        f = frame_map.get(stem)
+        if f is None or f.K_undist is None:
+            logger.warning("[%s] Stage B skip — no undistorted frame / K. Keeping MASt3R seed.", stem)
+            skipped += 1
+            continue
+
+        my_obs = [
+            o for o in mast3r_observations
+            if o.frame_stem == stem and o.point_idx in stageA_point_idxs and o.point_idx < n_pts
+        ]
+        if len(my_obs) < config.INCREMENTAL_MIN_LOCKED_OBS:
+            logger.info(
+                "[%s] Stage B skip — only %d locked obs (< %d). Keeping MASt3R seed pose.",
+                stem, len(my_obs), config.INCREMENTAL_MIN_LOCKED_OBS,
+            )
+            skipped += 1
+            continue
+
+        problemB = pyceres.Problem()
+        _add_mast3r_residuals(
+            problemB, pyceres, my_obs, cam_params, point_params,
+            frame_map, reproj_loss, n_pts,
+            restrict_stems={stem}, restrict_point_idxs=stageA_point_idxs,
+        )
+        _add_anchor_residuals(
+            problemB, pyceres, anchor_rays, cam_params, p_anchor,
+            frame_map, anchor_loss, restrict_stems={stem},
+        )
+
+        # Lock structure: freeze every referenced locked point + P_anchor so
+        # Stage B only moves this one camera (motion-only resection).
+        for pi in {o.point_idx for o in my_obs}:
+            _freeze_block(problemB, point_params[pi])
+        _freeze_block(problemB, p_anchor)
+
+        _add_camera_bounds(problemB, cam_params, [stem], stageb_rot, stageb_trans)
+
+        summaryB = pyceres.SolverSummary()
+        pyceres.solve(_solver_options(pyceres), problemB, summaryB)
+        registered += 1
+        logger.info("[%s] Stage B registered — %d locked obs. %s",
+                    stem, len(my_obs), summaryB.BriefReport())
+
+    points_3d_out = np.stack(point_params, axis=0)
+    report = (
+        f"Stage A: {reportA} || Stage B: registered {registered} / "
+        f"skipped {skipped} of {len(bad_stems)} bad frame(s)"
+    )
+    logger.info("Incremental two-stage solve complete: %s", report)
 
     return cam_params, points_3d_out, p_anchor, report
 

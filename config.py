@@ -306,6 +306,22 @@ SOLVER_POSITION_RANGE_V  =   2.0   # ± metres vertical
 # Maximum Ceres solver iterations.
 SOLVER_MAX_ITERATIONS = 200
 
+# ── Incremental two-stage solve (Phase 3) ───────────────────────────────────
+# Stage A: global BA over "good" frames only (CLIP anchor weight >= threshold),
+# then lock the Stage-A 3D points + P_anchor. Stage B: register each "bad" frame
+# motion-only against that locked structure with widened translation bounds.
+# Protects well-conditioned structure from blurry-frame noise. All inside Ceres
+# (orientation_solver.py) — MASt3R still runs once as a single complete graph.
+INCREMENTAL_SOLVE             = False   # master toggle; False ⇒ exact legacy single-stage path
+INCREMENTAL_GOOD_THRESHOLD    = CLIP_ANCHOR_THRESHOLD  # CLIP weight >= this ⇒ "good" (Stage A)
+INCREMENTAL_MIN_GOOD_FRAMES   = 3      # below this many good frames ⇒ fall back to single-stage
+INCREMENTAL_MIN_LOCKED_OBS    = 4      # bad frame needs >= this many obs onto locked points to RUN
+                                       # Stage B; below it the frame keeps its MASt3R seed pose
+INCREMENTAL_STAGEB_ROT_OFFSET = 50.0   # ± deg per axis-angle component for bad frames (= SOLVER_PITCH_OFFSET)
+INCREMENTAL_STAGEB_RANGE_H    = 25.0   # ± m East  for bad frames (widened vs SOLVER_POSITION_RANGE_H)
+INCREMENTAL_STAGEB_RANGE_N    = 15.0   # ± m North for bad frames (widened vs SOLVER_POSITION_RANGE_N)
+INCREMENTAL_STAGEB_RANGE_V    =  6.0   # ± m vert  for bad frames (widened vs SOLVER_POSITION_RANGE_V)
+
 # ── Focal length estimation ──────────────────────────────────────────────────
 # Set True to add focal length as a free parameter in the Ceres solve.
 ESTIMATE_FOCAL_LENGTH = False

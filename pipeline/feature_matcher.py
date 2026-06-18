@@ -390,19 +390,53 @@ def refine_pitches(
     # ── Step 4: Manual features ───────────────────────────────────────────────
     manual_features = _load_manual_features(ready) if use_manual_features else None
 
-    # ── Step 5: Ceres full-BA ─────────────────────────────────────────────────
-    from pipeline.orientation_solver import ceres_solve, align_to_telemetry_sim3
-
-    logger.info("Starting Ceres full-BA …")
-    cam_params_solved, points_3d_solved, p_anchor_solved, report = ceres_solve(
-        ready,
-        mast3r_observations=mast3r_result.observations,
-        anchor_rays=anchor_rays,
-        cam_poses_init=mast3r_result.camera_poses,
-        points_3d_init=mast3r_result.points_3d,
-        p_anchor_init=p_anchor_init,
-        manual_features=manual_features,
+    # ── Step 5: Ceres BA (single-stage or incremental two-stage) ──────────────
+    from pipeline.orientation_solver import (
+        ceres_solve, ceres_solve_incremental, align_to_telemetry_sim3,
     )
+
+    # Good frames = high-CLIP anchor frames (Stage A backbone for the incremental
+    # solve). Same source as the Sim(3) control set; tunable via its own knob.
+    good_stems = set()
+    if anchor_result is not None:
+        good_stems = {
+            s for s, w in anchor_result.weights.items()
+            if w >= config.INCREMENTAL_GOOD_THRESHOLD
+        }
+    use_incremental = (
+        config.INCREMENTAL_SOLVE
+        and len(good_stems) >= config.INCREMENTAL_MIN_GOOD_FRAMES
+    )
+    if config.INCREMENTAL_SOLVE and not use_incremental:
+        logger.warning(
+            "INCREMENTAL_SOLVE is on but only %d good frame(s) (< %d) — "
+            "falling back to single-stage ceres_solve.",
+            len(good_stems), config.INCREMENTAL_MIN_GOOD_FRAMES,
+        )
+
+    if use_incremental:
+        logger.info("Starting Ceres incremental two-stage solve …")
+        cam_params_solved, points_3d_solved, p_anchor_solved, report = ceres_solve_incremental(
+            ready,
+            mast3r_observations=mast3r_result.observations,
+            anchor_rays=anchor_rays,
+            cam_poses_init=mast3r_result.camera_poses,
+            points_3d_init=mast3r_result.points_3d,
+            p_anchor_init=p_anchor_init,
+            good_stems=good_stems,
+            manual_features=manual_features,
+        )
+    else:
+        logger.info("Starting Ceres full-BA (single-stage) …")
+        cam_params_solved, points_3d_solved, p_anchor_solved, report = ceres_solve(
+            ready,
+            mast3r_observations=mast3r_result.observations,
+            anchor_rays=anchor_rays,
+            cam_poses_init=mast3r_result.camera_poses,
+            points_3d_init=mast3r_result.points_3d,
+            p_anchor_init=p_anchor_init,
+            manual_features=manual_features,
+        )
     logger.info("Ceres BA: %s", report)
     logger.info("P_anchor solved: %s", np.round(p_anchor_solved, 3))
 
