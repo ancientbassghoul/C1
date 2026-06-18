@@ -93,6 +93,40 @@ AUTO_MATCHES_FILE = "./output/auto_matches.json"
 # Path where the Qwen/CLIP anchor detection result is cached.
 ANCHOR_CACHE_FILE = "./output/anchor_cache.json"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SURFACE-AWARE RAYCAST
+# ─────────────────────────────────────────────────────────────────────────────
+# The UI reprojects a picked pixel by intersecting its world ray with a surface.
+# Historically that surface was the flat plane Z=GROUND_Z_M, which injects error
+# wherever the real terrain has relief (amplified by oblique target views).
+# Instead, intersect against the reconstructed 3D terrain built from solved points.
+#
+# SURFACE_SOURCE selects which point cloud feeds the terrain height field:
+#   "sparse" — the ~1000 Ceres-refined solved points (clean; export sparse only)
+#   "dense"  — MASt3R's dense pointmap, robustly filtered (export dense only)
+#   "both"   — sparse ∪ dense, filtered (export both clouds)
+# "" / None disables surface raycast entirely (fall back to the flat plane).
+SURFACE_SOURCE = "sparse"
+
+# Ground-point cloud files (ENU metres) written at solve time, loaded by --import-solve.
+# Ceres-solve terrain (pairs with solved_cameras.json):
+SURFACE_POINTS_SPARSE_FILE = "./output/solved_ground_points_sparse.npy"
+SURFACE_POINTS_DENSE_FILE  = "./output/solved_ground_points_dense.npy"
+# MASt3R-native terrain (pairs with solved_camera_mast3r.json) — so the raw MASt3R
+# solve raycasts against its own ground, for a fair before/after-Ceres comparison.
+MAST3R_SURFACE_POINTS_SPARSE_FILE = "./output/mast3r_ground_points_sparse.npy"
+MAST3R_SURFACE_POINTS_DENSE_FILE  = "./output/mast3r_ground_points_dense.npy"
+
+# Ray↔surface intersection: fixed-point iteration seeded from the flat-Z hit.
+SURFACE_RAYCAST_MAX_ITERS = 8       # max fixed-point iterations
+SURFACE_RAYCAST_TOL_M     = 0.02    # convergence: world-point move below this (m)
+
+# Robust filtering applied to the dense cloud before building the height field
+# (sparse is already clean and skips this):
+SURFACE_VOXEL_M           = 0.25    # voxel-downsample leaf size (m); 0 disables
+SURFACE_OUTLIER_K         = 16      # neighbours for statistical outlier removal
+SURFACE_OUTLIER_STD       = 2.0     # drop points beyond mean + this·std of kNN dist
+
 # Max fraction of total image area a single anchor bbox may cover.
 # Detections larger than this threshold are treated as scene backgrounds
 # (e.g. "field" covering 50% of the frame) and discarded.

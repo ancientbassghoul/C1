@@ -427,6 +427,30 @@ def _umeyama_sim3(
     return s, R, t
 
 
+def _telemetry_control_stems(frames, anchor_result) -> list[str]:
+    """Stems used as Sim(3) control points: high-CLIP frames, else all frames.
+
+    Prefers frames with CLIP anchor weight >= CLIP_ANCHOR_THRESHOLD (sharp,
+    well-localized anchor); falls back to all frames if fewer than 3 qualify.
+    """
+    all_stems = [f.stem for f in frames]
+    if anchor_result is not None:
+        ctrl = [
+            stem for stem, w in anchor_result.weights.items()
+            if w >= config.CLIP_ANCHOR_THRESHOLD
+        ]
+    else:
+        ctrl = list(all_stems)
+
+    if len(ctrl) < 3:
+        logger.warning(
+            "Only %d high-confidence frames for Sim(3); using all frames as fallback.",
+            len(ctrl),
+        )
+        ctrl = list(all_stems)
+    return ctrl
+
+
 def align_to_telemetry_sim3(
     frames,
     cam_params_solved: dict[str, np.ndarray],
@@ -453,20 +477,7 @@ def align_to_telemetry_sim3(
     frame_map = {f.stem: f for f in frames}
 
     # ── Identify control points ───────────────────────────────────────────────
-    if anchor_result is not None:
-        ctrl_stems = [
-            stem for stem, w in anchor_result.weights.items()
-            if w >= config.CLIP_ANCHOR_THRESHOLD
-        ]
-    else:
-        ctrl_stems = list(frame_map.keys())
-
-    if len(ctrl_stems) < 3:
-        logger.warning(
-            "Only %d high-confidence frames for Sim(3); using all frames as fallback.",
-            len(ctrl_stems),
-        )
-        ctrl_stems = list(frame_map.keys())
+    ctrl_stems = _telemetry_control_stems(frames, anchor_result)
 
     # Camera centre in MASt3R frame: C = -R.T @ t
     def _camera_centre(cam6: np.ndarray) -> np.ndarray:
@@ -596,6 +607,86 @@ def _rotation_aligning(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return np.eye(3) + vx + vx @ vx * ((1 - c) / (s * s))
 
 
+def _fit_level_correction(
+    pts_enu: np.ndarray,
+    tag: str = "Ground leveling",
+) -> tuple[np.ndarray, np.ndarray, bool]:
+    """
+    Fit the rigid correction that levels a point cloud's dominant plane to +Z
+    at config.GROUND_Z_M.
+
+    RANSAC-fits the dominant plane, orients its normal up, then builds a
+    rotation R_level taking that normal to +Z (pivoting about the inlier
+    centroid) plus a translation b that also shifts the plane to GROUND_Z_M.
+    The correction maps a point x ↦ R_level @ x + b.
+
+    Returns (R_level, b, ok).  ok is False (and R_level=I, b=0) when there are
+    too few points, no dominant plane (inlier frac below threshold), or the
+    correction tilt exceeds the guard — callers should then leave the scene
+    untouched.
+    """
+    pts = np.asarray(pts_enu, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[0] < 3:
+        logger.warning("%s skipped — too few points (%d).", tag, len(pts))
+        return np.eye(3), np.zeros(3), False
+
+    rng = np.random.default_rng(0)   # deterministic
+    normal, centroid, inlier_mask = _ransac_plane(
+        pts,
+        thresh=float(config.GROUND_RANSAC_THRESH_M),
+        iters=int(config.GROUND_RANSAC_ITERS),
+        rng=rng,
+    )
+
+    inlier_frac = float(inlier_mask.mean())
+    if inlier_frac < float(config.GROUND_RANSAC_MIN_INLIER_FRAC):
+        logger.warning(
+            "%s skipped — no dominant plane (inlier frac %.2f < %.2f).",
+            tag, inlier_frac, config.GROUND_RANSAC_MIN_INLIER_FRAC,
+        )
+        return np.eye(3), np.zeros(3), False
+
+    # Orient the normal "up" so the corrective rotation is the minimal one.
+    if normal[2] < 0:
+        normal = -normal
+
+    tilt_deg = math.degrees(math.acos(np.clip(normal[2], -1.0, 1.0)))
+    if tilt_deg > float(config.GROUND_LEVEL_MAX_TILT_DEG):
+        logger.warning(
+            "%s skipped — correction tilt %.1f° exceeds max %.1f° "
+            "(RANSAC likely locked onto the van or a spike fan, not the ground).",
+            tag, tilt_deg, config.GROUND_LEVEL_MAX_TILT_DEG,
+        )
+        return np.eye(3), np.zeros(3), False
+
+    # Rotation taking the ground normal to +Z, pivoting about the inlier
+    # centroid, then a Z shift so the plane sits at GROUND_Z_M.
+    z_axis  = np.array([0.0, 0.0, 1.0])
+    R_level = _rotation_aligning(normal, z_axis)
+    z_shift = np.array([0.0, 0.0, centroid[2] - float(config.GROUND_Z_M)])
+    b       = centroid - R_level @ centroid - z_shift
+
+    logger.info(
+        "%s: %d/%d inliers (%.0f%%), tilt corrected %.2f°, ground z %.2f → %.2f m.",
+        tag, int(inlier_mask.sum()), len(pts), 100.0 * inlier_frac,
+        tilt_deg, float(centroid[2]), float(config.GROUND_Z_M),
+    )
+    return R_level, b, True
+
+
+def _compose_level_into_sim3(
+    sim3: tuple[float, np.ndarray, np.ndarray],
+    R_level: np.ndarray,
+    b: np.ndarray,
+) -> tuple[float, np.ndarray, np.ndarray]:
+    """Compose a leveling correction (x ↦ R_level@x + b) onto a Sim(3).
+
+    Result maps x ↦ R_level @ (s·R_sim·x + t_sim) + b, still a Sim(3).
+    """
+    scale, R_sim, t_sim = sim3
+    return scale, R_level @ R_sim, R_level @ t_sim + b
+
+
 def level_ground_plane(
     frames,
     points_3d_solved: np.ndarray,
@@ -626,51 +717,11 @@ def level_ground_plane(
         logger.warning("Ground leveling skipped — too few solved points (%d).", len(pts))
         return sim3
 
-    # Map MASt3R-frame points into the current ENU frame.
+    # Map MASt3R-frame points into the current ENU frame, then fit the level.
     pts_enu = scale * (pts @ R_sim.T) + t_sim
-
-    rng = np.random.default_rng(0)   # deterministic
-    normal, centroid, inlier_mask = _ransac_plane(
-        pts_enu,
-        thresh=float(config.GROUND_RANSAC_THRESH_M),
-        iters=int(config.GROUND_RANSAC_ITERS),
-        rng=rng,
-    )
-
-    inlier_frac = float(inlier_mask.mean())
-    if inlier_frac < float(config.GROUND_RANSAC_MIN_INLIER_FRAC):
-        logger.warning(
-            "Ground leveling skipped — no dominant plane (inlier frac %.2f < %.2f).",
-            inlier_frac, config.GROUND_RANSAC_MIN_INLIER_FRAC,
-        )
+    R_level, b, ok = _fit_level_correction(pts_enu, tag="Ground leveling")
+    if not ok:
         return sim3
-
-    # Orient the normal "up" so the corrective rotation is the minimal one.
-    if normal[2] < 0:
-        normal = -normal
-
-    tilt_deg = math.degrees(math.acos(np.clip(normal[2], -1.0, 1.0)))
-    if tilt_deg > float(config.GROUND_LEVEL_MAX_TILT_DEG):
-        logger.warning(
-            "Ground leveling skipped — correction tilt %.1f° exceeds max %.1f° "
-            "(RANSAC likely locked onto the van or a spike fan, not the ground).",
-            tilt_deg, config.GROUND_LEVEL_MAX_TILT_DEG,
-        )
-        return sim3
-
-    # Rotation taking the ground normal to +Z, pivoting about the inlier
-    # centroid, then a Z shift so the plane sits at GROUND_Z_M.
-    z_axis  = np.array([0.0, 0.0, 1.0])
-    R_level = _rotation_aligning(normal, z_axis)
-    z_shift = np.array([0.0, 0.0, centroid[2] - float(config.GROUND_Z_M)])
-    b       = centroid - R_level @ centroid - z_shift
-
-    logger.info(
-        "Ground leveling: %d/%d inliers (%.0f%%), tilt corrected %.2f°, "
-        "ground z %.2f → %.2f m.",
-        int(inlier_mask.sum()), len(pts_enu), 100.0 * inlier_frac,
-        tilt_deg, float(centroid[2]), float(config.GROUND_Z_M),
-    )
 
     # Apply level ∘ (existing ENU pose) to every frame.
     for f in frames:
@@ -679,8 +730,71 @@ def level_ground_plane(
         f.position_enu = R_level @ f.position_enu + b
         _apply_rotation_to_frame(f, f.R @ R_level.T)
 
-    # Composed Sim(3): x ↦ R_level @ (s·R_sim·x + t_sim) + b
-    return scale, R_level @ R_sim, R_level @ t_sim + b
+    return _compose_level_into_sim3(sim3, R_level, b)
+
+
+def mast3r_native_leveled_sim3(
+    frames,
+    mast3r_w2c_poses: dict[str, np.ndarray],
+    mast3r_points_3d: np.ndarray,
+    anchor_result=None,
+) -> tuple[float, np.ndarray, np.ndarray] | None:
+    """
+    Compute a Sim(3) that maps MASt3R's *raw* (pre-Ceres) frame to ENU AND
+    levels MASt3R's *own* ground to Z=0 — independent of the Ceres solve.
+
+    Used so solved_camera_mast3r.json can be loaded in the flat-Z=0 UI to judge
+    MASt3R's untouched geometry. The production path (`align_to_telemetry_sim3`
+    + `level_ground_plane`) levels the *Ceres* ground; applying that transform
+    to MASt3R seed cameras leaves them tilted whenever MASt3R and Ceres disagree
+    on the ground (which is exactly the "how much did Ceres help" signal).
+
+    Pure: does NOT mutate frames. Returns the composed Sim(3), or None if the
+    Umeyama fit has too few control points. Leveling silently falls back to the
+    un-leveled Sim(3) (guards in `_fit_level_correction`) when no dominant plane
+    is found in the noisier raw MASt3R points.
+    """
+    frame_map = {f.stem: f for f in frames}
+    ctrl_stems = _telemetry_control_stems(frames, anchor_result)
+
+    # Camera centre in MASt3R frame from a 4×4 world-to-camera: C = -R.T @ t
+    src_pts, dst_pts = [], []
+    for stem in ctrl_stems:
+        f   = frame_map.get(stem)
+        w2c = mast3r_w2c_poses.get(stem)
+        if f is None or w2c is None or f.position_enu is None:
+            continue
+        R34 = w2c[:3, :3]
+        t3  = w2c[:3, 3]
+        src_pts.append(-R34.T @ t3)
+        dst_pts.append(f.position_enu.copy())
+
+    if len(src_pts) < 3:
+        logger.error(
+            "MASt3R-native Sim(3): fewer than 3 control points (%d) — skipping.",
+            len(src_pts),
+        )
+        return None
+
+    scale, R_sim, t_sim = _umeyama_sim3(
+        np.stack(src_pts, axis=0), np.stack(dst_pts, axis=0)
+    )
+    logger.info("MASt3R-native Sim(3): scale=%.4f using %d control frames",
+                scale, len(src_pts))
+
+    base_sim3 = (scale, R_sim, t_sim)
+
+    pts = np.asarray(mast3r_points_3d, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[0] < 3:
+        logger.warning("MASt3R-native leveling skipped — too few raw points (%d).", len(pts))
+        return base_sim3
+
+    pts_enu = scale * (pts @ R_sim.T) + t_sim
+    R_level, b, ok = _fit_level_correction(pts_enu, tag="MASt3R-native leveling")
+    if not ok:
+        return base_sim3
+
+    return _compose_level_into_sim3(base_sim3, R_level, b)
 
 
 def decompose_R_wc(R_wc: np.ndarray) -> tuple[float, float, float] | None:

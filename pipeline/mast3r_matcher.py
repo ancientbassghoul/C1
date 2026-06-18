@@ -1013,3 +1013,83 @@ def export_aligned_glb(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     scene_glb.export(str(out_path))
     logger.info("Aligned (ENU) scene exported to %s (%d camera(s))", out_path, len(ready))
+
+
+def export_mast3r_native_leveled_glb(
+    mast3r_result: MASt3RResult,
+    mast3r_sim3: tuple[float, np.ndarray, np.ndarray],
+    frames: list,
+    out_path: str | Path,
+) -> None:
+    """
+    Export MASt3R's RAW (pre-Ceres) reconstruction, moved into ENU and leveled
+    on MASt3R's OWN ground via `mast3r_sim3` (from
+    orientation_solver.mast3r_native_leveled_sim3).
+
+    Differs from export_aligned_glb in three ways — everything here is MASt3R's
+    untouched output, so this is the 3D counterpart of solved_camera_mast3r.json:
+      - dense mesh: mast3r_result.dense (raw), moved by mast3r_sim3
+      - sparse points: mast3r_result.points_3d (raw, NOT the Ceres-refined cloud)
+      - reference cards: MASt3R SEED poses (mast3r_result.camera_poses), NOT the
+        final solved frame poses — coloured green to distinguish from the
+        Ceres-aligned scene's blue cards.
+
+    Open alongside mast3r_aligned_scene.glb to see the before/after-Ceres
+    difference directly (including any collapsed/degenerate MASt3R seed poses).
+    Requires mast3r_result.dense (keep_dense=True) and a non-None mast3r_sim3.
+    """
+    import trimesh
+    from dust3r.viz import pts3d_to_trimesh, cat_meshes, add_scene_cam
+
+    scale, R_sim, t_sim = mast3r_sim3
+
+    scene_glb = trimesh.Scene()
+
+    # Raw dense mesh, moved into ENU.
+    meshes = []
+    for stem, (pts3d_hw3, img_u8, valid) in mast3r_result.dense.items():
+        pts_enu = _apply_sim3(pts3d_hw3, scale, R_sim, t_sim)
+        meshes.append(pts3d_to_trimesh(img_u8, pts_enu, valid))
+    if meshes:
+        scene_glb.add_geometry(trimesh.Trimesh(**cat_meshes(meshes)))
+
+    # Raw MASt3R sparse point cloud, moved into ENU (orange, as in the raw dump).
+    if len(mast3r_result.points_3d):
+        pts_enu = _apply_sim3(np.asarray(mast3r_result.points_3d), scale, R_sim, t_sim)
+        scene_glb.add_geometry(trimesh.PointCloud(pts_enu, colors=(255, 160, 0)))
+
+    # Reference cards at each frame's MASt3R SEED pose, moved into ENU. Same
+    # transform math as feature_matcher._build_mast3r_cameras_enu:
+    #   C_enu = scale * R_sim @ (-R34.T @ t3) + t_sim
+    #   R_enu_wc = R34 @ R_sim.T  ⟹  c2w rotation = R_enu_wc.T
+    frame_map = {f.stem: f for f in frames}
+    cam_size  = max(0.1, float(config.MAST3R_GLB_CAM_SIZE_M))
+    n_cams = 0
+    for stem, w2c in mast3r_result.camera_poses.items():
+        f = frame_map.get(stem)
+        if f is None or f.undistorted is None:
+            continue
+        R34 = w2c[:3, :3]
+        t3  = w2c[:3, 3]
+        C_enu    = scale * R_sim @ (-R34.T @ t3) + t_sim
+        R_enu_wc = R34 @ R_sim.T
+
+        c2w = np.eye(4)
+        c2w[:3, :3] = R_enu_wc.T
+        c2w[:3, 3]  = C_enu
+
+        img_rgb = cv2.cvtColor(f.undistorted, cv2.COLOR_BGR2RGB)
+        focal   = float(f.K_undist[0, 0]) if f.K_undist is not None else None
+        imsize  = (img_rgb.shape[1], img_rgb.shape[0])
+
+        add_scene_cam(
+            scene_glb, c2w, (60, 220, 60),
+            image=img_rgb, focal=focal, imsize=imsize,
+            screen_width=cam_size,
+        )
+        n_cams += 1
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    scene_glb.export(str(out_path))
+    logger.info("MASt3R-native leveled scene exported to %s (%d camera(s))", out_path, n_cams)

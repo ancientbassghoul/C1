@@ -71,6 +71,23 @@ def export_mast3r_cameras(cameras_enu: dict, path: str | Path) -> None:
     logger.info("MASt3R seed cameras written to %s  (%d frame(s))", path, len(cameras_enu))
 
 
+def export_ground_points(points_enu, path: str | Path) -> None:
+    """Save an (N,3) ENU ground-point cloud as .npy for surface-aware raycast."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    arr = np.asarray(points_enu, dtype=np.float64)
+    np.save(path, arr)
+    logger.info("Ground points written to %s  (%d pts)", path, len(arr))
+
+
+def load_ground_points(path: str | Path):
+    """Load an ENU ground-point cloud written by export_ground_points, or None."""
+    path = Path(path)
+    if not path.exists():
+        return None
+    return np.load(path)
+
+
 def import_solve(frames: list, path: str | Path) -> int:
     """
     Load solved camera state from JSON and apply it to matching frames (by stem).

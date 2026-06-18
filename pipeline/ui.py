@@ -125,10 +125,13 @@ class ReprojectionViewer:
     WINDOW = ("Raycast  [click=pick | scroll=zoom | mid-drag=pan | "
               "ctrl+scroll=marker | R=reset | s=save | q=quit]")
 
-    def __init__(self, frames: list[Frame]) -> None:
+    def __init__(self, frames: list[Frame], surface=None) -> None:
         self.frames = [f for f in frames if f.ready]
         if not self.frames:
             raise RuntimeError("No ready frames to display.")
+
+        # Optional GroundSurface for terrain-aware reprojection (else flat Z=0).
+        self.surface = surface
 
         self._n_cols    = min(MAX_COLS, len(self.frames))
         self._frame_idx = {f: i for i, f in enumerate(self.frames)}
@@ -322,7 +325,7 @@ class ReprojectionViewer:
 
         self.annotations = {f: {} for f in self.frames}
         self.annotations[source]["src"] = (px, py)
-        results = reproject_pick(px, py, source, self.frames)
+        results = reproject_pick(px, py, source, self.frames, surface=self.surface)
         for tf, proj in results.items():
             self.annotations[tf]["dst"] = proj
 

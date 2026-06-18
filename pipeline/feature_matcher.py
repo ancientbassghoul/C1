@@ -37,8 +37,65 @@ class RefineResult:
     """
     mast3r_result: object               # MASt3RResult — carries .dense when keep_dense=True
     points_3d_solved: np.ndarray        # Ceres-refined sparse points, MASt3R frame (pre-Sim3)
-    sim3: tuple[float, np.ndarray, np.ndarray] | None  # (scale, R_sim, t_sim), MASt3R frame → ENU
+    sim3: tuple[float, np.ndarray, np.ndarray] | None  # (scale, R_sim, t_sim), MASt3R frame → ENU (Ceres-leveled)
     mast3r_cameras_enu: dict = None     # MASt3R seed cameras in ENU (before Ceres) — same schema as solved_cameras.json
+    mast3r_sim3: tuple[float, np.ndarray, np.ndarray] | None = None  # MASt3R-native composed Sim(3) (its own ground leveled)
+
+
+def surface_points_enu(
+    refine_result, source: str, which: str = "ceres",
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """
+    Build the ENU ground-point cloud(s) for surface-aware raycast from a solve.
+
+    Returns (sparse_enu, dense_enu) — each (N,3) in ENU metres or None — selected
+    by two orthogonal axes:
+
+      source ("sparse" | "dense" | "both") — which cloud type to build.
+      which  ("ceres" | "native")          — which solve frame to map into ENU:
+        - "ceres":  sim3 = refine_result.sim3 (composed, Ceres-leveled), sparse =
+                    points_3d_solved (Ceres-refined). Lines up with solved_cameras.json.
+        - "native": sim3 = refine_result.mast3r_sim3 (MASt3R's own ground leveled),
+                    sparse = mast3r_result.points_3d (raw). Lines up with
+                    solved_camera_mast3r.json.
+
+    dense = all valid MASt3R dense pointmap samples (same points either way),
+    transformed by the chosen sim3 — needs robust filtering at GroundSurface
+    build time. Returns (None, None) if the chosen sim3 is unavailable.
+    """
+    from pipeline.mast3r_matcher import _apply_sim3
+
+    if refine_result is None:
+        return None, None
+
+    if which == "native":
+        sim3 = refine_result.mast3r_sim3
+        sparse_src = getattr(refine_result.mast3r_result, "points_3d", None)
+    else:
+        sim3 = refine_result.sim3
+        sparse_src = refine_result.points_3d_solved
+
+    if sim3 is None:
+        return None, None
+    scale, R_sim, t_sim = sim3
+
+    sparse = dense = None
+    if source in ("sparse", "both") and sparse_src is not None:
+        pts = np.asarray(sparse_src)
+        if len(pts):
+            sparse = _apply_sim3(pts, scale, R_sim, t_sim)
+
+    if source in ("dense", "both"):
+        chunks = []
+        dense_dict = getattr(refine_result.mast3r_result, "dense", {}) or {}
+        for _stem, (pts3d_hw3, _img, valid) in dense_dict.items():
+            v = pts3d_hw3[valid]
+            if len(v):
+                chunks.append(np.asarray(v, dtype=np.float64))
+        if chunks:
+            dense = _apply_sim3(np.concatenate(chunks, axis=0), scale, R_sim, t_sim)
+
+    return sparse, dense
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -359,8 +416,16 @@ def refine_pitches(
         from pipeline.orientation_solver import level_ground_plane
         sim3 = level_ground_plane(ready, points_3d_solved, sim3)
 
-    # Build MASt3R-before-Ceres cameras in ENU using the same (composed) Sim(3).
-    mast3r_cams_enu = _build_mast3r_cameras_enu(ready, mast3r_result.camera_poses, sim3)
+    # Build MASt3R-before-Ceres cameras in ENU using a MASt3R-NATIVE Sim(3)
+    # (its own telemetry fit + its own ground leveled to Z=0) — NOT the Ceres
+    # composed sim3 above. This keeps solved_camera_mast3r.json loadable in the
+    # flat-Z=0 UI on MASt3R's own terms, for a clean before/after-Ceres compare.
+    from pipeline.orientation_solver import mast3r_native_leveled_sim3
+    mast3r_sim3 = mast3r_native_leveled_sim3(
+        ready, mast3r_result.camera_poses, mast3r_result.points_3d,
+        anchor_result=anchor_result,
+    )
+    mast3r_cams_enu = _build_mast3r_cameras_enu(ready, mast3r_result.camera_poses, mast3r_sim3)
     if mast3r_cams_enu:
         logger.info("MASt3R seed cameras converted to ENU (%d frames).", len(mast3r_cams_enu))
 
@@ -370,4 +435,5 @@ def refine_pitches(
         points_3d_solved=points_3d_solved,
         sim3=sim3,
         mast3r_cameras_enu=mast3r_cams_enu,
+        mast3r_sim3=mast3r_sim3,
     )

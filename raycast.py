@@ -417,10 +417,35 @@ def preview_anchor_cmd(frames_dir: str) -> None:
           f"{sum(1 for w in anchor.weights.values() if w >= config.CLIP_ANCHOR_THRESHOLD)}\n")
 
 
-def run_interactive(frames: list) -> None:
+def _build_surface(sparse, dense, source: str):
+    """Build a GroundSurface from gathered ENU clouds per SURFACE_SOURCE, or None."""
+    import numpy as np
+    from pipeline.geometry import GroundSurface
+
+    if source == "sparse":
+        pts, filt = sparse, False
+    elif source == "dense":
+        pts, filt = dense, True
+    elif source == "both":
+        parts = [p for p in (sparse, dense) if p is not None and len(p)]
+        pts = np.concatenate(parts, axis=0) if parts else None
+        filt = True
+    else:
+        return None
+
+    if pts is None or len(pts) < 3:
+        logger.warning("Surface raycast: no usable %s points — flat Z=0 fallback.", source)
+        return None
+    surf = GroundSurface(pts, filter_outliers=filt)
+    logger.info("Surface raycast enabled (source=%s, %d pts after filtering).",
+                source, surf.n_points)
+    return surf
+
+
+def run_interactive(frames: list, surface=None) -> None:
     """Launch the click-to-reproject GUI."""
     from pipeline.ui import ReprojectionViewer
-    viewer = ReprojectionViewer(frames)
+    viewer = ReprojectionViewer(frames, surface=surface)
     viewer.run()
 
 
@@ -428,6 +453,7 @@ def run_batch(
     frames: list,
     source_stem: str,
     pick: tuple[float, float],
+    surface=None,
 ) -> None:
     """Headless: reproject *pick* from *source_stem* and save proof sheet."""
     from pipeline.geometry import reproject_pick
@@ -447,7 +473,7 @@ def run_batch(
 
     px, py = pick
     logger.info("Batch reproject: source=%s  pick=(%.0f, %.0f)", source_stem, px, py)
-    results = reproject_pick(px, py, source, frames)
+    results = reproject_pick(px, py, source, frames, surface=surface)
     if not results:
         logger.error("No successful reprojections.  Check telemetry and config.py.")
         sys.exit(1)
@@ -561,13 +587,28 @@ def main() -> None:
     if args.import_solve is not None:
         from pipeline.frame     import load_frames
         from pipeline.undistort import undistort_all
-        from pipeline.solve_io  import import_solve
+        from pipeline.solve_io  import import_solve, load_ground_points
         _frames = load_frames(args.frames_dir)
         undistort_all(_frames)
         _path = args.import_solve or os.path.join(config.OUTPUT_DIR, "solved_cameras.json")
         n = import_solve(_frames, _path)
         logger.info("Imported solve for %d frame(s) from %s", n, _path)
-        run_interactive(_frames)
+
+        # Load the saved terrain cloud(s) for surface-aware raycast (else flat Z=0).
+        # Match the surface to the camera file: solved_camera_mast3r.json → the
+        # MASt3R-native clouds; anything else → the Ceres clouds.
+        _surface = None
+        if config.SURFACE_SOURCE:
+            _is_native = "mast3r" in os.path.basename(_path).lower()
+            if _is_native:
+                _sparse = load_ground_points(config.MAST3R_SURFACE_POINTS_SPARSE_FILE)
+                _dense  = load_ground_points(config.MAST3R_SURFACE_POINTS_DENSE_FILE)
+            else:
+                _sparse = load_ground_points(config.SURFACE_POINTS_SPARSE_FILE)
+                _dense  = load_ground_points(config.SURFACE_POINTS_DENSE_FILE)
+            logger.info("Surface source for import: %s", "native" if _is_native else "ceres")
+            _surface = _build_surface(_sparse, _dense, config.SURFACE_SOURCE)
+        run_interactive(_frames, surface=_surface)
         return
 
     # Preview undistort only
@@ -582,6 +623,7 @@ def main() -> None:
     # Run the shared pipeline
     _use_manual = args.manual_fm_json is not None
     _want_mesh = args.export_mesh is not None or args.skip_ceres
+    _need_dense_surface = config.SURFACE_SOURCE in ("dense", "both")
     _export_mesh_dir = (
         args.export_mesh or os.path.join(config.OUTPUT_DIR, "debug")
         if _want_mesh else None
@@ -595,7 +637,7 @@ def main() -> None:
         run_matcher_only=args.run_matcher_only or args.skip_ceres,
         use_saved_qwen=args.use_saved_qwen,
         save_mast3r_images=args.save_mast3r_images,
-        keep_dense=_want_mesh,
+        keep_dense=_want_mesh or _need_dense_surface,
         export_raw_glb_dir=_export_mesh_dir,
     )
 
@@ -629,6 +671,25 @@ def main() -> None:
             export_mast3r_cameras(refine_result.mast3r_cameras_enu, _mast3r_path)
             print(f"MASt3R seed cameras written to: {_mast3r_path}")
 
+        # Terrain cloud(s) for surface-aware raycast, per config.SURFACE_SOURCE.
+        # Exported twice: Ceres-frame (pairs with solved_cameras.json) and
+        # MASt3R-native-frame (pairs with solved_camera_mast3r.json).
+        if config.SURFACE_SOURCE and refine_result is not None:
+            from pipeline.feature_matcher import surface_points_enu
+            from pipeline.solve_io        import export_ground_points
+
+            for _which, _sparse_path, _dense_path in (
+                ("ceres",  config.SURFACE_POINTS_SPARSE_FILE,        config.SURFACE_POINTS_DENSE_FILE),
+                ("native", config.MAST3R_SURFACE_POINTS_SPARSE_FILE, config.MAST3R_SURFACE_POINTS_DENSE_FILE),
+            ):
+                _sparse, _dense = surface_points_enu(refine_result, config.SURFACE_SOURCE, which=_which)
+                if _sparse is not None:
+                    export_ground_points(_sparse, _sparse_path)
+                    print(f"{_which.capitalize()} sparse ground points written to: {_sparse_path}")
+                if _dense is not None:
+                    export_ground_points(_dense, _dense_path)
+                    print(f"{_which.capitalize()} dense ground points written to: {_dense_path}")
+
         print("Copy these files locally and run:")
         print(f"  python raycast.py --frames_dir ./frames --import-solve {_path}\n")
         did_export = True
@@ -656,20 +717,43 @@ def main() -> None:
         else:
             print("Aligned scene NOT written — no Ceres/Sim(3) result available "
                   "(check the log above for an aborted solve).")
+
+        # MASt3R-native leveled scene: raw MASt3R reconstruction + seed cameras,
+        # leveled on MASt3R's own ground (the 3D view of solved_camera_mast3r.json).
+        if (refine_result is not None
+                and refine_result.mast3r_sim3 is not None
+                and refine_result.mast3r_result.dense):
+            from pipeline.mast3r_matcher import export_mast3r_native_leveled_glb
+            _native_path = os.path.join(_export_mesh_dir, "mast3r_native_leveled_scene.glb")
+            export_mast3r_native_leveled_glb(
+                refine_result.mast3r_result,
+                refine_result.mast3r_sim3,
+                frames,
+                _native_path,
+            )
+            print(f"MASt3R-native leveled scene written to: {_native_path}")
+
         print("Open either in Blender via File > Import > glTF 2.0.\n")
         did_export = True
 
     if did_export:
         return
 
+    # Build the terrain surface from this solve for surface-aware raycast.
+    _surface = None
+    if config.SURFACE_SOURCE and refine_result is not None:
+        from pipeline.feature_matcher import surface_points_enu
+        _sparse, _dense = surface_points_enu(refine_result, config.SURFACE_SOURCE)
+        _surface = _build_surface(_sparse, _dense, config.SURFACE_SOURCE)
+
     # Mode dispatch
     if args.batch:
         if not args.source_frame or not args.pick:
             print("Batch mode requires --source-frame and --pick.  See --help.")
             sys.exit(1)
-        run_batch(frames, args.source_frame, tuple(args.pick))
+        run_batch(frames, args.source_frame, tuple(args.pick), surface=_surface)
     else:
-        run_interactive(frames)
+        run_interactive(frames, surface=_surface)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

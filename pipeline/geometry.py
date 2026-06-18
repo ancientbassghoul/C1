@@ -166,6 +166,97 @@ def project_to_frame(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Reconstructed-terrain surface (replaces the flat Z=0 plane when available)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _voxel_downsample(pts: np.ndarray, leaf: float) -> np.ndarray:
+    """Average points within each `leaf`-sized voxel → one point per voxel."""
+    if leaf <= 0 or len(pts) == 0:
+        return pts
+    keys = np.floor(pts / leaf).astype(np.int64)
+    _, inv = np.unique(keys, axis=0, return_inverse=True)
+    n = int(inv.max()) + 1
+    sums = np.zeros((n, 3), dtype=np.float64)
+    cnt  = np.zeros(n, dtype=np.float64)
+    np.add.at(sums, inv, pts)
+    np.add.at(cnt, inv, 1.0)
+    return sums / cnt[:, None]
+
+
+def _statistical_outlier_removal(pts: np.ndarray, k: int, std_mult: float) -> np.ndarray:
+    """Drop points whose mean distance to k nearest neighbours is an outlier.
+
+    Removes isolated flying-pixel spikes; dense clusters (e.g. the van) survive.
+    """
+    if k <= 0 or len(pts) <= k:
+        return pts
+    from scipy.spatial import cKDTree
+    tree = cKDTree(pts)
+    d, _ = tree.query(pts, k=k + 1)      # column 0 is the point itself
+    mean_d = d[:, 1:].mean(axis=1)
+    thr = float(mean_d.mean() + std_mult * mean_d.std())
+    return pts[mean_d <= thr]
+
+
+class GroundSurface:
+    """A 2.5-D terrain height field h = f(E, N) for ray intersection.
+
+    Built from solved ENU points via scipy's LinearNDInterpolator (returns NaN
+    outside the points' convex hull). `intersect()` replaces the flat-plane hit
+    with the true reconstructed surface and falls back to the flat plane when
+    the ray exits the data or the iteration fails to converge.
+    """
+
+    def __init__(self, points_enu: np.ndarray, filter_outliers: bool = False):
+        from scipy.interpolate import LinearNDInterpolator
+
+        pts = np.asarray(points_enu, dtype=np.float64)
+        if filter_outliers and len(pts):
+            pts = _voxel_downsample(pts, float(config.SURFACE_VOXEL_M))
+            pts = _statistical_outlier_removal(
+                pts, int(config.SURFACE_OUTLIER_K), float(config.SURFACE_OUTLIER_STD)
+            )
+
+        self._interp = None
+        self.n_points = len(pts)
+        if self.n_points >= 3:
+            try:
+                self._interp = LinearNDInterpolator(pts[:, :2], pts[:, 2])
+            except Exception as e:   # qhull failure on degenerate input
+                logger.warning("GroundSurface build failed (%s) — flat fallback.", e)
+                self._interp = None
+        if self._interp is None:
+            logger.warning("GroundSurface has no usable interpolator (%d pts).", self.n_points)
+
+    def height(self, e: float, n: float) -> float:
+        """Terrain height at (E, N), or NaN outside the data hull."""
+        if self._interp is None:
+            return float("nan")
+        return float(self._interp(e, n))
+
+    def intersect(self, origin: np.ndarray, direction: np.ndarray) -> Optional[np.ndarray]:
+        """Intersect the ray with the terrain; flat-Z=0 fallback on failure."""
+        flat = intersect_ground_plane(origin, direction, z=config.GROUND_Z_M)
+        if self._interp is None or flat is None or abs(direction[2]) < 1e-6:
+            return flat
+
+        t = (config.GROUND_Z_M - origin[2]) / direction[2]    # seed = flat hit
+        for _ in range(int(config.SURFACE_RAYCAST_MAX_ITERS)):
+            p = origin + t * direction
+            h = self.height(p[0], p[1])
+            if not np.isfinite(h):
+                return flat                                   # ray left the data
+            t_new = (h - origin[2]) / direction[2]
+            if t_new < 0:
+                return flat
+            if abs(t_new - t) * np.linalg.norm(direction) < float(config.SURFACE_RAYCAST_TOL_M):
+                t = t_new
+                break
+            t = t_new
+        return origin + t * direction
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Convenience: full pipeline for one pick
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -174,6 +265,7 @@ def reproject_pick(
     py: float,
     source_frame,            # pipeline.frame.Frame
     target_frames: list,     # list[pipeline.frame.Frame]
+    surface: "GroundSurface | None" = None,
 ) -> dict:
     """
     Full re-projection pipeline for a single pixel pick.
@@ -201,13 +293,18 @@ def reproject_pick(
         *origin, *direction,
     )
 
-    # Step 2 – Intersect with ground plane.
-    world_pt = intersect_ground_plane(origin, direction, z=config.GROUND_Z_M)
+    # Step 2 – Intersect with the reconstructed terrain (or flat plane fallback).
+    if surface is not None:
+        world_pt = surface.intersect(origin, direction)
+    else:
+        world_pt = intersect_ground_plane(origin, direction, z=config.GROUND_Z_M)
     if world_pt is None:
-        logger.warning("Ray did not intersect the ground plane.")
+        logger.warning("Ray did not intersect the ground%s.",
+                       " surface" if surface is not None else " plane")
         return {}
 
-    logger.info("Ground intersection: [%.2f E, %.2f N, %.2f U] m", *world_pt)
+    logger.info("Ground intersection (%s): [%.2f E, %.2f N, %.2f U] m",
+                "surface" if surface is not None else "flat", *world_pt)
 
     # Step 3 – Project into each target frame
     results: dict = {}
