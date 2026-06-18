@@ -194,7 +194,7 @@ MAST3R_CONF_THRESHOLD = 1.5    # DEPRECATED as a dense-pixel gate — superseded
                                 # collapsing the reconstruction onto 2 frames. The gate is now
                                 # per-frame and percentile-based (see below) so each frame
                                 # contributes its own most-reliable pixels regardless of band.
-MAST3R_MAX_POINTS     = 3000   # max 3D points passed to Ceres (subsampled if more)
+MAST3R_MAX_POINTS     = 1200   # max 3D points passed to Ceres (subsampled if more)
 
 # Adaptive per-pixel confidence gating (replaces the brittle absolute
 # MAST3R_CONF_THRESHOLD comparison at the dense-extraction gate sites).
@@ -223,12 +223,32 @@ MAST3R_CONF_PERCENTILE = 60    # per-frame percentile → keep ~top 40% of each 
 # what this lets through at the pair level. Also used
 # by run_complete_graph()'s pairwise-match diagnostics for its `matching_ok` column, so the log
 # stays consistent with what the solve actually uses.
-MAST3R_MATCHING_CONF_THR = 1.0
+MAST3R_MATCHING_CONF_THR = 2.0
+
+# Force all frames to share one focal length during SGA instead of per-frame
+# independent focals.  Prevents the optimizer from using focal flex as a
+# shock absorber for noisy tracking links.
+MAST3R_SHARED_INTRINSICS = True
 
 # Reference-card size (metres) for the Sim(3)-aligned debug .glb export
 # (--export-mesh). This scene is in real ENU units, unlike the raw MASt3R
 # export (which auto-sizes itself off the scene's own arbitrary scale).
 MAST3R_GLB_CAM_SIZE_M = 1.0
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GROUND-PLANE LEVELING
+# ─────────────────────────────────────────────────────────────────────────────
+# The telemetry Sim(3) fits camera centres only; on a near-constant-altitude
+# arc those are nearly coplanar, so the recovered "up" axis is poorly
+# constrained and the scene comes out tilted. After Sim(3) we RANSAC-fit the
+# dominant ground plane to the solved sparse points and apply a corrective
+# rigid transform that levels it to GROUND_Z_M (keeps GPS scale + horizontal
+# alignment; fixes only tilt + Z offset).
+LEVEL_GROUND_PLANE            = True
+GROUND_RANSAC_ITERS           = 1000   # RANSAC sample iterations
+GROUND_RANSAC_THRESH_M        = 0.30   # inlier orthogonal distance to plane (m)
+GROUND_RANSAC_MIN_INLIER_FRAC = 0.30   # below this, no dominant plane → skip leveling
+GROUND_LEVEL_MAX_TILT_DEG     = 45.0   # reject implausibly large corrections (likely not ground)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ORIENTATION SOLVER

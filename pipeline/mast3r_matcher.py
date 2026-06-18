@@ -411,7 +411,7 @@ def _extract_pointcloud(
     observations: list[Observation] = []
     point_to_obs_count = [0] * len(all_pts)  # track per-point multi-view count
 
-    MATCH_DIST_3D_M  = 2.0    # metric tolerance for 3D geometric cross-frame validation
+    MATCH_DIST_PX = 5.0   # scale-invariant pixel-space backprojection threshold (native res)
 
     for pt_idx, (P, seed_stem, seed_px, seed_conf) in enumerate(
         zip(all_pts, all_stem, all_px, all_conf)
@@ -441,15 +441,24 @@ def _extract_pointcloud(
             if not mask_view[vi, ui]:
                 continue
 
-            # Validate via 3D geometric consistency of globally-aligned SGA pointmaps.
-            # Confidence check removed: gray HUD fill depresses confidence in HUD zones
-            # to near-zero even for the van, causing all cross-frame observations to be
-            # rejected when they project into those zones. 3D consistency is the correct
-            # gate — if SGA's pointmap at the projected pixel agrees with P in world-space
-            # it is a valid match regardless of confidence.  The stored confidence value
-            # is still used by Ceres for weighting, so low-conf observations get low weight.
+            # Scale-invariant gate: project P_view back into the SOURCE frame and
+            # check it lands near the seed pixel.  The old 3D-distance gate ran in
+            # MASt3R's compressed coordinate space; with Sim(3) scale ~18.8x it was
+            # equivalent to ~37 real metres, accepting almost every track including
+            # franken-tracks (van in frame A paired with ground in frame B).
+            # Backprojecting into the source frame works in pixels and is scale-invariant.
+            # Confidence is still stored on the observation for Ceres weighting.
             P_view = pts_view[vi, ui]
-            if np.linalg.norm(P_view - P) > MATCH_DIST_3D_M:
+            src_w2c = cam_poses.get(seed_stem)
+            if src_w2c is None:
+                continue
+            p_view_src = src_w2c[:3, :3] @ P_view + src_w2c[:3, 3]
+            if p_view_src[2] <= 0:
+                continue
+            K_src = view_data[seed_stem][5]   # K_native for source frame
+            u_back = K_src[0, 0] * p_view_src[0] / p_view_src[2] + K_src[0, 2]
+            v_back = K_src[1, 1] * p_view_src[1] / p_view_src[2] + K_src[1, 2]
+            if (u_back - seed_px[0]) ** 2 + (v_back - seed_px[1]) ** 2 > MATCH_DIST_PX ** 2:
                 continue
 
             # Pixel coordinate to store — in K_undist's full-resolution space,
@@ -774,8 +783,10 @@ def run_complete_graph(
         except Exception as e:
             logger.warning("Pairwise match diagnostics failed (continuing): %s", e)
 
-        logger.info("Running sparse global alignment (matching_conf_thr=%.1f) …",
-                    config.MAST3R_MATCHING_CONF_THR)
+        logger.info(
+            "Running sparse global alignment (matching_conf_thr=%.1f, shared_intrinsics=%s) …",
+            config.MAST3R_MATCHING_CONF_THR, config.MAST3R_SHARED_INTRINSICS,
+        )
         scene = sparse_global_alignment(
             filelist,
             pairs,
@@ -784,6 +795,14 @@ def run_complete_graph(
             device=device,
             verbose=True,
             matching_conf_thr=config.MAST3R_MATCHING_CONF_THR,
+            shared_intrinsics=config.MAST3R_SHARED_INTRINSICS,
+        )
+
+        _focals = scene.get_focals().detach().cpu().numpy()
+        logger.info(
+            "MASt3R SGA focals (native 512px space): min=%.1f  max=%.1f  "
+            "[calibrated expected ≈156 px = 391.15 × (512/1280)]",
+            float(_focals.min()), float(_focals.max()),
         )
 
         if export_raw_glb_dir is not None:

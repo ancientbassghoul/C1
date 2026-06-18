@@ -158,6 +158,12 @@ def parse_args() -> argparse.Namespace:
              "running MASt3R or Ceres.",
     )
     p.add_argument(
+        "--skip-ceres", action="store_true", dest="skip_ceres",
+        help="Run steps 1–6 through MASt3R then exit: saves auto_matches.json and "
+             "mast3r_raw_scene.glb (to output/debug/ or the dir given by --export-mesh). "
+             "Skips the Ceres solve and does not open the GUI.",
+    )
+    p.add_argument(
         "--export-mesh", nargs="?", const="", default=None,
         dest="export_mesh", metavar="DIR",
         help="After the solve, write two debug .glb scenes to DIR (default: "
@@ -575,9 +581,10 @@ def main() -> None:
 
     # Run the shared pipeline
     _use_manual = args.manual_fm_json is not None
+    _want_mesh = args.export_mesh is not None or args.skip_ceres
     _export_mesh_dir = (
         args.export_mesh or os.path.join(config.OUTPUT_DIR, "debug")
-        if args.export_mesh is not None else None
+        if _want_mesh else None
     )
     frames, refine_result = run_pipeline(
         args.frames_dir,
@@ -585,10 +592,10 @@ def main() -> None:
         height_mode=args.height,
         cameras_init_from_config=args.cameras_init_from_config,
         use_manual_features=_use_manual,
-        run_matcher_only=args.run_matcher_only,
+        run_matcher_only=args.run_matcher_only or args.skip_ceres,
         use_saved_qwen=args.use_saved_qwen,
         save_mast3r_images=args.save_mast3r_images,
-        keep_dense=args.export_mesh is not None,
+        keep_dense=_want_mesh,
         export_raw_glb_dir=_export_mesh_dir,
     )
 
@@ -597,13 +604,12 @@ def main() -> None:
         camera_deltas_cmd(frames)
         return
 
-    # Matcher-only: auto_matches.json (and the raw .glb, if --export-mesh was
-    # also given — it's written inside run_complete_graph before Ceres runs)
-    # already written inside run_pipeline.
-    if args.run_matcher_only:
+    # Matcher-only / skip-ceres: auto_matches.json (and the raw .glb) already
+    # written inside run_pipeline / run_complete_graph before Ceres would run.
+    if args.run_matcher_only or args.skip_ceres:
         print(f"\nDone.  Matches saved to: {config.AUTO_MATCHES_FILE}")
         print("Run --show-scores to inspect them.\n")
-        if args.export_mesh is not None:
+        if _export_mesh_dir is not None:
             print(f"Raw MASt3R scene written to: "
                   f"{os.path.join(_export_mesh_dir, 'mast3r_raw_scene.glb')}\n")
         return

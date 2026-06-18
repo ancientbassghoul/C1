@@ -522,6 +522,167 @@ def align_to_telemetry_sim3(
     return scale, R_sim, t_sim
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Ground-plane leveling
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ransac_plane(
+    pts: np.ndarray,
+    thresh: float,
+    iters: int,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    RANSAC-fit the dominant plane in a point cloud.
+
+    Returns (normal, centroid, inlier_mask):
+      normal      : (3,) unit plane normal (refit to the best consensus set).
+      centroid    : (3,) mean of the inlier points (a point on the plane).
+      inlier_mask : (N,) bool mask of inliers within `thresh` of the plane.
+    """
+    n = len(pts)
+    best_mask = np.zeros(n, dtype=bool)
+    best_count = 0
+
+    for _ in range(iters):
+        idx = rng.choice(n, size=3, replace=False)
+        p1, p2, p3 = pts[idx]
+        nrm = np.cross(p2 - p1, p3 - p1)
+        nn = np.linalg.norm(nrm)
+        if nn < 1e-9:                      # degenerate (collinear) sample
+            continue
+        nrm = nrm / nn
+        dist = np.abs((pts - p1) @ nrm)
+        mask = dist < thresh
+        count = int(mask.sum())
+        if count > best_count:
+            best_count = count
+            best_mask = mask
+
+    if best_count < 3:
+        # No consensus — fall back to a total-least-squares fit over everything.
+        best_mask = np.ones(n, dtype=bool)
+
+    inliers = pts[best_mask]
+    centroid = inliers.mean(axis=0)
+    # Refit: smallest singular vector of the mean-centred inliers is the normal.
+    _, _, Vt = np.linalg.svd(inliers - centroid)
+    normal = Vt[-1]
+    normal = normal / np.linalg.norm(normal)
+    return normal, centroid, best_mask
+
+
+def _rotation_aligning(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Minimal rotation matrix R such that R @ a == b (a, b unit vectors)."""
+    a = a / np.linalg.norm(a)
+    b = b / np.linalg.norm(b)
+    v = np.cross(a, b)
+    c = float(np.dot(a, b))
+    s = float(np.linalg.norm(v))
+    if s < 1e-9:
+        # Parallel or antiparallel.
+        if c > 0:
+            return np.eye(3)
+        # Antiparallel: 180° about any axis orthogonal to a.
+        ortho = np.array([1.0, 0.0, 0.0])
+        if abs(a[0]) > 0.9:
+            ortho = np.array([0.0, 1.0, 0.0])
+        axis = np.cross(a, ortho)
+        axis = axis / np.linalg.norm(axis)
+        return Rotation.from_rotvec(np.pi * axis).as_matrix()
+    vx = np.array([[0, -v[2], v[1]],
+                   [v[2], 0, -v[0]],
+                   [-v[1], v[0], 0]])
+    return np.eye(3) + vx + vx @ vx * ((1 - c) / (s * s))
+
+
+def level_ground_plane(
+    frames,
+    points_3d_solved: np.ndarray,
+    sim3: tuple[float, np.ndarray, np.ndarray],
+) -> tuple[float, np.ndarray, np.ndarray]:
+    """
+    Correct the residual scene tilt left by the camera-centre Sim(3) fit.
+
+    The telemetry Sim(3) fits camera centres only; on a near-constant-altitude
+    arc those are nearly coplanar, so its vertical axis is poorly constrained
+    and the ground comes out tilted. Here we RANSAC-fit the dominant ground
+    plane to the Ceres-refined sparse points (mapped into ENU via `sim3`),
+    then apply a corrective rigid transform that rotates the plane normal to
+    +Z and shifts it to config.GROUND_Z_M.
+
+    Keeps the GPS-derived scale and horizontal alignment: the correction is a
+    rotation about a horizontal axis (heading preserved) plus a Z shift.
+
+    Mutates each frame's R / position_enu in place and returns the COMPOSED
+    Sim(3) (level ∘ sim3) so downstream artifacts (debug .glb, MASt3R-ENU
+    cameras) stay consistent.  On any guard failure the scene is left untouched
+    and the original `sim3` is returned.
+    """
+    scale, R_sim, t_sim = sim3
+
+    pts = np.asarray(points_3d_solved, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[0] < 3:
+        logger.warning("Ground leveling skipped — too few solved points (%d).", len(pts))
+        return sim3
+
+    # Map MASt3R-frame points into the current ENU frame.
+    pts_enu = scale * (pts @ R_sim.T) + t_sim
+
+    rng = np.random.default_rng(0)   # deterministic
+    normal, centroid, inlier_mask = _ransac_plane(
+        pts_enu,
+        thresh=float(config.GROUND_RANSAC_THRESH_M),
+        iters=int(config.GROUND_RANSAC_ITERS),
+        rng=rng,
+    )
+
+    inlier_frac = float(inlier_mask.mean())
+    if inlier_frac < float(config.GROUND_RANSAC_MIN_INLIER_FRAC):
+        logger.warning(
+            "Ground leveling skipped — no dominant plane (inlier frac %.2f < %.2f).",
+            inlier_frac, config.GROUND_RANSAC_MIN_INLIER_FRAC,
+        )
+        return sim3
+
+    # Orient the normal "up" so the corrective rotation is the minimal one.
+    if normal[2] < 0:
+        normal = -normal
+
+    tilt_deg = math.degrees(math.acos(np.clip(normal[2], -1.0, 1.0)))
+    if tilt_deg > float(config.GROUND_LEVEL_MAX_TILT_DEG):
+        logger.warning(
+            "Ground leveling skipped — correction tilt %.1f° exceeds max %.1f° "
+            "(RANSAC likely locked onto the van or a spike fan, not the ground).",
+            tilt_deg, config.GROUND_LEVEL_MAX_TILT_DEG,
+        )
+        return sim3
+
+    # Rotation taking the ground normal to +Z, pivoting about the inlier
+    # centroid, then a Z shift so the plane sits at GROUND_Z_M.
+    z_axis  = np.array([0.0, 0.0, 1.0])
+    R_level = _rotation_aligning(normal, z_axis)
+    z_shift = np.array([0.0, 0.0, centroid[2] - float(config.GROUND_Z_M)])
+    b       = centroid - R_level @ centroid - z_shift
+
+    logger.info(
+        "Ground leveling: %d/%d inliers (%.0f%%), tilt corrected %.2f°, "
+        "ground z %.2f → %.2f m.",
+        int(inlier_mask.sum()), len(pts_enu), 100.0 * inlier_frac,
+        tilt_deg, float(centroid[2]), float(config.GROUND_Z_M),
+    )
+
+    # Apply level ∘ (existing ENU pose) to every frame.
+    for f in frames:
+        if f.position_enu is None or f.R is None:
+            continue
+        f.position_enu = R_level @ f.position_enu + b
+        _apply_rotation_to_frame(f, f.R @ R_level.T)
+
+    # Composed Sim(3): x ↦ R_level @ (s·R_sim·x + t_sim) + b
+    return scale, R_level @ R_sim, R_level @ t_sim + b
+
+
 def decompose_R_wc(R_wc: np.ndarray) -> tuple[float, float, float] | None:
     """
     Decompose a world-to-camera rotation matrix (in ENU frame) into

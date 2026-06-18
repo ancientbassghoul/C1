@@ -353,7 +353,13 @@ def refine_pitches(
     logger.info("Aligning solved poses to GPS/ENU via Umeyama Sim(3) …")
     sim3 = align_to_telemetry_sim3(ready, cam_params_solved, anchor_result=anchor_result)
 
-    # Build MASt3R-before-Ceres cameras in ENU using the same Sim(3).
+    # ── Step 6b: Level the ground plane (corrects the tilt the near-coplanar
+    # camera-centre Sim(3) leaves underconstrained) ──────────────────────────
+    if config.LEVEL_GROUND_PLANE and sim3 is not None:
+        from pipeline.orientation_solver import level_ground_plane
+        sim3 = level_ground_plane(ready, points_3d_solved, sim3)
+
+    # Build MASt3R-before-Ceres cameras in ENU using the same (composed) Sim(3).
     mast3r_cams_enu = _build_mast3r_cameras_enu(ready, mast3r_result.camera_poses, sim3)
     if mast3r_cams_enu:
         logger.info("MASt3R seed cameras converted to ENU (%d frames).", len(mast3r_cams_enu))
