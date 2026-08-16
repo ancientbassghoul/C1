@@ -148,7 +148,7 @@ def undistort_frame(
     logger.debug("[%s] undistorted OK", frame.stem)
 
 
-def undistort_all(frames: list[Frame]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def undistort_all(frames: list[Frame], *, mask_hud: bool = True) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Undistort every frame in *frames* using a single shared K / D / K_new.
 
@@ -156,6 +156,10 @@ def undistort_all(frames: list[Frame]) -> tuple[np.ndarray, np.ndarray, np.ndarr
     cv2.remap's bilinear interpolation never samples HUD pixels into
     scene content.  OCR and bracket-roll detection must already have run
     on frame.raw before this function is called.
+
+    mask_hud=False skips the HUD mask entirely (e.g. for the manual
+    correspondence picker, where the feathered-gray fill only gets in the way
+    of clicking real features and there's no MASt3R/Qwen pass to protect).
 
     Returns (K, D, K_new) so callers can reuse them for point operations.
     """
@@ -169,7 +173,8 @@ def undistort_all(frames: list[Frame]) -> tuple[np.ndarray, np.ndarray, np.ndarr
     )
     for i, frame in enumerate(frames):
         logger.info("  Undistorting %d/%d: %s", i + 1, len(frames), frame.stem)
-        _apply_hud_mask_raw(frame)       # mask raw FIRST
+        if mask_hud:
+            _apply_hud_mask_raw(frame)   # mask raw FIRST
         undistort_frame(frame, K, D, K_new)
 
     return K, D, K_new

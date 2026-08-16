@@ -209,6 +209,13 @@ CLIP_MODEL  = "openai/clip-vit-large-patch14"
 CLIP_ANCHOR_THRESHOLD  = 0.20
 CLIP_ANCHOR_MIN_WEIGHT = 0.10
 
+# Manual-correspondence score coloring (--show-scores): real CLIP crop-similarity
+# scores on this dataset cluster tightly high (observed ~0.76-0.91) rather than
+# spanning 0-1, so the red->blue marker map is stretched across this narrower
+# window instead of the raw score, to actually spread markers across the palette.
+SCORE_COLOR_MIN = 0.65
+SCORE_COLOR_MAX = 1.00
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MAST3R-SFM
 # ─────────────────────────────────────────────────────────────────────────────

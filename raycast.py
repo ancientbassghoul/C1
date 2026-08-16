@@ -490,8 +490,8 @@ def manual_correspondences_cmd(frames_dir: str) -> None:
 
     logger.info("Loading frames from %s", frames_dir)
     frames = load_frames(frames_dir)
-    logger.info("Undistorting %d frame(s)...", len(frames))
-    undistort_all(frames)
+    logger.info("Undistorting %d frame(s) (HUD mask skipped for manual picking)...", len(frames))
+    undistort_all(frames, mask_hud=False)
 
     json_path = Path(config.MANUAL_CORRESPONDENCES_FILE)
     logger.info("Opening correspondence picker.  JSON: %s", json_path)
@@ -517,8 +517,8 @@ def show_scores_cmd(frames_dir: str, json_path: str,
 
     logger.info("Loading frames from %s", frames_dir)
     frames = load_frames(frames_dir)
-    logger.info("Undistorting %d frame(s)...", len(frames))
-    undistort_all(frames)
+    logger.info("Undistorting %d frame(s) (HUD mask skipped for manual picking)...", len(frames))
+    undistort_all(frames, mask_hud=False)
 
     path = Path(json_path)
     if not path.exists():

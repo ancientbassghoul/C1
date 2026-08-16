@@ -76,8 +76,17 @@ _C_TEXT         = (210, 210, 210)
 _C_DIVIDER      = ( 55,  55,  55)
 
 def _score_to_bgr(score: float) -> tuple[int, int, int]:
-    """Map score 0→1 to BGR colour: red → yellow → green → cyan → blue."""
-    h = int(score * 120)   # OpenCV hue 0=red, 60=green, 120=blue
+    """Map score to BGR colour: red → yellow → green → cyan → blue.
+
+    Real CLIP scores on this dataset cluster tightly in a high band rather
+    than spanning 0-1, so score is first rescaled from
+    [config.SCORE_COLOR_MIN, config.SCORE_COLOR_MAX] to [0, 1] before mapping
+    to hue -- otherwise nearly everything lands in the blue end of the wheel.
+    """
+    lo, hi = config.SCORE_COLOR_MIN, config.SCORE_COLOR_MAX
+    norm = (score - lo) / (hi - lo) if hi > lo else 0.0
+    norm = max(0.0, min(1.0, norm))
+    h = int(norm * 120)   # OpenCV hue 0=red, 60=green, 120=blue
     hsv = np.array([[[h, 255, 210]]], dtype=np.uint8)
     bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
     return (int(bgr[0, 0, 0]), int(bgr[0, 0, 1]), int(bgr[0, 0, 2]))
