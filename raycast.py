@@ -82,12 +82,6 @@ def parse_args() -> argparse.Namespace:
         help="Skip MASt3R + Ceres refinement (use config overrides only).",
     )
     p.add_argument(
-        "--cameras-init-from-config", action="store_true",
-        dest="cameras_init_from_config",
-        help="Seed camera poses from CAMERA_POSE_OVERRIDES in config.py before "
-             "running the orientation solver.",
-    )
-    p.add_argument(
         "--preview-anchor", action="store_true", dest="preview_anchor",
         help="Run Qwen VL + CLIP anchor detection, save annotated images showing "
              "detected anchor bboxes and CLIP weights per frame to "
@@ -186,7 +180,6 @@ def run_pipeline(
     frames_dir: str,
     no_refine: bool = False,
     height_mode: str = "tor",
-    cameras_init_from_config: bool = False,
     use_manual_features: bool = False,
     run_matcher_only: bool = False,
     use_saved_qwen: bool = False,
@@ -277,7 +270,6 @@ def run_pipeline(
         refine_result = refine_pitches(
             frames,
             anchor_result=anchor_result,
-            cameras_init_from_config=cameras_init_from_config,
             use_manual_features=use_manual_features,
             matcher_only=run_matcher_only,
             save_mast3r_images=save_mast3r_images,
@@ -632,7 +624,6 @@ def main() -> None:
         args.frames_dir,
         no_refine=args.no_refine,
         height_mode=args.height,
-        cameras_init_from_config=args.cameras_init_from_config,
         use_manual_features=_use_manual,
         run_matcher_only=args.run_matcher_only or args.skip_ceres,
         use_saved_qwen=args.use_saved_qwen,

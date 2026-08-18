@@ -84,14 +84,21 @@ OUTPUT_DIR = "./output"
 # Fixed ground plane height in the shared ENU coordinate frame (metres).
 GROUND_Z_M = 0.0
 
-# Path where the manual correspondence picker saves / loads its JSON file.
-MANUAL_CORRESPONDENCES_FILE = "./output/manual_correspondences.json"
-
 # Path where MASt3R automatic matches are saved after --run-matcher-only.
 AUTO_MATCHES_FILE = "./output/auto_matches.json"
 
 # Path where the Qwen/CLIP anchor detection result is cached.
 ANCHOR_CACHE_FILE = "./output/anchor_cache.json"
+
+# Path where the manual correspondence picker saves / loads its JSON file.
+MANUAL_CORRESPONDENCES_FILE = "./output/manual_correspondences.json"
+
+# Manual-correspondence score coloring (--show-scores): real CLIP crop-similarity
+# scores on this dataset cluster tightly high (observed ~0.76-0.91) rather than
+# spanning 0-1, so the red->blue marker map is stretched across this narrower
+# window instead of the raw score, to actually spread markers across the palette.
+SCORE_COLOR_MIN = 0.65
+SCORE_COLOR_MAX = 1.00
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SURFACE-AWARE RAYCAST
@@ -208,13 +215,6 @@ CLIP_MODEL  = "openai/clip-vit-large-patch14"
 # w <  CLIP_ANCHOR_MIN_WEIGHT → frame's AnchorRayCost skipped entirely.
 CLIP_ANCHOR_THRESHOLD  = 0.20
 CLIP_ANCHOR_MIN_WEIGHT = 0.10
-
-# Manual-correspondence score coloring (--show-scores): real CLIP crop-similarity
-# scores on this dataset cluster tightly high (observed ~0.76-0.91) rather than
-# spanning 0-1, so the red->blue marker map is stretched across this narrower
-# window instead of the raw score, to actually spread markers across the palette.
-SCORE_COLOR_MIN = 0.65
-SCORE_COLOR_MAX = 1.00
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAST3R-SFM
@@ -361,32 +361,3 @@ BANNER_MIN_ASPECT_RATIO  = 3.0  # width/height; real banner ≈11:1, false posit
 # crosshair/bracket HUD cluster (which sits AT the centre, offset ≈0) for the banner.
 # Reject anything whose vertical centre isn't clearly below the centre cluster.
 BANNER_MIN_Y_OFFSET_FROM_CENTER_PX = 60
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CAMERA POSE OVERRIDES
-# ─────────────────────────────────────────────────────────────────────────────
-# Manually calibrated camera poses (e.g. from Blender adjustment).
-# Used when --cameras-init-from-config is passed to raycast.py or
-# export_blender.py.  Key = last 5 digits of the frame filename stem.
-# Values:  x, y, z     – ENU position in metres
-#          heading      – compass bearing in degrees (0=N, 90=E, clockwise)
-#          pitch        – degrees, negative = looking down
-#          roll         – degrees, positive = roll right
-#
-# Leave empty ({}) to use MASt3R-SfM camera poses for all frames.
-CAMERA_POSE_OVERRIDES: dict[str, dict] = {
-    '04681': {'x':    0.000, 'y':    0.000, 'z':    4.100,
-              'heading':  145.40, 'pitch':    1.98, 'roll':    7.87},
-    '04709': {'x':    8.225, 'y':   -9.110, 'z':    4.700,
-              'heading':  152.00, 'pitch':   -0.05, 'roll':   16.41},
-    '04752': {'x':   20.634, 'y':  -18.583, 'z':    6.717,
-              'heading':  207.00, 'pitch':   -4.17, 'roll':   16.93},
-    '07849': {'x':   23.477, 'y':   24.828, 'z':   13.600,
-              'heading':  181.00, 'pitch':   -2.67, 'roll':    1.34},
-    '10474': {'x':   22.043, 'y':   18.952, 'z':   14.500,
-              'heading':  176.00, 'pitch':    1.50, 'roll':   -0.53},
-    '10671': {'x':   25.897, 'y':   12.343, 'z':   14.800,
-              'heading':  236.00, 'pitch':   -1.93, 'roll':    0.34},
-    '12035': {'x':   28.989, 'y':  -18.239, 'z':   21.300,
-              'heading':  226.40, 'pitch':  -30.79, 'roll':   -3.03},
-}

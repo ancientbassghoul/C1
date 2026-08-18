@@ -104,7 +104,7 @@ Interactive viewer controls: click = pick pixel | scroll = zoom | mid-drag = pan
 
 ### Central config
 
-**`config.py`** is the single source of truth for every tunable parameter: camera intrinsics, OCR crop windows, solver bounds, van geometry, HUD mask regions, Qwen/CLIP thresholds, MASt3R settings, and per-frame overrides (`GIMBAL_PITCH_OVERRIDES`, `CAMERA_ROLL_OVERRIDES`, `CAMERA_POSE_OVERRIDES`).
+**`config.py`** is the single source of truth for every tunable parameter: camera intrinsics, OCR crop windows, solver bounds, van geometry, HUD mask regions, Qwen/CLIP thresholds, MASt3R settings, and per-frame overrides (`GIMBAL_PITCH_OVERRIDES`, `CAMERA_ROLL_OVERRIDES`).
 
 When behaviour seems wrong, start with `config.py`. Van feature z-plane values are **baked into the manual correspondences JSON at save time** — if you change `VAN_HEIGHT_M` or similar constants, re-open `--manual-correspondences` and press `s` to regenerate.
 

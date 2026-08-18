@@ -21,7 +21,6 @@ from pathlib import Path
 import numpy as np
 
 from pipeline.frame import Frame
-from pipeline.pose import build_rotation
 import config
 
 logger = logging.getLogger(__name__)
@@ -101,32 +100,6 @@ def surface_points_enu(
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _apply_pose_overrides(frames: list[Frame]) -> int:
-    """Apply config.CAMERA_POSE_OVERRIDES to matching frames in-place."""
-    overrides = config.CAMERA_POSE_OVERRIDES
-    if not overrides:
-        return 0
-    updated = 0
-    for f in frames:
-        frame_num = f.stem[-5:]
-        if frame_num not in overrides:
-            continue
-        ov = overrides[frame_num]
-        f.position_enu     = np.array([ov['x'], ov['y'], ov['z']])
-        f.heading_deg      = ov['heading']
-        f.gimbal_pitch_deg = ov['pitch']
-        f.camera_roll_deg  = ov['roll']
-        f.R = build_rotation(f.heading_deg, f.gimbal_pitch_deg, f.camera_roll_deg)
-        logger.info(
-            "[%s] Pose from config override: pos=(%.2f, %.2f, %.2f)m  "
-            "hdg=%.1f°  pitch=%.1f°  roll=%.1f°",
-            f.stem, ov['x'], ov['y'], ov['z'],
-            ov['heading'], ov['pitch'], ov['roll'],
-        )
-        updated += 1
-    return updated
-
 
 def _load_manual_features(frames: list[Frame]) -> list[dict]:
     """
@@ -305,7 +278,6 @@ def _init_p_anchor(
 def refine_pitches(
     frames: list[Frame],
     anchor_result=None,
-    cameras_init_from_config: bool = False,
     use_manual_features: bool = False,
     matcher_only: bool = False,
     save_mast3r_images: str | None = None,
@@ -317,20 +289,18 @@ def refine_pitches(
 
     Steps
     -----
-    1. (Optional) Apply config.CAMERA_POSE_OVERRIDES.
-    2. Run MASt3R-SfM complete-graph on all eligible frames.
-    3. Build CLIP-weighted anchor rays from anchor_result.
-    4. Initialize P_anchor from MASt3R point cloud projected into anchor bboxes.
-    5. (Optional) Load manual correspondences as additional Ceres residuals.
-    6. Single Ceres full-BA solve (MASt3RReprojCost + AnchorRayCost + manual).
-    7. Umeyama Sim(3): map solved MASt3R frame → GPS/ENU.
+    1. Run MASt3R-SfM complete-graph on all eligible frames.
+    2. Build CLIP-weighted anchor rays from anchor_result.
+    3. Initialize P_anchor from MASt3R point cloud projected into anchor bboxes.
+    4. (Optional) Load manual correspondences as additional Ceres residuals.
+    5. Single Ceres full-BA solve (MASt3RReprojCost + AnchorRayCost + manual).
+    6. Umeyama Sim(3): map solved MASt3R frame → GPS/ENU.
 
     Parameters
     ----------
     frames              : all loaded frames.
     anchor_result       : AnchorResult from detect_anchor() (Qwen + CLIP).
                           If None, anchor rays are omitted.
-    cameras_init_from_config : apply CAMERA_POSE_OVERRIDES before solving.
     use_manual_features : load and inject MANUAL_CORRESPONDENCES_FILE.
     matcher_only        : run MASt3R only, save auto_matches.json, then return.
     keep_dense          : passed through to run_complete_graph — retain dense
@@ -344,11 +314,6 @@ def refine_pitches(
     optional debug export (--export-mesh). None on any early abort (too few
     frames, MASt3R failure, or --run-matcher-only).
     """
-    # ── Apply manual pose overrides ───────────────────────────────────────────
-    if cameras_init_from_config:
-        n = _apply_pose_overrides(frames)
-        logger.info("Applied config pose overrides to %d frame(s).", n)
-
     # ── Eligible frames ───────────────────────────────────────────────────────
     ready = [
         f for f in frames

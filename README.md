@@ -43,7 +43,6 @@ venv\Scripts\python export_blender.py --frames_dir ./frames --out_dir ./blender_
 | `--show-scores [PATH]` | — | Score correspondences and open the viewer coloured red→blue by quality. Without `--manual-correspondences`: scores `AUTO_MATCHES_FILE`. With `--manual-correspondences`: scores `MANUAL_CORRESPONDENCES_FILE`. Optional PATH overrides either default. |
 | `--camera-deltas` | off | After solving, print a two-table report comparing final solved camera state to raw telemetry: position ΔEast/ΔNorth/Z and orientation Δyaw/pitch/roll. |
 | `--no-refine` | off | Skip automatic pitch/orientation refinement entirely. Uses config overrides only (`GIMBAL_PITCH_OVERRIDES`, `CAMERA_ROLL_OVERRIDES`). |
-| `--cameras-init-from-config` | off | Seed camera poses from `CAMERA_POSE_OVERRIDES` in config.py before running the orientation solver. Bypasses GPS + GeoCalib for overridden frames. |
 | `--enhance` | off | Enable CLAHE + unsharp preprocessing before LightGlue feature matching. |
 | `--feature-matcher-debug` | off | Open the **interactive feature matcher debug viewer** — a GUI showing SuperPoint keypoints per frame, coloured by ground mask, with click-to-trace matching. Skips pose estimation, van detection, and Ceres (load + undistort only). See *Feature matching inspection* below. |
 | `--preview-undistort` | off | Show each undistorted frame one by one, then exit. Tune `FOCAL_LENGTH` and `FISHEYE_K*` in `config.py`. |
@@ -409,9 +408,6 @@ venv\Scripts\python raycast.py --frames_dir ./frames --manual-fm-json
 
 :: Use a specific file
 venv\Scripts\python raycast.py --frames_dir ./frames --manual-fm-json path\to\corr.json
-
-:: Combine with config-seeded camera poses
-venv\Scripts\python raycast.py --frames_dir ./frames --manual-fm-json --cameras-init-from-config
 ```
 
 This runs the full pipeline (OCR, undistort, pose, van detection) then feeds your manual correspondences directly to the Ceres solver, bypassing GroundedSAM and LightGlue entirely. Each correspondence with N frames contributes N*(N-1)/2 pairwise constraints. Van feature constraints (wheel_axis, roof_edge, roof_plane) from the same JSON are also included.
