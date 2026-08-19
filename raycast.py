@@ -581,7 +581,7 @@ def main() -> None:
         from pipeline.undistort import undistort_all
         from pipeline.solve_io  import import_solve, load_ground_points
         _frames = load_frames(args.frames_dir)
-        undistort_all(_frames)
+        undistort_all(_frames, mask_hud=False)
         _path = args.import_solve or os.path.join(config.OUTPUT_DIR, "solved_cameras.json")
         n = import_solve(_frames, _path)
         logger.info("Imported solve for %d frame(s) from %s", n, _path)
