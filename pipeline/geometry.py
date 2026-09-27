@@ -260,6 +260,37 @@ class GroundSurface:
 # Convenience: full pipeline for one pick
 # ─────────────────────────────────────────────────────────────────────────────
 
+def pixel_to_ground(
+    px: float,
+    py: float,
+    frame,                   # pipeline.frame.Frame
+    surface: "GroundSurface | None" = None,
+) -> Optional[np.ndarray]:
+    """Cast pixel (px, py) of *frame* onto the terrain (or flat plane).
+
+    Returns the (3,) ENU ground point, or None if the ray misses.
+    """
+    origin, direction = unproject_pixel(
+        px, py, frame.K_undist, frame.R, frame.position_enu,
+    )
+    logger.info(
+        "Ray from [%s] pixel (%.1f, %.1f): origin=[%.2f, %.2f, %.2f]  "
+        "dir=[%.4f, %.4f, %.4f]",
+        frame.stem, px, py, *origin, *direction,
+    )
+    if surface is not None:
+        return surface.intersect(origin, direction)
+    return intersect_ground_plane(origin, direction, z=config.GROUND_Z_M)
+
+
+def ground_sample_distance(world_pt: np.ndarray, frame) -> Optional[float]:
+    """Metres per pixel at *world_pt* as seen by *frame* (depth / fx)."""
+    depth = float((frame.R @ (world_pt - frame.position_enu))[2])
+    if depth <= 0:
+        return None
+    return depth / float(frame.K_undist[0, 0])
+
+
 def reproject_pick(
     px: float,
     py: float,
@@ -279,25 +310,8 @@ def reproject_pick(
         logger.error("[%s] Source frame not ready for ray-casting.", source_frame.stem)
         return {}
 
-    # Step 1 – Unproject to world ray
-    origin, direction = unproject_pixel(
-        px, py,
-        source_frame.K_undist,
-        source_frame.R,
-        source_frame.position_enu,
-    )
-    logger.info(
-        "Ray from [%s] pixel (%.1f, %.1f): origin=[%.2f, %.2f, %.2f]  "
-        "dir=[%.4f, %.4f, %.4f]",
-        source_frame.stem, px, py,
-        *origin, *direction,
-    )
-
-    # Step 2 – Intersect with the reconstructed terrain (or flat plane fallback).
-    if surface is not None:
-        world_pt = surface.intersect(origin, direction)
-    else:
-        world_pt = intersect_ground_plane(origin, direction, z=config.GROUND_Z_M)
+    # Steps 1–2 – Unproject to world ray, intersect terrain (or flat plane)
+    world_pt = pixel_to_ground(px, py, source_frame, surface)
     if world_pt is None:
         logger.warning("Ray did not intersect the ground%s.",
                        " surface" if surface is not None else " plane")

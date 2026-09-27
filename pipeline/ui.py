@@ -32,6 +32,17 @@ A pick is written to score.csv (one row per target frame) only if it has at
 least one truth click; otherwise it is discarded.  Frames left unclicked are
 logged as 'skipped', so unjudgeable (blurry) frames show up as missing
 coverage rather than as error.
+
+Three error measures are recorded side by side:
+  err_px      – image pixels.  Not comparable across frames: a far, zoomed-out
+                frame shows the same miss as far fewer pixels.
+  err_m_view  – err_px × gsd (metres per pixel at the point's depth): the miss
+                in metres, measured facing the camera.  Removes the zoom /
+                distance effect.
+  err_m       – ground distance: the truth click is cast through the target
+                camera onto the terrain and compared with the pick's ground
+                point.  At shallow view angles this is stretched by
+                ~1 / sin(view_elev_deg) along the line of sight.
 """
 
 from __future__ import annotations
@@ -46,7 +57,9 @@ import cv2
 import numpy as np
 
 from pipeline.frame import Frame
-from pipeline.geometry import reproject_pick
+from pipeline.geometry import reproject_pick, pixel_to_ground
+from pipeline.scoring import (_SCORE_TARGET_PX, _fmt, _fmt_metric, _metric_error,
+                              _stats_block)
 import config
 
 logger = logging.getLogger(__name__)
@@ -63,12 +76,11 @@ _MARKER_R_MAX     = 60
 _DOT_FRAC         = 0.35
 
 _TRUTH_COLOR = (0, 230, 255)   # BGR yellow
-_SCORE_TARGET_PX = 10.0
 
 SCORE_FIELDS = [
     "timestamp", "pick_id", "solve_file", "source_frame", "src_x", "src_y",
     "target_frame", "proj_x", "proj_y", "gt_x", "gt_y", "dx", "dy", "err_px",
-    "status",
+    "err_m", "err_m_view", "gsd_m_per_px", "range_m", "view_elev_deg", "status",
 ]
 
 
@@ -186,12 +198,18 @@ class ReprojectionViewer:
         # Scoring state: current pick + human truth clicks in target frames
         self._score_path = Path(score_path) if score_path else None
         self._solve_file = solve_file
-        self._pick_id    = _next_pick_id(self._score_path)
         self._pick_src   : tuple[Frame, float, float] | None = None
+        self._pick_world : np.ndarray | None = None
         self._pick_proj  : dict[Frame, tuple[float, float]] = {}
         self._truth_map  : dict[Frame, tuple[float, float]] = {}
+        self._truth_metric: dict[Frame, dict] = {}    # frame → _metric_error output
         self._truth_history: list[tuple[Frame, tuple[float, float] | None]] = []
-        self._session_errs: list[float] = []
+        self._session_errs: dict[str, list[float]] = {"err_m_view": [], "err_m": []}
+
+        if self._score_path is not None:
+            backfill_metric_scores(self._score_path, self.frames, self.surface,
+                                   self._solve_file)
+        self._pick_id = _next_pick_id(self._score_path)
 
         # Build the static clean canvas (no markers)
         self._canvas = self._build_canvas()
@@ -315,7 +333,15 @@ class ReprojectionViewer:
             if proj is not None:
                 px, py = self._img_to_screen(frame, *proj)
                 cv2.line(display, (px, py), (tx, ty), _TRUTH_COLOR, 1, cv2.LINE_AA)
-                label = f"{math.hypot(gx - proj[0], gy - proj[1]):.1f}px"
+                m = self._truth_metric.get(frame, {})
+                parts = [f"{math.hypot(gx - proj[0], gy - proj[1]):.1f}px"]
+                if m.get("err_m_view") is not None:
+                    parts.append(f"{m['err_m_view']:.2f} m")
+                if m.get("err_m") is not None:
+                    elev = m.get("view_elev_deg")
+                    parts.append(f"gnd {m['err_m']:.2f} m"
+                                 + (f" @{elev:.0f}deg" if elev is not None else ""))
+                label = " | ".join(parts)
             else:
                 label = "MISSED"
             org = (tx + arm + 4, ty - arm)
@@ -380,8 +406,14 @@ class ReprojectionViewer:
             if frame is self._pick_src[0]:
                 return
             self._truth_history.append((frame, self._truth_map.get(frame)))
-            self._truth_map[frame] = (gx, gy)
-            logger.info("Truth click on [%s] at (%.1f, %.1f)", frame.stem, gx, gy)
+            self._set_truth(frame, (gx, gy))
+            m = self._truth_metric[frame]
+            logger.info("Truth click on [%s] at (%.1f, %.1f)  view=%s m  ground=%s m  "
+                        "gsd=%s m/px  range=%s m  elev=%s deg",
+                        frame.stem, gx, gy,
+                        *(_fmt(m[k], nd) or "n/a" for k, nd in
+                          (("err_m_view", 3), ("err_m", 3), ("gsd_m_per_px", 4),
+                           ("range_m", 1), ("view_elev_deg", 1))))
             self._update_score_status()
             return
 
@@ -404,8 +436,9 @@ class ReprojectionViewer:
         for tf, proj in results.items():
             self.annotations[tf]["dst"] = proj
 
-        self._pick_src  = (source, px, py)
-        self._pick_proj = dict(results)
+        self._pick_src   = (source, px, py)
+        self._pick_proj  = dict(results)
+        self._pick_world = pixel_to_ground(px, py, source, self.surface)
 
         n_ok = len(results)
         self._status = (f"Pick #{self._pick_id} ({px:.0f}, {py:.0f}) in '{source.display_name}'  "
@@ -416,35 +449,54 @@ class ReprojectionViewer:
 
     # ── Scoring ───────────────────────────────────────────────────────────────
 
-    def _current_errs(self) -> list[float]:
-        return [math.hypot(g[0] - self._pick_proj[f][0], g[1] - self._pick_proj[f][1])
-                for f, g in self._truth_map.items() if f in self._pick_proj]
+    def _set_truth(self, frame: Frame, truth: tuple[float, float] | None) -> None:
+        if truth is None:
+            self._truth_map.pop(frame, None)
+            self._truth_metric.pop(frame, None)
+            return
+        self._truth_map[frame] = truth
+        proj = self._pick_proj.get(frame)
+        err_px = math.hypot(truth[0] - proj[0], truth[1] - proj[1]) if proj else None
+        self._truth_metric[frame] = _metric_error(self._pick_world, frame, *truth,
+                                                  err_px=err_px, surface=self.surface)
+
+    def _clear_truth(self) -> None:
+        self._truth_map.clear()
+        self._truth_metric.clear()
+        self._truth_history.clear()
+
+    def _current_errs(self, key: str) -> list[float]:
+        return [self._truth_metric[f][key] for f in self._truth_map
+                if f in self._pick_proj and self._truth_metric[f][key] is not None]
+
+    @staticmethod
+    def _med_m(v: list[float]) -> str:
+        return f"{float(np.median(v)):.2f} m" if v else "-"
 
     def _update_score_status(self) -> None:
-        errs = self._current_errs()
+        n_judged = sum(f in self._pick_proj for f in self._truth_map)
         n_targets = len(self.frames) - 1
-        med = f"{float(np.median(errs)):.1f}px" if errs else "-"
-        sess = self._session_errs + errs
-        sess_med = f"{float(np.median(sess)):.1f}px" if sess else "-"
-        self._status = (f"Pick #{self._pick_id}: judged {len(errs)}/{n_targets}, "
-                        f"median {med}   |  session: {len(sess)} judged, median {sess_med}")
+        cur  = {k: self._current_errs(k) for k in ("err_m_view", "err_m")}
+        sess = {k: self._session_errs[k] + cur[k] for k in cur}
+        self._status = (f"Pick #{self._pick_id}: judged {n_judged}/{n_targets}, "
+                        f"median {self._med_m(cur['err_m_view'])} "
+                        f"(gnd {self._med_m(cur['err_m'])})   |  "
+                        f"session: {len(sess['err_m_view'])} judged, "
+                        f"median {self._med_m(sess['err_m_view'])} "
+                        f"(gnd {self._med_m(sess['err_m'])})")
 
     def _undo_truth(self) -> None:
         if not self._truth_history:
             return
         frame, prev = self._truth_history.pop()
-        if prev is None:
-            self._truth_map.pop(frame, None)
-        else:
-            self._truth_map[frame] = prev    # right-click had replaced an earlier one
+        self._set_truth(frame, prev)    # prev: earlier click that was replaced, or None
         logger.info("Undo truth click on [%s]", frame.stem)
         self._update_score_status()
 
     def _commit_pick(self) -> None:
         """Append the current pick to score.csv (only if it has truth clicks)."""
         if self._pick_src is None or not self._truth_map or self._score_path is None:
-            self._truth_map.clear()
-            self._truth_history.clear()
+            self._clear_truth()
             return
 
         source, sx, sy = self._pick_src
@@ -466,11 +518,15 @@ class ReprojectionViewer:
             if proj is not None and truth is not None:
                 dx, dy = truth[0] - proj[0], truth[1] - proj[1]
                 err = math.hypot(dx, dy)
+                m = self._truth_metric[tf]
                 row.update(dx=f"{dx:.2f}", dy=f"{dy:.2f}", err_px=f"{err:.2f}",
-                           status="judged")
-                self._session_errs.append(err)
+                           **_fmt_metric(m), status="judged")
+                for k in self._session_errs:
+                    if m[k] is not None:
+                        self._session_errs[k].append(m[k])
             elif proj is not None:
-                row["status"] = "skipped"
+                row.update(**_fmt_metric(_metric_error(self._pick_world, tf)),
+                           status="skipped")
             elif truth is not None:
                 row["status"] = "missed"
             else:
@@ -489,11 +545,11 @@ class ReprojectionViewer:
         logger.info("Committed pick #%d (%d judged) → %s",
                     self._pick_id, n_judged, self._score_path)
         self._pick_id += 1
-        self._truth_map.clear()
-        self._truth_history.clear()
+        self._clear_truth()
         sess = self._session_errs
-        self._status = (f"Committed. Session: {len(sess)} judged, "
-                        f"median {float(np.median(sess)):.1f}px" if sess else "Committed.")
+        self._status = (f"Committed. Session: {len(sess['err_m_view'])} judged, "
+                        f"median {self._med_m(sess['err_m_view'])} "
+                        f"(gnd {self._med_m(sess['err_m'])})")
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
@@ -502,31 +558,39 @@ class ReprojectionViewer:
         cv2.resizeWindow(self.WINDOW, self._win_w, self._win_h)
         cv2.setMouseCallback(self.WINDOW, self._on_mouse)
 
-        while True:
-            try:
-                rect = cv2.getWindowImageRect(self.WINDOW)
-                if rect[2] > 0 and rect[3] > 0:
-                    self._win_w = rect[2]
-                    self._win_h = rect[3]
-            except Exception:
-                pass
+        # try/finally: the pending pick is committed however the viewer ends —
+        # q/Esc, the window's X button, or Ctrl+C in the terminal.
+        try:
+            while True:
+                try:
+                    rect = cv2.getWindowImageRect(self.WINDOW)
+                    if rect[2] > 0 and rect[3] > 0:
+                        self._win_w = rect[2]
+                        self._win_h = rect[3]
+                except Exception:
+                    pass
 
-            cv2.imshow(self.WINDOW, self._compose())
-            key = cv2.waitKey(30) & 0xFF
+                cv2.imshow(self.WINDOW, self._compose())
+                key = cv2.waitKey(30) & 0xFF
 
-            if key in (ord('q'), 27):
-                break
-            elif key in (ord('r'), ord('R')):
-                self._reset_view()
-            elif key == ord('s'):
-                self._save_proof_sheet()
-            elif key == ord('u'):
-                self._undo_truth()
-            elif key in (13, 10, ord('n')):
-                self._commit_pick()
+                # Window closed via its X button (imshow would otherwise re-create it)
+                if cv2.getWindowProperty(self.WINDOW, cv2.WND_PROP_VISIBLE) < 1:
+                    logger.info("Viewer window closed.")
+                    break
 
-        self._commit_pick()
-        cv2.destroyAllWindows()
+                if key in (ord('q'), 27):
+                    break
+                elif key in (ord('r'), ord('R')):
+                    self._reset_view()
+                elif key == ord('s'):
+                    self._save_proof_sheet()
+                elif key == ord('u'):
+                    self._undo_truth()
+                elif key in (13, 10, ord('n')):
+                    self._commit_pick()
+        finally:
+            self._commit_pick()
+            cv2.destroyAllWindows()
 
         if self._score_path is not None and self._score_path.exists():
             summary = summarize_scores(self._score_path)
@@ -570,42 +634,129 @@ def _next_pick_id(csv_path: Path | None) -> int:
     return max(ids) + 1 if ids else 1
 
 
+def backfill_metric_scores(csv_path: Path, frames: list, surface,
+                           solve_file: str) -> None:
+    """Fill the metric columns for existing score.csv rows (upgrades old files).
+
+    Rows scored under a different solve file are left untouched — their pixels
+    only make sense against the cameras they were clicked with.
+    """
+    if not csv_path.exists():
+        return
+    with open(csv_path, newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        header = reader.fieldnames or []
+        rows   = list(reader)
+    if not rows:
+        return
+
+    header_old = header != SCORE_FIELDS
+    todo = [r for r in rows
+            if r.get("status") in ("judged", "skipped") and not r.get("view_elev_deg")]
+    if not header_old and not todo:
+        return
+
+    by_stem = {f.stem: f for f in frames}
+    world_cache: dict[str, np.ndarray | None] = {}
+    n_filled = n_foreign = n_missing = 0
+    for r in todo:
+        if r.get("solve_file", "") != solve_file:
+            n_foreign += 1
+            continue
+        src, tf = by_stem.get(r["source_frame"]), by_stem.get(r["target_frame"])
+        if src is None or tf is None:
+            n_missing += 1
+            continue
+        pid = r["pick_id"]
+        if pid not in world_cache:
+            world_cache[pid] = pixel_to_ground(float(r["src_x"]), float(r["src_y"]),
+                                               src, surface)
+        world = world_cache[pid]
+        if world is None:
+            continue
+        if r["status"] == "judged":
+            m = _metric_error(world, tf, float(r["gt_x"]), float(r["gt_y"]),
+                              err_px=float(r["err_px"]), surface=surface)
+        else:
+            m = _metric_error(world, tf)
+        r.update(_fmt_metric(m))
+        n_filled += 1
+
+    if n_foreign:
+        logger.warning("score.csv backfill: %d row(s) from a different solve file "
+                       "(active: '%s') left without metric error.", n_foreign, solve_file)
+    if n_missing:
+        logger.warning("score.csv backfill: %d row(s) reference frames not loaded.", n_missing)
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=SCORE_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        for r in rows:
+            writer.writerow({k: r.get(k, "") or "" for k in SCORE_FIELDS})
+    logger.info("score.csv backfill: filled metric columns for %d row(s)%s → %s",
+                n_filled, " (header upgraded)" if header_old else "", csv_path)
+
+
 def summarize_scores(csv_path: str | Path) -> str:
-    """Human-readable accuracy summary of every row in score.csv."""
+    """Human-readable accuracy summary of every row in score.csv.
+
+    Reports the three error measures side by side (see module docstring),
+    plus a per-target-frame table of medians.
+    """
     rows = _read_score_rows(Path(csv_path))
     counts = {s: sum(r["status"] == s for r in rows)
               for s in ("judged", "skipped", "missed", "not_visible")}
     n_picks = len({r["pick_id"] for r in rows})
 
-    errs, per_frame = [], {}
-    for r in rows:
-        if r["status"] != "judged" or not r["err_px"]:
-            continue
-        e = float(r["err_px"])
-        errs.append(e)
-        per_frame.setdefault(r["target_frame"], []).append(e)
+    def _f(r, k):
+        v = r.get(k, "")
+        return float(v) if v not in ("", None) else None
+
+    judged = [r for r in rows if r["status"] == "judged"]
+    cols = ("err_px", "err_m_view", "err_m", "gsd_m_per_px", "range_m", "view_elev_deg")
+
+    def _vals(rs, col):
+        return np.asarray([v for v in (_f(r, col) for r in rs) if v is not None])
 
     lines = [
         f"Reprojection accuracy - {csv_path}",
         f"  picks: {n_picks}   judged: {counts['judged']}   skipped: {counts['skipped']}   "
         f"missed: {counts['missed']}   not_visible: {counts['not_visible']}",
     ]
-    if errs:
-        a = np.asarray(errs)
-        lines += [
-            "  error (undistorted-image px):",
-            f"    median {np.median(a):.1f}   mean {a.mean():.1f}   "
-            f"RMS {np.sqrt((a ** 2).mean()):.1f}   P90 {np.percentile(a, 90):.1f}   "
-            f"max {a.max():.1f}",
-            f"    within {_SCORE_TARGET_PX:.0f} px: {100.0 * (a <= _SCORE_TARGET_PX).mean():.0f}%"
-            f"  ({int((a <= _SCORE_TARGET_PX).sum())}/{len(a)})",
-            "  per target frame (median px, n):",
-        ]
-        for stem in sorted(per_frame):
-            v = per_frame[stem]
-            lines.append(f"    {stem:<34} {np.median(v):7.1f}   n={len(v)}")
-    else:
+    if not judged:
         lines.append("  no judged rows yet.")
+        return "\n".join(lines) + "\n"
+
+    tgt_m = float(config.SCORE_TARGET_M)
+    n = len(judged)
+    lines += _stats_block("image error (pixels; favours far / zoomed-out frames)",
+                          _vals(judged, "err_px"), "px", 1, _SCORE_TARGET_PX, n)
+    lines += _stats_block("view error (px x m/px: miss in metres facing the camera)",
+                          _vals(judged, "err_m_view"), "m", 2, tgt_m, n)
+    lines += _stats_block("ground error (distance on the terrain; stretched at shallow views)",
+                          _vals(judged, "err_m"), "m", 2, tgt_m, n)
+
+    by_frame: dict[str, list[dict]] = {}
+    for r in judged:
+        by_frame.setdefault(r["target_frame"], []).append(r)
+
+    def _med(rs, col, scale=1.0, nd=1):
+        v = _vals(rs, col)
+        return f"{np.median(v) * scale:.{nd}f}" if len(v) else "-"
+
+    lines += [
+        "  per target frame (medians over judged clicks):",
+        f"    {'frame':<34} {'view deg':>8} {'range m':>8} {'px':>6} {'cm/px':>6} "
+        f"{'view m':>7} {'ground m':>9} {'n':>3}",
+    ]
+    for stem in sorted(by_frame):
+        rs = by_frame[stem]
+        lines.append(
+            f"    {stem:<34} {_med(rs, 'view_elev_deg'):>8} {_med(rs, 'range_m'):>8} "
+            f"{_med(rs, 'err_px'):>6} {_med(rs, 'gsd_m_per_px', 100, 2):>6} "
+            f"{_med(rs, 'err_m_view', 1, 2):>7} {_med(rs, 'err_m', 1, 2):>9} {len(rs):>3}")
+    lines.append("    view m = px x cm/px;  ground m ~ view m / sin(view deg) "
+                 "for misses along the line of sight.")
     return "\n".join(lines) + "\n"
 
 

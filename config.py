@@ -149,6 +149,11 @@ MARKER_COLOR_SRC = (0, 220, 0)    # Green  – source pick
 MARKER_COLOR_DST = (0, 60,  220)  # Blue   – reprojected point
 MARKER_THICKNESS = 3
 
+# Reprojection scoring (viewer right-click truth → output/score.csv).
+# Metric pass threshold for the summary: ground distance between the
+# reprojected point and the human truth click (~¼ of the van's width).
+SCORE_TARGET_M = 0.5
+
 # ─────────────────────────────────────────────────────────────────────────────
 # VAN GEOMETRY
 # ─────────────────────────────────────────────────────────────────────────────

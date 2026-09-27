@@ -139,6 +139,14 @@ def parse_args() -> argparse.Namespace:
              "viewer.  Use locally after copying the JSON from RunPod.",
     )
     p.add_argument(
+        "--score-tracks", nargs="?", const="", default=None,
+        dest="score_tracks", metavar="CSV",
+        help="With --import-solve: instead of opening the viewer, treat every "
+             "pick in CSV (default: output/score.csv) as a track and score all "
+             "source→target frame pairs against the imported solve.  Writes "
+             "score_pairs.csv, score_pairs_summary.txt, score_pairs_matrix.png.",
+    )
+    p.add_argument(
         "--use-saved-qwen", action="store_true", dest="use_saved_qwen",
         help="Load Qwen/CLIP anchor results from the cache file "
              "(output/anchor_cache.json) instead of re-running Qwen.  "
@@ -443,6 +451,34 @@ def run_interactive(frames: list, surface=None, solve_file: str = "") -> None:
     viewer.run()
 
 
+def score_tracks_cmd(frames: list, surface, solve_path: str, score_csv: str) -> None:
+    """Headless: cross-score every pick in *score_csv* as a track (all frame pairs)."""
+    from pipeline.scoring import (load_tracks, plot_pair_matrix, score_tracks,
+                                  summarize_pairs, write_pairs_csv)
+
+    if not os.path.exists(score_csv):
+        logger.error("Score CSV not found: %s", score_csv)
+        sys.exit(1)
+    solve_file = os.path.basename(solve_path)
+    tracks = load_tracks(score_csv)
+    rows = score_tracks(tracks, frames, surface=surface, solve_file=solve_file)
+
+    # Default solve → score_pairs.*; any other solve gets a suffix so runs
+    # against different solves can be compared side by side.
+    stem = os.path.splitext(solve_file)[0]
+    suffix = "" if stem == "solved_cameras" else f"_{stem}"
+    out = Path(config.OUTPUT_DIR)
+    write_pairs_csv(rows, out / f"score_pairs{suffix}.csv")
+    summary = summarize_pairs(rows, title=solve_file)
+    (out / f"score_pairs{suffix}_summary.txt").write_text(summary, encoding="utf-8")
+    png = plot_pair_matrix(rows, out / f"score_pairs{suffix}_matrix.png", title=solve_file)
+    print("\n" + summary)
+    print(f"Written: {out / f'score_pairs{suffix}.csv'}")
+    print(f"         {out / f'score_pairs{suffix}_summary.txt'}")
+    if png:
+        print(f"         {png}\n")
+
+
 def run_batch(
     frames: list,
     source_stem: str,
@@ -602,6 +638,11 @@ def main() -> None:
                 _dense  = load_ground_points(config.SURFACE_POINTS_DENSE_FILE)
             logger.info("Surface source for import: %s", "native" if _is_native else "ceres")
             _surface = _build_surface(_sparse, _dense, config.SURFACE_SOURCE)
+
+        if args.score_tracks is not None:
+            score_tracks_cmd(_frames, _surface, _path,
+                             args.score_tracks or os.path.join(config.OUTPUT_DIR, "score.csv"))
+            return
         run_interactive(_frames, surface=_surface, solve_file=os.path.basename(_path))
         return
 

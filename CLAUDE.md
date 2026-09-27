@@ -84,6 +84,10 @@ venv\Scripts\python raycast.py --frames_dir ./frames --use-saved-qwen --export-s
 
 :: Local GUI from RunPod solve — skip pipeline, load JSON, open viewer
 venv\Scripts\python raycast.py --frames_dir ./frames --import-solve
+
+:: Cross-score every viewer pick (output/score.csv) as a track against the imported solve
+:: → output/score_pairs.csv, score_pairs_summary.txt, score_pairs_matrix.png (no GUI)
+venv\Scripts\python raycast.py --frames_dir ./frames --import-solve --score-tracks
 ```
 
 `--manual-fm-json` / `--manual-correspondences` exist for strengthening a specific
@@ -93,7 +97,9 @@ what's being discussed.
 
 Interactive viewer controls: click = pick pixel | right-click = mark true location in a target frame | `u` = undo truth click | `Enter`/`n` = commit pick to score | scroll = zoom | mid-drag = pan | `s` = save proof sheet | `R` = reset | `q` = commit + quit.
 
-**Reprojection scoring:** after a pick, right-click where the point *really* is in each target frame you can identify confidently. On commit (next pick, `Enter`/`n`, or `q`) one row per target frame is appended to `output/score.csv` (`status` = `judged` / `skipped` / `missed` / `not_visible`; missing numbers are empty). Picks with no truth clicks are discarded. On quit, a summary (median/mean/RMS/P90/max, % ≤ 10 px, per-frame median) is printed and written to `output/score_summary.txt`. Pick ground-level points — the raycast hits the terrain, so van-roof points measure parallax, not solve error.
+**Reprojection scoring:** after a pick, right-click where the point *really* is in each target frame you can identify confidently. On commit (next pick, `Enter`/`n`, or `q`) one row per target frame is appended to `output/score.csv` (`status` = `judged` / `skipped` / `missed` / `not_visible`; missing numbers are empty). Picks with no truth clicks are discarded. Three error measures are recorded side by side: `err_px` (image pixels — not comparable across frames, favours far/zoomed-out ones), `err_m_view` (`err_px × gsd_m_per_px`: the miss in metres facing the camera, removes the zoom/distance effect) and `err_m` (distance on the terrain between the truth click's ray hit and the pick's ground point — stretched by ~1/sin(`view_elev_deg`) at shallow views). `range_m` / `view_elev_deg` / `gsd_m_per_px` describe how each target camera sees the point. On viewer start, older `score.csv` rows are backfilled with these columns (only rows from the same solve file). On quit, a summary (stats for all three measures + per-frame table) is printed and written to `output/score_summary.txt`; `config.SCORE_TARGET_M` is the metric pass threshold. Pick ground-level points — the raycast hits the terrain, so van-roof points measure parallax, not solve error. Test: `venv\Scripts\python tests/test_scoring.py`.
+
+**Track cross-scoring (`--score-tracks [CSV]`, with `--import-solve`):** each pick in `score.csv` is one physical feature clicked in several frames (source + truth clicks = a track). `pipeline/scoring.py` scores every ordered frame pair A→B of every track (A's click → ground → reprojected into B, compared with B's click), giving per-source-frame and per-target-frame tables, an overall score (median over pairs + mean of per-source medians) and a source×target heatmap. Clicks are pure pixels, independent of the solve, so the same tracks score any solve file; a non-default solve's outputs get a `_<solve stem>` suffix. `err_m` (ground) is symmetric (A→B = B→A); `err_px` / `err_m_view` are directional. `out_of_frame` pairs (solve projects the feature outside the image) are real failures and are included in the metric stats.
 
 ---
 
