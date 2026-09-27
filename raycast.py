@@ -434,10 +434,12 @@ def _build_surface(sparse, dense, source: str):
     return surf
 
 
-def run_interactive(frames: list, surface=None) -> None:
-    """Launch the click-to-reproject GUI."""
+def run_interactive(frames: list, surface=None, solve_file: str = "") -> None:
+    """Launch the click-to-reproject GUI (right-click truth → output/score.csv)."""
     from pipeline.ui import ReprojectionViewer
-    viewer = ReprojectionViewer(frames, surface=surface)
+    viewer = ReprojectionViewer(frames, surface=surface,
+                                score_path=os.path.join(config.OUTPUT_DIR, "score.csv"),
+                                solve_file=solve_file)
     viewer.run()
 
 
@@ -600,7 +602,7 @@ def main() -> None:
                 _dense  = load_ground_points(config.SURFACE_POINTS_DENSE_FILE)
             logger.info("Surface source for import: %s", "native" if _is_native else "ceres")
             _surface = _build_surface(_sparse, _dense, config.SURFACE_SOURCE)
-        run_interactive(_frames, surface=_surface)
+        run_interactive(_frames, surface=_surface, solve_file=os.path.basename(_path))
         return
 
     # Preview undistort only

@@ -91,7 +91,9 @@ poorly-constrained frame (see §Manual correspondences below) — they are **not
 of the normal/default workflow and shouldn't be suggested unless that's explicitly
 what's being discussed.
 
-Interactive viewer controls: click = pick pixel | scroll = zoom | mid-drag = pan | `s` = save proof sheet | `R` = reset | `q` = quit.
+Interactive viewer controls: click = pick pixel | right-click = mark true location in a target frame | `u` = undo truth click | `Enter`/`n` = commit pick to score | scroll = zoom | mid-drag = pan | `s` = save proof sheet | `R` = reset | `q` = commit + quit.
+
+**Reprojection scoring:** after a pick, right-click where the point *really* is in each target frame you can identify confidently. On commit (next pick, `Enter`/`n`, or `q`) one row per target frame is appended to `output/score.csv` (`status` = `judged` / `skipped` / `missed` / `not_visible`; missing numbers are empty). Picks with no truth clicks are discarded. On quit, a summary (median/mean/RMS/P90/max, % ≤ 10 px, per-frame median) is printed and written to `output/score_summary.txt`. Pick ground-level points — the raycast hits the terrain, so van-roof points measure parallax, not solve error.
 
 ---
 

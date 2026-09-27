@@ -18,16 +18,28 @@ Navigation
 
 Key bindings
 ────────────
-  click     – pick a pixel in any frame
-  s         – save the current annotated grid as a proof-sheet PNG
-  r / R     – reset view (first press); double-r resets markers too
-  q / Esc   – quit
+  click       – pick a pixel in any frame
+  right-click – mark the TRUE location of the pick in a target frame (scoring)
+  u           – undo the last truth click
+  Enter / n   – commit the current pick's scores to score.csv
+  s           – save the current annotated grid as a proof-sheet PNG
+  r / R       – reset view (first press); double-r resets markers too
+  q / Esc     – commit pending scores, print summary, quit
+
+Scoring
+───────
+A pick is written to score.csv (one row per target frame) only if it has at
+least one truth click; otherwise it is discarded.  Frames left unclicked are
+logged as 'skipped', so unjudgeable (blurry) frames show up as missing
+coverage rather than as error.
 """
 
 from __future__ import annotations
 
+import csv
 import logging
 import math
+from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -49,6 +61,15 @@ _ZOOM_MAX      = 12.0
 _MARKER_R_DEFAULT = 14
 _MARKER_R_MAX     = 60
 _DOT_FRAC         = 0.35
+
+_TRUTH_COLOR = (0, 230, 255)   # BGR yellow
+_SCORE_TARGET_PX = 10.0
+
+SCORE_FIELDS = [
+    "timestamp", "pick_id", "solve_file", "source_frame", "src_x", "src_y",
+    "target_frame", "proj_x", "proj_y", "gt_x", "gt_y", "dx", "dy", "err_px",
+    "status",
+]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -122,10 +143,12 @@ class ReprojectionViewer:
     OpenCV-based interactive re-projection viewer with zoom / pan / marker scale.
     """
 
-    WINDOW = ("Raycast  [click=pick | scroll=zoom | mid-drag=pan | "
-              "ctrl+scroll=marker | R=reset | s=save | q=quit]")
+    WINDOW = ("Raycast  [click=pick | right-click=truth | u=undo | Enter=commit | "
+              "scroll=zoom | mid-drag=pan | ctrl+scroll=marker | R=reset | s=save | q=quit]")
 
-    def __init__(self, frames: list[Frame], surface=None) -> None:
+    def __init__(self, frames: list[Frame], surface=None,
+                 score_path: str | Path | None = None,
+                 solve_file: str = "") -> None:
         self.frames = [f for f in frames if f.ready]
         if not self.frames:
             raise RuntimeError("No ready frames to display.")
@@ -159,6 +182,16 @@ class ReprojectionViewer:
 
         self._status    = "Click any frame to pick a target pixel."
         self._last_save = None
+
+        # Scoring state: current pick + human truth clicks in target frames
+        self._score_path = Path(score_path) if score_path else None
+        self._solve_file = solve_file
+        self._pick_id    = _next_pick_id(self._score_path)
+        self._pick_src   : tuple[Frame, float, float] | None = None
+        self._pick_proj  : dict[Frame, tuple[float, float]] = {}
+        self._truth_map  : dict[Frame, tuple[float, float]] = {}
+        self._truth_history: list[tuple[Frame, tuple[float, float] | None]] = []
+        self._session_errs: list[float] = []
 
         # Build the static clean canvas (no markers)
         self._canvas = self._build_canvas()
@@ -270,6 +303,44 @@ class ReprojectionViewer:
                 cv2.circle(display, (sx, sy), r,     c, 2,          cv2.LINE_AA)
                 cv2.circle(display, (sx, sy), dot_r, c, cv2.FILLED, cv2.LINE_AA)
 
+        # Truth clicks: yellow cross, line to reprojection, error label
+        for frame, (gx, gy) in self._truth_map.items():
+            tx, ty = self._img_to_screen(frame, gx, gy)
+            arm = r + 5
+            cv2.line(display, (tx-arm, ty-arm), (tx+arm, ty+arm), (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.line(display, (tx-arm, ty+arm), (tx+arm, ty-arm), (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.line(display, (tx-arm, ty-arm), (tx+arm, ty+arm), _TRUTH_COLOR, 2, cv2.LINE_AA)
+            cv2.line(display, (tx-arm, ty+arm), (tx+arm, ty-arm), _TRUTH_COLOR, 2, cv2.LINE_AA)
+            proj = self._pick_proj.get(frame)
+            if proj is not None:
+                px, py = self._img_to_screen(frame, *proj)
+                cv2.line(display, (px, py), (tx, ty), _TRUTH_COLOR, 1, cv2.LINE_AA)
+                label = f"{math.hypot(gx - proj[0], gy - proj[1]):.1f}px"
+            else:
+                label = "MISSED"
+            org = (tx + arm + 4, ty - arm)
+            cv2.putText(display, label, org, cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                        (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.putText(display, label, org, cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                        _TRUTH_COLOR, 1, cv2.LINE_AA)
+
+    # ── Hit test ──────────────────────────────────────────────────────────────
+
+    def _hit_test(self, wx: int, wy: int):
+        """Window pixel → (frame, px, py) in full-res undistorted image, or None."""
+        cx, cy = self._win_to_canvas(wx, wy)
+        if cx < 0 or cy < 0:
+            return None
+        col = int(cx // THUMB_W)
+        row = int(cy // THUMB_H)
+        idx = row * self._n_cols + col
+        if idx >= len(self.frames) or col >= self._n_cols:
+            return None
+        frame  = self.frames[idx]
+        tx, ty = cx % THUMB_W, cy % THUMB_H
+        h, w   = frame.undistorted.shape[:2]
+        return frame, tx * w / THUMB_W, ty * h / THUMB_H
+
     # ── Mouse callback ────────────────────────────────────────────────────────
 
     def _on_mouse(self, event, wx: int, wy: int, flags, param):
@@ -301,27 +372,31 @@ class ReprojectionViewer:
             self._panning = False
             return
 
+        if event == cv2.EVENT_RBUTTONDOWN:
+            hit = self._hit_test(wx, wy)
+            if hit is None or self._pick_src is None:
+                return
+            frame, gx, gy = hit
+            if frame is self._pick_src[0]:
+                return
+            self._truth_history.append((frame, self._truth_map.get(frame)))
+            self._truth_map[frame] = (gx, gy)
+            logger.info("Truth click on [%s] at (%.1f, %.1f)", frame.stem, gx, gy)
+            self._update_score_status()
+            return
+
         if event != cv2.EVENT_LBUTTONDOWN:
             return
 
-        # Map window → canvas → frame
-        cx, cy = self._win_to_canvas(wx, wy)
-        if cx < 0 or cy < 0:
+        hit = self._hit_test(wx, wy)
+        if hit is None:
             return
-        col = int(cx // THUMB_W)
-        row = int(cy // THUMB_H)
-        idx = row * self._n_cols + col
-        if idx >= len(self.frames) or col >= self._n_cols:
-            return
-
-        source  = self.frames[idx]
-        tx, ty  = cx % THUMB_W, cy % THUMB_H
-        h, w    = source.undistorted.shape[:2]
-        px      = tx * w / THUMB_W
-        py      = ty * h / THUMB_H
+        source, px, py = hit
 
         logger.info("Click on frame %d [%s] at undist pixel (%.1f, %.1f)",
-                    idx, source.stem, px, py)
+                    self._frame_idx[source], source.stem, px, py)
+
+        self._commit_pick()
 
         self.annotations = {f: {} for f in self.frames}
         self.annotations[source]["src"] = (px, py)
@@ -329,10 +404,96 @@ class ReprojectionViewer:
         for tf, proj in results.items():
             self.annotations[tf]["dst"] = proj
 
+        self._pick_src  = (source, px, py)
+        self._pick_proj = dict(results)
+
         n_ok = len(results)
-        self._status = (f"Picked ({px:.0f}, {py:.0f}) in '{source.display_name}'  "
-                        f"???  reprojected into {n_ok}/{len(self.frames)-1} frame(s).")
+        self._status = (f"Pick #{self._pick_id} ({px:.0f}, {py:.0f}) in '{source.display_name}'  "
+                        f"???  reprojected into {n_ok}/{len(self.frames)-1} frame(s).  "
+                        f"Right-click true location in target frames.")
         logger.info(self._status.replace("???", "→"))
+        self._status = self._status.replace("???", "->")
+
+    # ── Scoring ───────────────────────────────────────────────────────────────
+
+    def _current_errs(self) -> list[float]:
+        return [math.hypot(g[0] - self._pick_proj[f][0], g[1] - self._pick_proj[f][1])
+                for f, g in self._truth_map.items() if f in self._pick_proj]
+
+    def _update_score_status(self) -> None:
+        errs = self._current_errs()
+        n_targets = len(self.frames) - 1
+        med = f"{float(np.median(errs)):.1f}px" if errs else "-"
+        sess = self._session_errs + errs
+        sess_med = f"{float(np.median(sess)):.1f}px" if sess else "-"
+        self._status = (f"Pick #{self._pick_id}: judged {len(errs)}/{n_targets}, "
+                        f"median {med}   |  session: {len(sess)} judged, median {sess_med}")
+
+    def _undo_truth(self) -> None:
+        if not self._truth_history:
+            return
+        frame, prev = self._truth_history.pop()
+        if prev is None:
+            self._truth_map.pop(frame, None)
+        else:
+            self._truth_map[frame] = prev    # right-click had replaced an earlier one
+        logger.info("Undo truth click on [%s]", frame.stem)
+        self._update_score_status()
+
+    def _commit_pick(self) -> None:
+        """Append the current pick to score.csv (only if it has truth clicks)."""
+        if self._pick_src is None or not self._truth_map or self._score_path is None:
+            self._truth_map.clear()
+            self._truth_history.clear()
+            return
+
+        source, sx, sy = self._pick_src
+        ts   = datetime.now().isoformat(timespec="seconds")
+        rows = []
+        for tf in self.frames:
+            if tf is source:
+                continue
+            proj  = self._pick_proj.get(tf)
+            truth = self._truth_map.get(tf)
+            row = {k: "" for k in SCORE_FIELDS}
+            row.update(timestamp=ts, pick_id=self._pick_id, solve_file=self._solve_file,
+                       source_frame=source.stem, src_x=f"{sx:.2f}", src_y=f"{sy:.2f}",
+                       target_frame=tf.stem)
+            if proj is not None:
+                row.update(proj_x=f"{proj[0]:.2f}", proj_y=f"{proj[1]:.2f}")
+            if truth is not None:
+                row.update(gt_x=f"{truth[0]:.2f}", gt_y=f"{truth[1]:.2f}")
+            if proj is not None and truth is not None:
+                dx, dy = truth[0] - proj[0], truth[1] - proj[1]
+                err = math.hypot(dx, dy)
+                row.update(dx=f"{dx:.2f}", dy=f"{dy:.2f}", err_px=f"{err:.2f}",
+                           status="judged")
+                self._session_errs.append(err)
+            elif proj is not None:
+                row["status"] = "skipped"
+            elif truth is not None:
+                row["status"] = "missed"
+            else:
+                row["status"] = "not_visible"
+            rows.append(row)
+
+        self._score_path.parent.mkdir(parents=True, exist_ok=True)
+        new_file = not self._score_path.exists() or self._score_path.stat().st_size == 0
+        with open(self._score_path, "a", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=SCORE_FIELDS)
+            if new_file:
+                writer.writeheader()
+            writer.writerows(rows)
+
+        n_judged = sum(r["status"] == "judged" for r in rows)
+        logger.info("Committed pick #%d (%d judged) → %s",
+                    self._pick_id, n_judged, self._score_path)
+        self._pick_id += 1
+        self._truth_map.clear()
+        self._truth_history.clear()
+        sess = self._session_errs
+        self._status = (f"Committed. Session: {len(sess)} judged, "
+                        f"median {float(np.median(sess)):.1f}px" if sess else "Committed.")
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
@@ -359,8 +520,20 @@ class ReprojectionViewer:
                 self._reset_view()
             elif key == ord('s'):
                 self._save_proof_sheet()
+            elif key == ord('u'):
+                self._undo_truth()
+            elif key in (13, 10, ord('n')):
+                self._commit_pick()
 
+        self._commit_pick()
         cv2.destroyAllWindows()
+
+        if self._score_path is not None and self._score_path.exists():
+            summary = summarize_scores(self._score_path)
+            print("\n" + summary)
+            out = self._score_path.with_name("score_summary.txt")
+            out.write_text(summary, encoding="utf-8")
+            logger.info("Score summary written: %s", out)
 
     # ── Save ──────────────────────────────────────────────────────────────────
 
@@ -373,6 +546,67 @@ class ReprojectionViewer:
         cv2.imwrite(str(path), grid)
         self._status = f"Proof sheet saved → {path}"
         logger.info("Proof sheet saved: %s", path)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reprojection scoring (score.csv)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _read_score_rows(csv_path: Path) -> list[dict]:
+    if csv_path is None or not csv_path.exists():
+        return []
+    with open(csv_path, newline="", encoding="utf-8") as fh:
+        return list(csv.DictReader(fh))
+
+
+def _next_pick_id(csv_path: Path | None) -> int:
+    """Continue pick numbering from an existing score.csv (1 if none)."""
+    ids = []
+    for row in _read_score_rows(csv_path):
+        try:
+            ids.append(int(row["pick_id"]))
+        except (KeyError, ValueError):
+            pass
+    return max(ids) + 1 if ids else 1
+
+
+def summarize_scores(csv_path: str | Path) -> str:
+    """Human-readable accuracy summary of every row in score.csv."""
+    rows = _read_score_rows(Path(csv_path))
+    counts = {s: sum(r["status"] == s for r in rows)
+              for s in ("judged", "skipped", "missed", "not_visible")}
+    n_picks = len({r["pick_id"] for r in rows})
+
+    errs, per_frame = [], {}
+    for r in rows:
+        if r["status"] != "judged" or not r["err_px"]:
+            continue
+        e = float(r["err_px"])
+        errs.append(e)
+        per_frame.setdefault(r["target_frame"], []).append(e)
+
+    lines = [
+        f"Reprojection accuracy - {csv_path}",
+        f"  picks: {n_picks}   judged: {counts['judged']}   skipped: {counts['skipped']}   "
+        f"missed: {counts['missed']}   not_visible: {counts['not_visible']}",
+    ]
+    if errs:
+        a = np.asarray(errs)
+        lines += [
+            "  error (undistorted-image px):",
+            f"    median {np.median(a):.1f}   mean {a.mean():.1f}   "
+            f"RMS {np.sqrt((a ** 2).mean()):.1f}   P90 {np.percentile(a, 90):.1f}   "
+            f"max {a.max():.1f}",
+            f"    within {_SCORE_TARGET_PX:.0f} px: {100.0 * (a <= _SCORE_TARGET_PX).mean():.0f}%"
+            f"  ({int((a <= _SCORE_TARGET_PX).sum())}/{len(a)})",
+            "  per target frame (median px, n):",
+        ]
+        for stem in sorted(per_frame):
+            v = per_frame[stem]
+            lines.append(f"    {stem:<34} {np.median(v):7.1f}   n={len(v)}")
+    else:
+        lines.append("  no judged rows yet.")
+    return "\n".join(lines) + "\n"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
