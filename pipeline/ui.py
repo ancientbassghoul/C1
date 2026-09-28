@@ -22,6 +22,10 @@ Key bindings
   right-click – mark the TRUE location of the pick in a target frame (scoring)
   u           – undo the last truth click
   Enter / n   – commit the current pick's scores to score.csv
+  ← / →       – review saved picks from score.csv (read-only; reprojected
+                with the currently loaded solve)
+  c           – clear all markers / leave review (a live pick with truth
+                clicks is committed first)
   s           – save the current annotated grid as a proof-sheet PNG
   r / R       – reset view (first press); double-r resets markers too
   q / Esc     – commit pending scores, print summary, quit
@@ -76,6 +80,10 @@ _MARKER_R_MAX     = 60
 _DOT_FRAC         = 0.35
 
 _TRUTH_COLOR = (0, 230, 255)   # BGR yellow
+
+# cv2.waitKeyEx arrow codes: Windows, then GTK / Qt
+_KEYS_LEFT  = (2424832, 65361)
+_KEYS_RIGHT = (2555904, 65363)
 
 SCORE_FIELDS = [
     "timestamp", "pick_id", "solve_file", "source_frame", "src_x", "src_y",
@@ -156,7 +164,8 @@ class ReprojectionViewer:
     """
 
     WINDOW = ("Raycast  [click=pick | right-click=truth | u=undo | Enter=commit | "
-              "scroll=zoom | mid-drag=pan | ctrl+scroll=marker | R=reset | s=save | q=quit]")
+              "arrows=review saved | c=clear | scroll=zoom | mid-drag=pan | "
+              "ctrl+scroll=marker | R=reset | s=save | q=quit]")
 
     def __init__(self, frames: list[Frame], surface=None,
                  score_path: str | Path | None = None,
@@ -205,6 +214,9 @@ class ReprojectionViewer:
         self._truth_metric: dict[Frame, dict] = {}    # frame → _metric_error output
         self._truth_history: list[tuple[Frame, tuple[float, float] | None]] = []
         self._session_errs: dict[str, list[float]] = {"err_m_view": [], "err_m": []}
+
+        # Review mode: pick_id of the saved pick on display (read-only), else None
+        self._review_pid: str | None = None
 
         if self._score_path is not None:
             backfill_metric_scores(self._score_path, self.frames, self.surface,
@@ -402,6 +414,10 @@ class ReprojectionViewer:
             hit = self._hit_test(wx, wy)
             if hit is None or self._pick_src is None:
                 return
+            if self._review_pid is not None:
+                self._status = ("Reviewing a saved pick (read-only) - press c to clear "
+                                "and pick a new point.")
+                return
             frame, gx, gy = hit
             if frame is self._pick_src[0]:
                 return
@@ -429,7 +445,16 @@ class ReprojectionViewer:
                     self._frame_idx[source], source.stem, px, py)
 
         self._commit_pick()
+        self._review_pid = None          # a left-click always starts a live pick
+        n_ok = self._start_pick(source, px, py)
+        self._status = (f"Pick #{self._pick_id} ({px:.0f}, {py:.0f}) in '{source.display_name}'  "
+                        f"???  reprojected into {n_ok}/{len(self.frames)-1} frame(s).  "
+                        f"Right-click true location in target frames.")
+        logger.info(self._status.replace("???", "→"))
+        self._status = self._status.replace("???", "->")
 
+    def _start_pick(self, source: Frame, px: float, py: float) -> int:
+        """Show a pick: source marker + reprojections; returns #frames reprojected."""
         self.annotations = {f: {} for f in self.frames}
         self.annotations[source]["src"] = (px, py)
         results = reproject_pick(px, py, source, self.frames, surface=self.surface)
@@ -439,13 +464,85 @@ class ReprojectionViewer:
         self._pick_src   = (source, px, py)
         self._pick_proj  = dict(results)
         self._pick_world = pixel_to_ground(px, py, source, self.surface)
+        return len(results)
 
-        n_ok = len(results)
-        self._status = (f"Pick #{self._pick_id} ({px:.0f}, {py:.0f}) in '{source.display_name}'  "
-                        f"???  reprojected into {n_ok}/{len(self.frames)-1} frame(s).  "
-                        f"Right-click true location in target frames.")
-        logger.info(self._status.replace("???", "→"))
-        self._status = self._status.replace("???", "->")
+    # ── Review saved picks / clear ────────────────────────────────────────────
+
+    def _load_saved_picks(self) -> dict[str, dict]:
+        """score.csv → {pick_id: {source, src, truths{stem: (x,y)}, solve_file}}."""
+        picks: dict[str, dict] = {}
+        for r in _read_score_rows(self._score_path):
+            p = picks.setdefault(r["pick_id"], {
+                "source": r["source_frame"],
+                "src": (float(r["src_x"]), float(r["src_y"])),
+                "truths": {},
+                "solve_file": r.get("solve_file", ""),
+            })
+            if r.get("gt_x") and r.get("gt_y"):
+                p["truths"][r["target_frame"]] = (float(r["gt_x"]), float(r["gt_y"]))
+        return dict(sorted(picks.items(), key=lambda kv: int(kv[0])))
+
+    def _show_saved_pick(self, step: int) -> None:
+        """Display the next (+1) / previous (-1) saved pick, read-only."""
+        self._commit_pick()
+        picks = self._load_saved_picks()
+        if not picks:
+            self._status = f"No saved picks in {self._score_path}."
+            return
+        ids = list(picks)
+        if self._review_pid in ids:
+            i = (ids.index(self._review_pid) + step) % len(ids)
+        else:
+            i = 0 if step > 0 else len(ids) - 1
+        pid, p = ids[i], picks[ids[i]]
+
+        by_stem = {f.stem: f for f in self.frames}
+        source = by_stem.get(p["source"])
+        if source is None:
+            logger.warning("Saved pick #%s: source frame %s not loaded.", pid, p["source"])
+            self._clear_view()
+            self._review_pid = pid           # keep position so arrows continue from here
+            self._status = f"Review pick #{pid}: source frame {p['source']} not loaded."
+            return
+
+        self._clear_truth()
+        self._review_pid = pid
+        self._start_pick(source, *p["src"])
+        missing = 0
+        for stem, xy in p["truths"].items():
+            tf = by_stem.get(stem)
+            if tf is None or tf is source:
+                missing += tf is None
+                continue
+            self._set_truth(tf, xy)
+        if missing:
+            logger.warning("Saved pick #%s: %d truth frame(s) not loaded.", pid, missing)
+
+        n_judged = sum(f in self._pick_proj for f in self._truth_map)
+        cur = {k: self._current_errs(k) for k in ("err_m_view", "err_m")}
+        other = (f"  (clicked under {p['solve_file']})"
+                 if p["solve_file"] and p["solve_file"] != self._solve_file else "")
+        self._status = (f"Review pick {i + 1}/{len(ids)} (#{pid}) from "
+                        f"{source.stem.rsplit('_', 1)[-1]}: judged {n_judged}, "
+                        f"median {self._med_m(cur['err_m_view'])} "
+                        f"(gnd {self._med_m(cur['err_m'])}){other}   "
+                        f"[<-/-> browse | c clear]")
+        logger.info("Review saved pick #%s (source %s, %d truth click(s))",
+                    pid, source.stem, len(self._truth_map))
+
+    def _clear_view(self) -> None:
+        self.annotations = {f: {} for f in self.frames}
+        self._pick_src   = None
+        self._pick_world = None
+        self._pick_proj  = {}
+        self._clear_truth()
+        self._review_pid = None
+
+    def _clear_all(self) -> None:
+        """Commit any live pick (if it has truth clicks), then clear everything."""
+        self._commit_pick()
+        self._clear_view()
+        self._status = "Cleared. Click any frame to pick a new point (<-/-> to review saved picks)."
 
     # ── Scoring ───────────────────────────────────────────────────────────────
 
@@ -486,7 +583,7 @@ class ReprojectionViewer:
                         f"(gnd {self._med_m(sess['err_m'])})")
 
     def _undo_truth(self) -> None:
-        if not self._truth_history:
+        if self._review_pid is not None or not self._truth_history:
             return
         frame, prev = self._truth_history.pop()
         self._set_truth(frame, prev)    # prev: earlier click that was replaced, or None
@@ -495,7 +592,9 @@ class ReprojectionViewer:
 
     def _commit_pick(self) -> None:
         """Append the current pick to score.csv (only if it has truth clicks)."""
-        if self._pick_src is None or not self._truth_map or self._score_path is None:
+        if (self._review_pid is not None           # reviewed picks are already saved
+                or self._pick_src is None or not self._truth_map
+                or self._score_path is None):
             self._clear_truth()
             return
 
@@ -571,22 +670,30 @@ class ReprojectionViewer:
                     pass
 
                 cv2.imshow(self.WINDOW, self._compose())
-                key = cv2.waitKey(30) & 0xFF
+                # waitKeyEx: plain waitKey() & 0xFF drops the arrow-key codes
+                key_ex = cv2.waitKeyEx(30)
+                key = key_ex & 0xFF if key_ex != -1 else 255
 
                 # Window closed via its X button (imshow would otherwise re-create it)
                 if cv2.getWindowProperty(self.WINDOW, cv2.WND_PROP_VISIBLE) < 1:
                     logger.info("Viewer window closed.")
                     break
 
-                if key in (ord('q'), 27):
+                if key_ex in _KEYS_RIGHT:
+                    self._show_saved_pick(+1)
+                elif key_ex in _KEYS_LEFT:
+                    self._show_saved_pick(-1)
+                elif key in (ord('q'), 27):
                     break
+                elif key in (ord('c'), ord('C')):
+                    self._clear_all()
                 elif key in (ord('r'), ord('R')):
                     self._reset_view()
                 elif key == ord('s'):
                     self._save_proof_sheet()
                 elif key == ord('u'):
                     self._undo_truth()
-                elif key in (13, 10, ord('n')):
+                elif key in (13, 10, ord('n')) and self._review_pid is None:
                     self._commit_pick()
         finally:
             self._commit_pick()
